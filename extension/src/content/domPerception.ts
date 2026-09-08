@@ -46,7 +46,54 @@ const SUPPORTED_ARIA_ROLES = new Set<ElementRole>([
   'unknown'
 ]);
 
-/** Elements that can contribute to the page representation. */
+/** ARIA roles that intentionally remove or neutralize native semantics. */
+const PRESENTATION_ROLES = new Set(['none', 'presentation']);
+
+/** Native elements with useful semantics or interaction affordances. */
+const NATIVE_CANDIDATE_TAGS = new Set([
+  'button',
+  'a',
+  'input',
+  'textarea',
+  'select',
+  'option',
+  'label',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'img',
+  'form',
+  'nav',
+  'dialog',
+  'progress',
+  'summary'
+]);
+
+/** Text-bearing structural elements worth exposing when they contain content. */
+const MEANINGFUL_CONTENT_TAGS = new Set([
+  'main',
+  'article',
+  'section',
+  'aside',
+  'header',
+  'footer',
+  'p',
+  'blockquote',
+  'pre',
+  'figure',
+  'figcaption',
+  'li',
+  'dt',
+  'dd',
+  'table',
+  'caption',
+  'output'
+]);
+
+/** Elements that may contribute to the page representation. */
 const PERCEPTION_SELECTOR = [
   'button',
   'a[href]',
@@ -59,6 +106,11 @@ const PERCEPTION_SELECTOR = [
   'img',
   'form',
   'nav',
+  'dialog',
+  'progress',
+  'summary',
+  'main, article, section, aside, header, footer',
+  'p, blockquote, pre, figure, figcaption, li, dt, dd, table, caption, output',
   '[role]',
   '[tabindex]'
 ].join(', ');
@@ -68,6 +120,71 @@ const PERCEPTION_SELECTOR = [
  */
 function normalizeText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+/** Gets the first explicit ARIA role token without preserving arbitrary values. */
+function getExplicitRole(element: Element): string | undefined {
+  const role = normalizeText(element.getAttribute('role') || '').toLowerCase();
+  return role ? role.split(/\s+/)[0] : undefined;
+}
+
+/**
+ * Determines whether a candidate is a native semantic element. An anchor is
+ * useful here only when it has an href; an anchor without one is not a native
+ * link and needs an independent role or tabindex to be represented.
+ */
+function isNativeCandidate(element: Element): boolean {
+  const tagName = element.tagName.toLowerCase();
+  if (!NATIVE_CANDIDATE_TAGS.has(tagName)) {
+    return false;
+  }
+  return tagName !== 'a' || element.hasAttribute('href');
+}
+
+/**
+ * Presentation roles are ignored on native interactive controls because those
+ * controls retain an actionable accessibility semantic.
+ */
+function isNativeInteractiveElement(element: Element): boolean {
+  return element.matches(
+    'input:not([type="hidden"]), textarea, select, button, summary, a[href]'
+  );
+}
+
+/**
+ * Determines whether a structural element contributes meaningful text or an
+ * accessible name, without promoting arbitrary layout containers.
+ */
+function isMeaningfulContentCandidate(element: Element): boolean {
+  if (!MEANINGFUL_CONTENT_TAGS.has(element.tagName.toLowerCase())) {
+    return false;
+  }
+  return Boolean(getVisibleText(element) || getAccessibleName(element));
+}
+
+/**
+ * Selects useful representation candidates while excluding role-only noise.
+ * Negative tabindex elements remain candidates for representation, but their
+ * interactivity is decided separately by isInteractive().
+ */
+function isRepresentationCandidate(element: Element): boolean {
+  const explicitRole = getExplicitRole(element);
+  const hasTabindex = element.hasAttribute('tabindex');
+  const nativeCandidate = isNativeCandidate(element);
+  const meaningfulContent = isMeaningfulContentCandidate(element);
+
+  if (explicitRole && PRESENTATION_ROLES.has(explicitRole)) {
+    return isNativeInteractiveElement(element) || hasTabindex;
+  }
+
+  if (
+    explicitRole === 'img'
+    || (explicitRole && SUPPORTED_ARIA_ROLES.has(explicitRole as ElementRole))
+  ) {
+    return true;
+  }
+
+  return nativeCandidate || hasTabindex || meaningfulContent;
 }
 
 /**
@@ -168,16 +285,19 @@ function getVisibleText(element: Element): string | undefined {
  * Determines the semantic role of an element from ARIA and native semantics.
  */
 function getElementRole(element: Element): ElementRole {
-  const explicitRole = normalizeText(element.getAttribute('role') || '')
-    .toLowerCase()
-    .split(/\s+/)[0];
+  const explicitRole = getExplicitRole(element);
 
-  if (explicitRole) {
+  if (
+    explicitRole
+    && PRESENTATION_ROLES.has(explicitRole)
+    && !isNativeInteractiveElement(element)
+  ) {
+    return 'generic';
+  }
+
+  if (explicitRole && !PRESENTATION_ROLES.has(explicitRole)) {
     if (explicitRole === 'img') {
       return 'image';
-    }
-    if (explicitRole === 'none' || explicitRole === 'presentation') {
-      return 'generic';
     }
     if (SUPPORTED_ARIA_ROLES.has(explicitRole as ElementRole)) {
       return explicitRole as ElementRole;
@@ -243,6 +363,15 @@ function getElementRole(element: Element): ElementRole {
   }
   if (tagName === 'nav') {
     return 'navigation';
+  }
+  if (tagName === 'dialog') {
+    return 'dialog';
+  }
+  if (tagName === 'progress') {
+    return 'progressbar';
+  }
+  if (tagName === 'summary') {
+    return 'button';
   }
 
   return 'generic';
@@ -444,7 +573,8 @@ function extractState(element: Element): ElementState {
 export function extractPageRepresentationFromDom(): PageRepresentation {
   // querySelectorAll already returns document order, which makes the IDs
   // deterministic for a given representation without relying on page data.
-  const elementsArray = Array.from(document.querySelectorAll<Element>(PERCEPTION_SELECTOR));
+  const elementsArray = Array.from(document.querySelectorAll<Element>(PERCEPTION_SELECTOR))
+    .filter(isRepresentationCandidate);
   const elementIdMap = new Map<Element, string>();
 
   elementsArray.forEach((element, index) => {
@@ -543,6 +673,12 @@ function isInteractive(element: Element, role: ElementRole): boolean {
   ];
 
   if (interactiveRoles.includes(role)) {
+    return true;
+  }
+
+  // Native controls remain useful even when their role is generic, such as a
+  // file input or image-submit input. Hidden inputs are intentionally excluded.
+  if (element.matches('input:not([type="hidden"]), textarea, select, button, summary')) {
     return true;
   }
 

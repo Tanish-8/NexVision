@@ -138,6 +138,44 @@ describe('DOM Perception', () => {
     expect(element.interactive).toBe(true);
   });
 
+  it('should classify checkbox, radio, select, and image semantics', () => {
+    setUpHtml(`
+      <label><input type="checkbox" checked> Remember me</label>
+      <label><input type="radio" name="plan" checked> Standard</label>
+      <select aria-label="Plan">
+        <option>Standard</option>
+        <option selected>Premium</option>
+      </select>
+      <img src="logo.png" alt="Company logo">
+      <div role="img" aria-label="Chart image"></div>
+    `);
+    document.querySelectorAll('label, input, select, option, img, [role]').forEach((element) => {
+      mockBoundingClientRect(element);
+    });
+
+    const representation = extractPageRepresentationFromDom();
+    const checkbox = requirePageElement(representation, (element) => element.role === 'checkbox');
+    const radio = requirePageElement(representation, (element) => element.role === 'radio');
+    const select = requirePageElement(representation, (element) => element.tagName === 'select');
+    const image = requirePageElement(representation, (element) => element.tagName === 'img');
+    const ariaImage = requirePageElement(representation, (element) => element.accessibleName === 'Chart image');
+
+    expect(checkbox.state?.checked).toBe(true);
+    expect(checkbox.accessibleName).toBe('Remember me');
+    expect(checkbox.interactive).toBe(true);
+    expect(radio.state?.checked).toBe(true);
+    expect(radio.accessibleName).toBe('Standard');
+    expect(radio.interactive).toBe(true);
+    expect(select.role).toBe('combobox');
+    expect(select.accessibleName).toBe('Plan');
+    expect(select.visibleText).toBe('Premium');
+    expect(select.interactive).toBe(true);
+    expect(image.role).toBe('image');
+    expect(image.accessibleName).toBe('Company logo');
+    expect(ariaImage.role).toBe('image');
+    expect(ariaImage.interactive).toBe(false);
+  });
+
   it('should extract headings', () => {
     setUpHtml('<h1>Main Title</h1><h2>Subtitle</h2>');
     document.querySelectorAll('h1, h2').forEach((element) => mockBoundingClientRect(element));
@@ -150,6 +188,27 @@ describe('DOM Perception', () => {
     expect(heading1.visibleText).toBe('Main Title');
     expect(heading2.role).toBe('heading');
     expect(heading2.visibleText).toBe('Subtitle');
+  });
+
+  it('should represent meaningful text content without promoting layout nodes', () => {
+    setUpHtml(`
+      <main>
+        <article><p>  A meaningful   paragraph. </p></article>
+        <div>Layout wrapper only</div>
+      </main>
+    `);
+    document.querySelectorAll('main, article, p').forEach((element) => mockBoundingClientRect(element));
+
+    const representation = extractPageRepresentationFromDom();
+    const main = requirePageElement(representation, (element) => element.tagName === 'main');
+    const article = requirePageElement(representation, (element) => element.tagName === 'article');
+    const paragraph = requirePageElement(representation, (element) => element.tagName === 'p');
+
+    expect(main.role).toBe('generic');
+    expect(main.visibleText).toBe('A meaningful paragraph. Layout wrapper only');
+    expect(article.visibleText).toBe('A meaningful paragraph.');
+    expect(paragraph.visibleText).toBe('A meaningful paragraph.');
+    expect(representation.elements.some((element) => element.tagName === 'div')).toBe(false);
   });
 
   it('should normalize visible text', () => {
@@ -310,6 +369,43 @@ describe('DOM Perception', () => {
     expect(checkbox.interactive).toBe(true);
   });
 
+  it('should keep unsupported and neutral roles from creating arbitrary elements', () => {
+    setUpHtml(`
+      <div role="made-up">Unsupported role</div>
+      <div role="none">Decorative node</div>
+      <div role="presentation">Presentation node</div>
+      <button role="none">Native action</button>
+      <p role="presentation">Presented paragraph</p>
+      <img role="presentation" alt="Presented image" src="presentation.png">
+      <div tabindex="-1">Programmatic focus target</div>
+      <div tabindex="0">Keyboard focus target</div>
+    `);
+    document.querySelectorAll('[role], [tabindex]').forEach((element) => mockBoundingClientRect(element));
+
+    const representation = extractPageRepresentationFromDom();
+    const nativeButton = requirePageElement(representation, (element) => element.tagName === 'button');
+    const negativeTabindex = requirePageElement(
+      representation,
+      (element) => element.visibleText === 'Programmatic focus target'
+    );
+    const positiveTabindex = requirePageElement(
+      representation,
+      (element) => element.visibleText === 'Keyboard focus target'
+    );
+
+    expect(representation.elements.some((element) => element.visibleText === 'Unsupported role')).toBe(false);
+    expect(representation.elements.some((element) => element.visibleText === 'Decorative node')).toBe(false);
+    expect(representation.elements.some((element) => element.visibleText === 'Presentation node')).toBe(false);
+    expect(representation.elements.some((element) => element.visibleText === 'Presented paragraph')).toBe(false);
+    expect(representation.elements.some((element) => element.accessibleName === 'Presented image')).toBe(false);
+    expect(nativeButton.role).toBe('button');
+    expect(nativeButton.interactive).toBe(true);
+    expect(negativeTabindex.role).toBe('generic');
+    expect(negativeTabindex.interactive).toBe(false);
+    expect(positiveTabindex.role).toBe('generic');
+    expect(positiveTabindex.interactive).toBe(true);
+  });
+
   it('should preserve form relationships and direct child IDs', () => {
     setUpHtml(`
       <form id="my-form">
@@ -333,7 +429,7 @@ describe('DOM Perception', () => {
     expect(label.parentId).toBe(form.id);
   });
 
-  it('should not expose input, password, hidden, or textarea values', () => {
+  it('should keep sensitive control values out of classified elements', () => {
     setUpHtml(`
       <form>
         <input type="text" value="visible text">
@@ -387,6 +483,10 @@ describe('DOM Perception', () => {
       ['elem-1', 'h1'],
       ['elem-2', 'button']
     ]);
-    expect(secondRepresentation.elements.map((element) => element.id)).toEqual(['elem-1', 'elem-2']);
+    expect(secondRepresentation.elements.map((element) => element.id)).toEqual(
+      firstRepresentation.elements.map((element) => element.id)
+    );
+    expect(firstRepresentation.elements.map((element) => element.id)).not.toContain('First');
+    expect(firstRepresentation.elements.map((element) => element.id)).not.toContain('Second');
   });
 });
