@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+extension/dist/
+
+# Build artifacts
+*.output
+*.tsbuildinfo
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Chrome extension
+manifest.json.local
+
+# Temporary Brave validation profiles
+.brave-validation-profile*/
+
+# Machine-local Claude Code settings
+.claude/settings.local.json

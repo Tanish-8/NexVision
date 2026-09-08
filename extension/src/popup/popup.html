@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SIH26171</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="popup">
+    <header class="popup-header">
+      <h1>SIH26171</h1>
+      <span class="status-badge">M0</span>
+    </header>
+
+    <main class="popup-content">
+      <div class="info-section">
+        <div class="info-row">
+          <span class="info-label">Page:</span>
+          <span id="page-title" class="info-value">—</span>
+        </div>
+        <div class="info-row">
+          <span class="info-label">URL:</span>
+          <span id="page-url" class="info-value url-value">—</span>
+        </div>
+        <div class="info-row">
+          <span class="info-label">Headings:</span>
+          <span id="heading-count" class="info-value">—</span>
+        </div>
+      </div>
+
+      <div id="error-message" class="error-section hidden"></div>
+      <div id="success-message" class="success-section hidden"></div>
+
+      <div class="actions">
+        <button id="inspect-btn" type="button">Inspect Page</button>
+      </div>
+    </main>
+
+    <footer class="popup-footer">
+      <p>Privacy-first perception</p>
+    </footer>
+  </div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

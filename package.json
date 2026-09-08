@@ -1,0 +1,18 @@
+{
+  "name": "sih26171-on-device-visual-perception",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Privacy-first browser agent — M0 foundation",
+  "workspaces": [
+    "extension"
+  ],
+  "scripts": {
+    "typecheck": "tsc --build extension/tsconfig.json",
+    "test": "cd extension && npm test",
+    "build": "cd extension && npm run build",
+    "lint": "cd extension && npm run lint"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
