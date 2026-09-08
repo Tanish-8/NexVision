@@ -4,16 +4,28 @@
 
 **Project:** SIH26171 — On-device Visual Perception for Lightweight Browser Agents  
 **Tracker status:** Authoritative live project tracker  
-**Last updated:** 2026-09-08  
+**Last updated:** 2026-09-09  
 **Current phase:** Phase 1B complete  
-**Next phase:** Phase 1C — DOM perception quality/unification  
-**Current milestone:** M1 — Extension understands DOM (1B complete; 1C pending)  
+**Next phase:** Phase 1C — DOM perception quality/unification (Next / Not Started)  
+**Current milestone:** M1 — Extension understands DOM  
 **Overall completion:** Approximately 15%  
-**Status:** 🟡 Phase 1B is complete; Phase 1C is the next implementation target.
+**Status:** 🟡 Phase 1B is complete; repository setup is verified; Phase 1C is the next implementation target.
 
 > **Important:** Phase 1C is not complete and must not be marked complete during documentation work. The next implementation target is Phase 1C.
 
 This file is the authoritative live tracker for implementation work. Every future implementation session must read both `docs/ARCHITECTURE.md` and this file before editing, and must update this file after the task with actual changes and verification results.
+
+---
+
+## Repository setup
+
+- **GitHub repository:** NexVision.
+- **Git repository:** initialized.
+- **Default branch:** `main`.
+- **Baseline commit:** `feat: establish NexVision project baseline`.
+- **GitHub remote:** `origin` configured.
+- **Push status:** `main` branch pushed successfully.
+- **Verification status:** repository setup verified on 2026-09-09.
 
 ---
 
@@ -140,10 +152,11 @@ Updated `extension/src/content/domPerception.test.ts`:
 
 ## 4. Latest verification
 
-These are the latest verification results from the completed Phase 1B implementation. Documentation changes do not alter production code.
+These are the latest verification results for the repository setup and completed Phase 1B implementation. Documentation changes do not alter production code.
 
 | Check | Result | Details |
 |---|---|---|
+| GitHub repository setup | ✅ Verified | NexVision repository initialized; default branch is `main`; baseline commit created; `origin` configured; `main` pushed successfully. |
 | TypeScript typecheck | ✅ Passed | Strict TypeScript check completed. |
 | Automated tests | ✅ Passed | 24 tests across 3 test files; 17 are DOM perception tests. |
 | Extension build | ✅ Passed | `extension/dist` generated successfully. |
@@ -234,3 +247,10 @@ If the repository workflow supports commits, commit the completed Phase 1B work 
 - Recorded Phase 1C as the next planned implementation target and explicitly not complete.
 - Recorded the latest typecheck, test, build, Brave, and privacy-validation results.
 - Recorded the documentation workflow required for future implementation sessions.
+
+### 2026-09-09 — GitHub repository setup verified
+
+- Recorded the GitHub repository as NexVision.
+- Recorded Git initialization, the `main` default branch, baseline commit `feat: establish NexVision project baseline`, configured `origin`, and the successful push to `origin/main`.
+- Recorded the latest repository-setup verification status.
+- Kept Phase 1C as the next implementation step and explicitly not complete.
