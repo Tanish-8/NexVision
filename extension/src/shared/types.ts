@@ -185,7 +185,6 @@ export const MessageType = {
   PAGE_SNAPSHOT: 'page-snapshot',
   EXTENSION_READY: 'extension-ready',
   CAPTURE_SCREENSHOT_REQUEST: 'capture-screenshot-request',
-  /** Phase 2D — triggers the unified DOM + screenshot + vision pipeline. */
   UNIFIED_PERCEPTION_REQUEST: 'unified-perception-request'
 } as const;
 
@@ -197,4 +196,67 @@ export type MessageType = typeof MessageType[keyof typeof MessageType];
  */
 export interface UnifiedPerceptionRequest {
   // reserved for future caller-supplied options (Phase 3+)
+}
+
+
+/** Sensitive data categories classified by local privacy processing. */
+export type PrivacyCategory =
+  | 'email'
+  | 'phone'
+  | 'card'
+  | 'password'
+  | 'address'
+  | 'name'
+  | 'auth_token'
+  | 'other';
+
+/** Confidence of a privacy detection finding. */
+export type PrivacyConfidence = 'high' | 'medium' | 'low';
+
+/** Source signal contributing to a privacy finding. */
+export type PrivacySignalSource =
+  | 'input_type'
+  | 'autocomplete'
+  | 'attribute'
+  | 'visible_text'
+  | 'accessible_name'
+  | 'placeholder'
+  | 'url_query';
+
+/**
+ * A privacy finding describing detected sensitive information.
+ * Strictly local and metadata-only: NEVER retains raw detected PII values.
+ */
+export interface PrivacyFinding {
+  /** Target element ID (or 'page-metadata' / 'page-url' for page-level findings). */
+  elementId?: string;
+  /** Categorized sensitive data type. */
+  category: PrivacyCategory;
+  /** Evaluated confidence level. */
+  confidence: PrivacyConfidence;
+  /** Signal sources contributing to this finding. */
+  sources: PrivacySignalSource[];
+  /** Optional semantic reference for future executor resolution (e.g., 'profile.email'). */
+  semanticReference?: string;
+}
+
+/** Metadata summarizing the privacy sanitization execution. */
+export interface PrivacySanitizationMetadata {
+  /** Epoch timestamp (ms) when sanitization was performed. */
+  sanitizedAt: number;
+  /** Total count of privacy findings detected. */
+  totalFindings: number;
+  /** Findings broken down by category. */
+  categoryCounts: Record<PrivacyCategory, number>;
+}
+
+/**
+ * Sanitized page representation produced by the local privacy boundary.
+ * Contains the structural PageRepresentation with sensitive textual values
+ * replaced by deterministic redaction tokens, alongside privacy findings.
+ */
+export interface SanitizedPageRepresentation {
+  pageRepresentation: PageRepresentation;
+  findings: PrivacyFinding[];
+  metadata: PrivacySanitizationMetadata;
 }
