@@ -5,7 +5,12 @@
  * All visual coordinates are relative to the supplied input image.
  */
 
-import type { ElementProvenance } from '../../extension/src/shared/types.js';
+/**
+ * Perception source provenance — mirrors the extension contract.
+ * Declared locally so the vision project remains self-contained.
+ */
+export type ElementProvenance = 'dom' | 'vision' | 'both';
+
 
 /**
  * Bounding box relative to the top-left corner of the input image, in image pixels.

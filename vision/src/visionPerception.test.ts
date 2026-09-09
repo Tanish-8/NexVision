@@ -269,4 +269,36 @@ describe('Phase 2B — Vision Perception Interface & Adapters', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
   });
+  // 18. Bounding-box right-edge overflow rejected
+  it('18. should reject a box whose right edge (x + width) exceeds image width', () => {
+    // 750 + 100 = 850 > 800
+    const box: VisionBoundingBox = { x: 750, y: 0, width: 100, height: 50 };
+    const dimensions = { width: 800, height: 600 };
+    expect(isValidBoundingBox(box)).toBe(true);  // struct is valid
+    expect(() => validateBoundingBox(box, dimensions)).toThrow();
+  });
+
+  // 19. Bounding-box bottom-edge overflow rejected
+  it('19. should reject a box whose bottom edge (y + height) exceeds image height', () => {
+    // 550 + 100 = 650 > 600
+    const box: VisionBoundingBox = { x: 0, y: 550, width: 100, height: 100 };
+    const dimensions = { width: 800, height: 600 };
+    expect(() => validateBoundingBox(box, dimensions)).toThrow();
+  });
+
+  // 20. Box that exactly fills the image boundary is accepted
+  it('20. should accept a box that exactly fills the image dimensions', () => {
+    const box: VisionBoundingBox = { x: 0, y: 0, width: 800, height: 600 };
+    const dimensions = { width: 800, height: 600 };
+    expect(() => validateBoundingBox(box, dimensions)).not.toThrow();
+    expect(validateBoundingBox(box, dimensions)).toEqual(box);
+  });
+
+  // 21. Box that overflows both right and bottom edges is rejected
+  it('21. should reject a box overflowing both right and bottom edges', () => {
+    const box: VisionBoundingBox = { x: 750, y: 550, width: 100, height: 100 };
+    const dimensions = { width: 800, height: 600 };
+    // right = 850, bottom = 650 — both exceed dimensions
+    expect(() => validateBoundingBox(box, dimensions)).toThrow();
+  });
 });

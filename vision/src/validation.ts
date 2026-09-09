@@ -73,6 +73,11 @@ export function isValidBoundingBox(box: unknown): box is VisionBoundingBox {
 /**
  * Validates a bounding box structure. Throws Error if invalid.
  * Optionally verifies bounds against image dimensions if provided.
+ *
+ * When dimensions are supplied the COMPLETE rectangle must fit inside the image:
+ *   x >= 0, y >= 0, width >= 0, height >= 0
+ *   x + width <= image.width
+ *   y + height <= image.height
  */
 export function validateBoundingBox(
   box: unknown,
@@ -85,15 +90,25 @@ export function validateBoundingBox(
   }
 
   if (dimensions) {
-    if (box.x > dimensions.width || box.y > dimensions.height) {
+    const right = box.x + box.width;
+    const bottom = box.y + box.height;
+    if (
+      box.x > dimensions.width ||
+      box.y > dimensions.height ||
+      right > dimensions.width ||
+      bottom > dimensions.height
+    ) {
       throw new Error(
-        `Bounding box origin (${box.x}, ${box.y}) exceeds image dimensions (${dimensions.width}x${dimensions.height})`
+        `Bounding box (x=${box.x}, y=${box.y}, width=${box.width}, height=${box.height}) ` +
+        `exceeds image dimensions (${dimensions.width}x${dimensions.height}): ` +
+        `right edge=${right}, bottom edge=${bottom}`
       );
     }
   }
 
   return box;
 }
+
 
 /**
  * Checks whether image dimensions are valid (width > 0, height > 0, finite numbers).

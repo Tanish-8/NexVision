@@ -12,9 +12,9 @@
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "outDir": "./dist",
-    "rootDir": "..",
+    "rootDir": "./src",
     "types": ["chrome"]
   },
-  "include": ["src/**/*.ts", "../vision/src/**/*.ts"],
+  "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
