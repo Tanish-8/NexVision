@@ -21,6 +21,8 @@ import type {
   VisualObservation,
   UnifiedPerceptionResult
 } from './orchestrator.js';
+import { createLlamaVisionAdapter } from './llamaVisionAdapter.js';
+
 
 const router = new MessageRouter();
 
@@ -160,7 +162,7 @@ export function createDomProvider(tabId: number): DomPerceptionProvider {
  * Declared locally to preserve the extension TypeScript project boundary
  * (extension/tsconfig.json rootDir: ./src). The vision workspace is NOT imported here.
  */
-const nullVisionAdapter: VisualPerceptionAdapter = {
+export const nullVisionAdapter: VisualPerceptionAdapter = {
   name: 'NullVisionAdapter',
   async perceive(_input) {
     return {
@@ -201,11 +203,11 @@ router.register(MessageType.CAPTURE_SCREENSHOT_REQUEST, async (
 });
 
 /**
- * Handle unified perception requests (Phase 2D).
+ * Handle unified perception requests (Phase 2D / Phase 2E-2B).
  *
  * Orchestrates DOM perception (via content-script IPC), screenshot capture,
  * and vision processing into a single UnifiedPerceptionResult using the Phase 2C
- * perceivePage() orchestrator.
+ * perceivePage() orchestrator with Phase 2E-2B real local llama.cpp vision adapter.
  *
  * NOTE: CSS viewport dimensions (from DOM perception) are used as image dimensions
  * passed to the vision adapter. On high-DPI displays, captureVisibleTab captures at
@@ -243,7 +245,8 @@ router.register(MessageType.UNIFIED_PERCEPTION_REQUEST, async (
       };
     };
 
-    const result = await perceivePage(domProvider, screenshotProvider, nullVisionAdapter);
+    const visionAdapter = createLlamaVisionAdapter();
+    const result = await perceivePage(domProvider, screenshotProvider, visionAdapter);
 
     return {
       success: true,
