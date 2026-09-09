@@ -22,6 +22,7 @@ import {
   isSemanticProfileReference,
   sanitizeFreeFormText,
   redactObviousCredentials,
+  isSafeTypeActionText,
   LOCAL_AGENT_SYSTEM_PROMPT,
   type LocalLlamaChatClient,
   DefaultLocalLlamaChatClient
@@ -1209,6 +1210,276 @@ describe('Phase 5A — Local AI Agent / PlannerDriver Integration', () => {
         expect(prompt).toContain('profile.firstName');
         expect(prompt).toContain('profile.phone');
       });
+    });
+  });
+});
+// ---------------------------------------------------------------------------
+// Output-Side Privacy Safety Regression Tests
+// ---------------------------------------------------------------------------
+
+describe('Phase 5A — Output-Side Type Action Privacy Safety', () => {
+  // -------------------------------------------------------------------------
+  // isSafeTypeActionText unit tests
+  // -------------------------------------------------------------------------
+  describe('isSafeTypeActionText — safe text accepted', () => {
+    it('accepts ordinary search phrase', () => {
+      expect(isSafeTypeActionText('gaming laptop')).toBe(true);
+    });
+
+    it('accepts ordinary task button label', () => {
+      expect(isSafeTypeActionText('Search products')).toBe(true);
+    });
+
+    it('accepts numeric task value (e.g. budget)', () => {
+      expect(isSafeTypeActionText('50000')).toBe(true);
+    });
+
+    it('accepts short search keyword', () => {
+      expect(isSafeTypeActionText('laptop')).toBe(true);
+    });
+
+    it('accepts profile.email semantic reference', () => {
+      expect(isSafeTypeActionText('profile.email')).toBe(true);
+    });
+
+    it('accepts profile.firstName semantic reference', () => {
+      expect(isSafeTypeActionText('profile.firstName')).toBe(true);
+    });
+
+    it('accepts profile.phone semantic reference', () => {
+      expect(isSafeTypeActionText('profile.phone')).toBe(true);
+    });
+
+    it('accepts profile.lastName semantic reference', () => {
+      expect(isSafeTypeActionText('profile.lastName')).toBe(true);
+    });
+
+    it('accepts profile.address semantic reference', () => {
+      expect(isSafeTypeActionText('profile.address')).toBe(true);
+    });
+  });
+
+  describe('isSafeTypeActionText — PII/credential text rejected', () => {
+    it('rejects raw email address', () => {
+      expect(isSafeTypeActionText('user@example.com')).toBe(false);
+    });
+
+    it('rejects raw phone number (ITU-T format)', () => {
+      // redactText handles validated phone numbers
+      expect(isSafeTypeActionText('+14155552671')).toBe(false);
+    });
+
+    it('rejects bearer token credential', () => {
+      expect(isSafeTypeActionText('Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.abc123def456')).toBe(false);
+    });
+
+    it('rejects GitHub PAT credential', () => {
+      expect(isSafeTypeActionText('ghp_abcdefghijklmnopqrstuvwxyz123456')).toBe(false);
+    });
+
+    it('rejects OpenAI sk- API key credential', () => {
+      expect(isSafeTypeActionText('sk-abcdefghijklmnopqrstuv')).toBe(false);
+    });
+
+    it('rejects api_key=... credential pattern', () => {
+      expect(isSafeTypeActionText('api_key=my-secret-value')).toBe(false);
+    });
+
+    it('rejects JWT token', () => {
+      expect(
+        isSafeTypeActionText(
+          'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
+        )
+      ).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // parseAdvisoryResponse integration: type payload safety check
+  // -------------------------------------------------------------------------
+  describe('parseAdvisoryResponse — type payload safety enforcement', () => {
+    function makeTypeAction(text: string): string {
+      return JSON.stringify({
+        type: 'ACTION',
+        targetElementId: 'elem-search-input',
+        actionType: 'type',
+        payload: { text },
+        rationale: 'fill in search field',
+        estimatedProgress: 0.3
+      });
+    }
+
+    it('accepts safe ordinary text in type payload', () => {
+      const result = parseAdvisoryResponse(makeTypeAction('gaming laptop'));
+      expect(result.status).toBe('ACTION');
+    });
+
+    it('accepts numeric task value in type payload', () => {
+      const result = parseAdvisoryResponse(makeTypeAction('50000'));
+      expect(result.status).toBe('ACTION');
+    });
+
+    it('accepts profile.email reference in type payload', () => {
+      const result = parseAdvisoryResponse(makeTypeAction('profile.email'));
+      expect(result.status).toBe('ACTION');
+    });
+
+    it('accepts profile.firstName reference in type payload', () => {
+      const result = parseAdvisoryResponse(makeTypeAction('profile.firstName'));
+      expect(result.status).toBe('ACTION');
+    });
+
+    it('accepts profile.phone reference in type payload', () => {
+      const result = parseAdvisoryResponse(makeTypeAction('profile.phone'));
+      expect(result.status).toBe('ACTION');
+    });
+
+    it('rejects raw email address in type payload with deterministic reason', () => {
+      const result = parseAdvisoryResponse(makeTypeAction('user@example.com'));
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toBe(
+          'Model proposed sensitive PII or credentials in type action payload'
+        );
+      }
+    });
+
+    it('rejects raw phone number in type payload', () => {
+      const result = parseAdvisoryResponse(makeTypeAction('+14155552671'));
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toBe(
+          'Model proposed sensitive PII or credentials in type action payload'
+        );
+      }
+    });
+
+    it('rejects bearer token credential in type payload', () => {
+      const result = parseAdvisoryResponse(
+        makeTypeAction('Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.abc123def456')
+      );
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toBe(
+          'Model proposed sensitive PII or credentials in type action payload'
+        );
+      }
+    });
+
+    it('rejects sk- API key in type payload', () => {
+      const result = parseAdvisoryResponse(
+        makeTypeAction('sk-abcdefghijklmnopqrstuv')
+      );
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toBe(
+          'Model proposed sensitive PII or credentials in type action payload'
+        );
+      }
+    });
+
+    it('does NOT apply safety check to click actions (only type is guarded)', () => {
+      // click has no payload.text; safety check must not block click actions
+      const clickJson = JSON.stringify({
+        type: 'ACTION',
+        targetElementId: 'elem-submit-btn',
+        actionType: 'click',
+        rationale: 'submit search',
+        estimatedProgress: 0.5
+      });
+      const result = parseAdvisoryResponse(clickJson);
+      expect(result.status).toBe('ACTION');
+    });
+
+    it('does NOT apply safety check to focus actions (only type is guarded)', () => {
+      const focusJson = JSON.stringify({
+        type: 'ACTION',
+        targetElementId: 'elem-search-input',
+        actionType: 'focus',
+        rationale: 'focus search input',
+        estimatedProgress: 0.1
+      });
+      const result = parseAdvisoryResponse(focusJson);
+      expect(result.status).toBe('ACTION');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Propagation through LocalAgentDriver.proposeStep → planNextStep → MODEL_ERROR
+  // -------------------------------------------------------------------------
+  describe('LocalAgentDriver / planNextStep — FAILED propagates as MODEL_ERROR', () => {
+    it('PII in type payload propagates through proposeStep as FAILED', async () => {
+      const piiPayload: LocalLlamaChatClient = {
+        chat: async () => ({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-search-input',
+            actionType: 'type',
+            payload: { text: 'attacker@evil.com' },
+            rationale: 'adversarial injection',
+            estimatedProgress: 0.5
+          })
+        })
+      };
+
+      const driver = new LocalAgentDriver(piiPayload);
+      const input = createMockPlannerInput();
+      const result = await driver.proposeStep(input);
+
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toBe(
+          'Model proposed sensitive PII or credentials in type action payload'
+        );
+      }
+    });
+
+    it('PII in type payload propagates through planNextStep as MODEL_ERROR', async () => {
+      const piiPayload: LocalLlamaChatClient = {
+        chat: async () => ({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-search-input',
+            actionType: 'type',
+            payload: { text: 'Bearer secret-token-9999' },
+            rationale: 'adversarial injection',
+            estimatedProgress: 0.5
+          })
+        })
+      };
+
+      const agent = new LocalAgent(piiPayload);
+      const input = createMockPlannerInput();
+      const result = await agent.planNextStep(input);
+
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toBe('MODEL_ERROR');
+      }
+    });
+
+    it('safe text in type payload propagates through planNextStep as PLANNED_ACTION', async () => {
+      const safePayload: LocalLlamaChatClient = {
+        chat: async () => ({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-search-input',
+            actionType: 'type',
+            payload: { text: 'gaming laptop' },
+            rationale: 'search for product',
+            estimatedProgress: 0.4
+          })
+        })
+      };
+
+      const agent = new LocalAgent(safePayload);
+      const input = createMockPlannerInput();
+      const result = await agent.planNextStep(input);
+
+      expect(result.status).toBe('ACTION');
     });
   });
 });

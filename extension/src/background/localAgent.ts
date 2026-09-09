@@ -149,6 +149,32 @@ export function sanitizeFreeFormText(text: string | undefined): string | undefin
 }
 
 /**
+ * Checks whether a model-generated type-action text is safe to use.
+ *
+ * A value is safe when:
+ * - It is a semantic profile reference (e.g. 'profile.email', 'profile.firstName',
+ *   'profile.phone'). These are unresolved pointers, never raw PII.
+ * - Passing the text through sanitizeFreeFormText() does NOT alter it, meaning the
+ *   existing privacy engine and credential redactor found nothing to redact.
+ *
+ * A value is unsafe (returns false) when:
+ * - The privacy sanitizer would alter the text (e.g. it contains a raw email address,
+ *   phone number, Luhn-valid card number, bearer token, or API key).
+ *
+ * This is deliberately narrow: it does NOT build a second general-purpose PII classifier.
+ * It reuses the authoritative sanitizeFreeFormText() already used for model input.
+ */
+export function isSafeTypeActionText(text: string): boolean {
+  // Semantic profile references are always safe (unresolved vault pointers)
+  if (isSemanticProfileReference(text.trim())) {
+    return true;
+  }
+  // Safe when sanitization leaves the text unchanged
+  const sanitized = sanitizeFreeFormText(text);
+  return sanitized === text;
+}
+
+/**
  * Sensitive goal parameter keys per Requirement 3:
  * - password, passwd, secret, token, auth, credential, cookie
  * - card, cvv, cvc, email, phone, telephone
@@ -530,6 +556,17 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
         return {
           status: 'FAILED',
           reason: 'payload.pressEnter must be a boolean when supplied'
+        };
+      }
+
+      // Output-side privacy safety: reject type payloads containing raw PII or credentials.
+      // isSafeTypeActionText() passes the text through the existing sanitizeFreeFormText()
+      // privacy sanitizer; it allows ordinary task text and semantic profile references
+      // while rejecting any text that sanitization would alter (email, phone, card, token).
+      if (!isSafeTypeActionText(rawPayload['text'] as string)) {
+        return {
+          status: 'FAILED',
+          reason: 'Model proposed sensitive PII or credentials in type action payload'
         };
       }
 
