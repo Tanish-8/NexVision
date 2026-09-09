@@ -4,9 +4,9 @@
 **Problem statement:** On-device Visual Perception for Lightweight Browser Agents  
 **GitHub repository:** NexVision  
 **Document status:** Long-term architecture and development workflow  
-**Current implementation status:** Phase 0 complete; Phase 1A and Phase 1B complete; Phase 1C is next.
+**Current implementation status:** Phase 0, Phase 1A, Phase 1B, Phase 1C-1, and Phase 1C-2 are complete; Phase 1C-3 is next.
 
-> This document is the architectural source of truth. It describes the current repository accurately and separates implemented behavior from planned behavior. Future implementation work must read this document and `docs/PROGRESS.md` before changing code.
+> This document is the architectural source of truth. It describes the current repository accurately and separates implemented behavior from planned behavior. Implementation agents should inspect the current source before changing code; `docs/PROGRESS.md` and Git history are maintained by the project owner unless explicitly delegated.
 
 ## Mandatory Development & Progress Tracking Workflow
 
@@ -14,18 +14,18 @@
 
 For every future implementation task:
 
-1. Read `docs/ARCHITECTURE.md` and `docs/PROGRESS.md` first.
-2. Inspect the current implementation before editing.
-3. Implement only the requested scope.
-4. Run the appropriate tests, typecheck, build, and manual verification.
-5. Update `docs/PROGRESS.md` in the same task with the files changed, verification results, current phase, milestone, completion estimate, remaining work, next step, and real blockers.
-6. Commit the implementation and documentation when the task is complete.
+1. Inspect the current implementation and tests before editing.
+2. Implement only the requested, explicitly scoped increment.
+3. Add or update focused tests for every changed behavior.
+4. Run the appropriate typecheck, full tests, build, and relevant local/manual verification.
+5. Do not expand into later roadmap phases unless explicitly requested.
+6. The project owner maintains `docs/PROGRESS.md`, architecture updates, commits, and pushes unless those responsibilities are explicitly delegated to the implementation agent.
 7. Update this architecture document only when an actual architectural decision or structural change occurs. Do not rewrite it for every small code change.
 8. Never mark a phase, milestone, or feature complete without corresponding verification.
 
-**Every completed implementation task MUST update `docs/PROGRESS.md` before the task is considered complete.**
+**Every completed implementation increment MUST leave enough verification evidence for the project owner to update `docs/PROGRESS.md` accurately.**
 
-This workflow is a project rule for contributors and Claude Code sessions. The documentation itself does not replace tests, review, or version-control history.
+This workflow keeps coding-agent work focused on implementation quality while keeping project-state documentation and version-control decisions under explicit project-owner control.
 
 ---
 
@@ -107,9 +107,9 @@ This is the target workflow. Only the extension foundation, PageRepresentation c
 1. **User task** — The user expresses an intended outcome, such as finding information or completing a form.
 2. **Task understanding** — A future task-understanding component will interpret the instruction, constraints, and desired outcome. No agent or task-understanding implementation exists yet.
 3. **Browser** — The browser is the environment being observed and, later, acted upon.
-4. **DOM perception** — The current implementation extracts semantic and structural information from the page DOM. It is useful for roles, names, text, state, relationships, and precise element grounding.
+4. **DOM perception** — The current implementation extracts semantic and structural information from the page DOM. It now includes the Phase 1C-1/1C-2 hardening described below and is intended to provide reliable input for later grounding.
 5. **Screenshot / visual perception** — A planned component will capture and interpret visual information that DOM inspection cannot fully describe, such as visual grouping, layout, canvas content, and rendered appearance.
-6. **Unified page representation** — DOM and visual observations will eventually be combined into one versioned representation. The current `PageRepresentation` is the DOM-side contract and already includes provenance so future sources can be distinguished or combined.
+6. **Unified page representation** — DOM and visual observations will eventually be combined into one versioned representation. The current `PageRepresentation` is the DOM-side contract and already includes provenance so future sources can be distinguished or combined. Phase 1C hardening improves the quality of this DOM-side evidence without introducing visual perception.
 7. **Local privacy engine** — A planned local component will detect, classify, and protect PII and other sensitive content before it crosses the privacy boundary.
 8. **Sanitized page state** — Only the minimum information needed for reasoning and grounding should leave the local perception/privacy boundary.
 9. **Task ↔ element grounding** — A planned component will map task language to stable page-element identifiers and supported actions.
@@ -201,16 +201,18 @@ A small `PageSnapshot` type also remains in the shared file as an earlier basic 
 
 `extension/src/content/domPerception.ts` currently:
 
-- Selects buttons, links, inputs, textareas, selects/options, labels, headings, images, forms, navigation elements, ARIA-role elements, and tabindex elements.
+- Selects native interactive elements, meaningful content elements, headings, images, forms/navigation elements, supported ARIA-role elements, and tabindex candidates while filtering unsupported presentation/layout noise.
 - Uses document order to assign deterministic IDs (`elem-1`, `elem-2`, and so on) for each representation.
 - Normalizes whitespace in text and selected attributes.
 - Extracts native and supported ARIA semantics.
 - Computes accessible names from `aria-label`, `aria-labelledby`, associated labels, image alt text, and appropriate visible text.
 - Uses `getBoundingClientRect()` for bounds and the production visibility check.
-- Handles CSS visibility, hidden ancestors, zero-size elements, hidden inputs, disabled controls, disabled fieldsets, focus, checked state, selected options, and `aria-expanded`.
+- Handles CSS visibility, hidden ancestors, zero-size elements, hidden inputs, disabled controls, disabled fieldsets, focus, checked state, selected options, `aria-expanded`, and ancestor `inert`.
 - Represents direct parent/child relationships using IDs rather than nested element objects.
 - Sets `provenance` to `dom`.
 - Copies only a curated set of grounding/state attributes and deliberately excludes values, passwords, checked/selected values, and arbitrary HTML attributes.
+- Keeps `aria-hidden` as accessibility semantics rather than treating it as visual invisibility.
+- Normalizes visible text and selected attributes, extracts associated labels, computes lightweight accessible names, and exposes label relationships through `labelIds`.
 - Excludes user-entered input and textarea text even when those controls are descendants of a represented container such as a form.
 
 ### Current verification evidence
@@ -220,7 +222,7 @@ The current DOM implementation has a Vitest suite using happy-dom and mocked lay
 The latest verified results are:
 
 - `npm run typecheck` — passed.
-- `npm test` — 24 tests passed across 3 test files.
+- `npm test` — 48 tests passed across 3 test files, including 41 DOM perception tests.
 - `npm run build` — passed and refreshed `extension/dist`.
 - Brave validation — the popup successfully inspected a local page and a synthetic form page; the representation excluded synthetic input/password/textarea values. An external `https://example.com/` check was attempted but DNS was unavailable in the validation environment.
 
@@ -250,11 +252,11 @@ The following components describe the intended final system. Each item is explic
 1. **Browser Extension — CURRENT foundation / PLANNED expansion**  
    The current extension is the runtime container. It will eventually coordinate local perception, privacy processing, grounding, execution, and verification.
 2. **DOM Perception — CURRENT**  
-   The extension can extract a DOM-based `PageRepresentation`. Phase 1C will improve quality and unification; this is not started yet.
+   The extension can extract a DOM-based `PageRepresentation`. Phase 1C-1 and Phase 1C-2 are complete; Phase 1C-3 remains as the next DOM hardening increment.
 3. **Visual Perception — PLANNED / NOT YET FINALIZED**  
    A future screenshot and visual-analysis component will complement DOM perception.
 4. **Unified Page Representation — CURRENT contract / PLANNED unification**  
-   Schema version `1.0` and DOM provenance exist. Combining DOM and visual observations is planned.
+   Schema version `1.0` and DOM provenance exist. DOM quality/unification hardening is in progress; combining DOM and visual observations remains planned.
 5. **Local Privacy Engine — PLANNED / NOT YET IMPLEMENTED**  
    The privacy-engine directory is scaffolded, but its README explicitly says there is no functionality yet.
 6. **Task ↔ Element Grounding — PLANNED**  
@@ -362,7 +364,10 @@ Establish repository structure, documentation, build tooling, MV3 extension pack
 
 - **1A — PageRepresentation schema:** Define the versioned common representation for metadata, viewport, elements, semantics, state, bounds, relationships, and provenance. **Current: complete.**
 - **1B — DOM perception:** Extract the current page into the representation with deterministic IDs, visibility/state, accessible names, bounds, relationships, and privacy exclusions. **Current: complete.**
-- **1C — DOM perception quality/unification:** Improve quality, edge-case coverage, and the unification boundary while preserving privacy and the verified contract. **Next; not started.**
+- **1C — DOM perception quality/unification:** Improve quality, edge-case coverage, and the unification boundary while preserving privacy and the verified contract. **In progress.**
+  - **1C-1 — Stable element IDs and semantic classification:** deterministic candidate selection, native/ARIA semantics, meaningful-content filtering, and related regression tests. **Complete.**
+  - **1C-2 — Visibility, text normalization, accessibility, and relationship hardening:** visibility semantics, normalized text, labels, accessible names, inert handling, privacy-safe ancestor text, and regression tests. **Complete.**
+  - **1C-3 — Final DOM perception hardening and representation consistency:** narrow remaining high-value DOM edge cases and consistency checks. **Next.**
 
 ### Phase 2 — Visual Perception
 
@@ -475,10 +480,10 @@ No future technology should be documented as selected until it is actually decid
 - **Phase 0 complete:** Repository, extension foundation, messaging, build/test tooling, and documentation foundation exist.
 - **Phase 1A complete:** Versioned `PageRepresentation` schema exists in shared types.
 - **Phase 1B complete:** DOM perception is integrated, tested, built, and manually validated on a local form page with privacy exclusions.
-- **Phase 1C next:** DOM perception quality/unification is the immediate next implementation target and has not started.
+- **Phase 1C in progress:** 1C-1 and 1C-2 are complete and verified; 1C-3 is the immediate next implementation target.
 
 ### PLANNED
 
-- Phase 1C onward, including visual perception, privacy detection/redaction, grounding, agent reasoning, execution, verification/recovery, voice, evaluation, and demo preparation.
+- Phase 1C-3 onward, including visual perception, privacy detection/redaction, grounding, agent reasoning, execution, verification/recovery, voice, evaluation, and demo preparation.
 
 No Phase 1C or later functionality should be implemented as part of documentation-only work.
