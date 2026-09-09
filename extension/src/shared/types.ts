@@ -153,13 +153,38 @@ export interface ExtensionResponse<T = any> {
 }
 
 /**
+ * Options for local visible tab screenshot capture.
+ */
+export interface ScreenshotCaptureOptions {
+  /** Target image format. Defaults to 'png'. */
+  format?: 'png' | 'jpeg';
+  /** Compression quality (0-100), only applicable when format is 'jpeg'. */
+  quality?: number;
+}
+
+/**
+ * Minimal local viewport screenshot result.
+ * Strictly local and ephemeral: contains only in-memory image data and essential capture metadata.
+ * Contains no DOM HTML, form values, credentials, or arbitrary page data.
+ */
+export interface ScreenshotCaptureResult {
+  /** In-memory data URL of the captured viewport ('data:image/png;base64,...'). */
+  dataUrl: string;
+  /** Image format of the captured screenshot. */
+  format: 'png' | 'jpeg';
+  /** Epoch timestamp (ms) when the screenshot was captured. */
+  timestamp: number;
+}
+
+/**
  * Message type discriminators
  */
 export const MessageType = {
   INSPECT_PAGE_REQUEST: 'inspect-page-request',
   INSPECT_PAGE_RESPONSE: 'inspect-page-response',
   PAGE_SNAPSHOT: 'page-snapshot',
-  EXTENSION_READY: 'extension-ready'
+  EXTENSION_READY: 'extension-ready',
+  CAPTURE_SCREENSHOT_REQUEST: 'capture-screenshot-request'
 } as const;
 
 export type MessageType = typeof MessageType[keyof typeof MessageType];
