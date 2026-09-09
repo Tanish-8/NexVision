@@ -28,6 +28,7 @@ import {
 } from '../shared/planner.js';
 
 import { stripMarkdownFences } from './llamaVisionAdapter.js';
+import { redactText, sanitizeUrl, REDACTION_TOKENS } from '../privacy/index.js';
 
 // Re-export authoritative planner contracts for consumers
 export type {
@@ -105,40 +106,165 @@ export const LOCAL_AGENT_SYSTEM_PROMPT =
   'Schema for completion:\n' +
   '{"type": "COMPLETED", "rationale": "<brief reason>"}';
 
-const SENSITIVE_PARAM_KEY_PATTERN =
-  /password|secret|token|cookie|credential|auth|card|cvv|ssn|pin/i;
-
-const SENSITIVE_PARAM_VALUE_PATTERN =
-  /bearer\s+[a-zA-Z0-9_\-\.]+|session=[a-zA-Z0-9_\-\.]+|\b[0-9]{13,19}\b/i;
+/**
+ * Small deterministic helper specifically targeting obvious credential/bearer/token patterns
+ * in free-form text. Replaces obvious secrets with REDACTION_TOKENS.AUTH_TOKEN.
+ * Does NOT build a generic PII classifier.
+ */
+const OBVIOUS_CREDENTIAL_PATTERNS = [
+  // Bearer tokens (e.g. "Bearer eyJ...", "bearer secret-tok-12345")
+  /bearer\s+[a-zA-Z0-9_\-\.+=/]+/gi,
+  // Obvious token prefixes (e.g. sk-..., ghp_..., gho_..., glpat-...)
+  /\b(?:sk-[a-zA-Z0-9]{20,}|gh[pousr]_[a-zA-Z0-9]{30,}|glpat-[a-zA-Z0-9_\-]{20,})\b/g,
+  // JWT tokens (3 dot-separated base64 segments)
+  /\beyJ[a-zA-Z0-9_\-]{8,}\.eyJ[a-zA-Z0-9_\-]{8,}\.[a-zA-Z0-9_\-]{8,}\b/g,
+  // Explicit key-value assignments for sensitive credentials (e.g. api_key=..., auth_token: ...)
+  /\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['"]?[a-zA-Z0-9_\-\.+=/]{6,}['"]?/gi,
+  // Session/token query-like patterns
+  /\b(?:session_?id|access_?token|auth_?token|jwt)=[a-zA-Z0-9_\-\.+=/]{8,}\b/gi
+];
 
 /**
- * Filters goal parameters to allow ONLY safe keys or semantic references (e.g. 'profile.email').
- * Strips any sensitive credentials or raw PII values.
+ * Deterministically redacts obvious bearer/auth/token credentials from text.
+ */
+export function redactObviousCredentials(text: string): string {
+  let result = text;
+  for (const pattern of OBVIOUS_CREDENTIAL_PATTERNS) {
+    result = result.replace(pattern, REDACTION_TOKENS.AUTH_TOKEN);
+  }
+  return result;
+}
+
+/**
+ * Sanitizes free-form text:
+ * 1. Uses existing privacy engine redactText() (emails, validated Luhn cards, ITU-T phones).
+ * 2. Uses deterministic credential/token helper for obvious auth/bearer secrets.
+ */
+export function sanitizeFreeFormText(text: string | undefined): string | undefined {
+  if (text === undefined || text === null || text === '') {
+    return text;
+  }
+  const redacted = redactText(text) ?? text;
+  return redactObviousCredentials(redacted);
+}
+
+/**
+ * Sensitive goal parameter keys per Requirement 3:
+ * - password, passwd, secret, token, auth, credential, cookie
+ * - card, cvv, cvc, email, phone, telephone
+ * - name, firstName, lastName, address, street, postal, zip
+ */
+const SENSITIVE_PARAM_KEYS = new Set([
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'auth',
+  'credential',
+  'cookie',
+  'card',
+  'cvv',
+  'cvc',
+  'email',
+  'phone',
+  'telephone',
+  'name',
+  'firstname',
+  'lastname',
+  'address',
+  'street',
+  'postal',
+  'zip'
+]);
+
+/**
+ * Identifies sensitive parameter keys.
+ */
+export function isSensitiveParameterKey(key: string): boolean {
+  if (typeof key !== 'string') return false;
+  const lower = key.trim().toLowerCase();
+  if (SENSITIVE_PARAM_KEYS.has(lower)) {
+    return true;
+  }
+  // Strip non-alphanumeric characters (e.g. first_name -> firstname, zip-code -> zipcode)
+  const alphaOnly = lower.replace(/[^a-z0-9]/g, '');
+  if (SENSITIVE_PARAM_KEYS.has(alphaOnly)) {
+    return true;
+  }
+  // Check common compound patterns
+  return (
+    /(?:^|[_\-.])(?:password|passwd|secret|token|auth|credential|cookie|card|cvv|cvc|email|phone|telephone|firstname|lastname|address|street|postal|zip)(?:[_\-.]|$)/i.test(lower) ||
+    /^(?:user_?name|full_?name|first_?name|last_?name|phone_?number|zip_?code|postal_?code|email_?address|card_?number|credit_?card|billing_?address|shipping_?address)$/i.test(lower) ||
+    /(?:password|passwd|secret|credential|cookie|cvv|cvc)/i.test(lower)
+  );
+}
+
+/**
+ * Checks if a value is a semantic profile reference (e.g., 'profile.email', 'profile.firstName').
+ * Semantic profile references represent unresolved vault pointers rather than raw PII.
+ */
+export function isSemanticProfileReference(value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const trimmed = value.trim();
+  return /^profile\.[a-zA-Z0-9_.-]+$/i.test(trimmed);
+}
+
+/**
+ * Filters goal parameters to ensure they are privacy-safe.
+ * - Sensitive parameter keys with raw values are NOT copied into the model-facing payload.
+ * - Semantic profile references (e.g. 'profile.email', 'profile.firstName', 'profile.phone') are strictly preserved.
+ * - Non-sensitive parameter values are sanitized using redactText() and credential redaction.
+ * - Recursively handles simple JSON-compatible objects if present.
  */
 export function filterSafeGoalParameters(
-  params?: Record<string, string>
+  params?: Record<string, unknown>
 ): Record<string, string> | undefined {
   if (!params || typeof params !== 'object') {
     return undefined;
   }
 
   const safeParams: Record<string, string> = {};
-  for (const [key, value] of Object.entries(params)) {
-    if (typeof key !== 'string' || typeof value !== 'string') {
+
+  for (const [key, rawValue] of Object.entries(params)) {
+    if (typeof key !== 'string') {
       continue;
     }
 
-    // Reject keys with sensitive identifiers
-    if (SENSITIVE_PARAM_KEY_PATTERN.test(key)) {
-      continue;
-    }
+    if (typeof rawValue === 'string') {
+      const trimmed = rawValue.trim();
 
-    // Reject values containing raw tokens/cards/sessions
-    if (SENSITIVE_PARAM_VALUE_PATTERN.test(value)) {
-      continue;
-    }
+      // Semantic profile references (e.g. 'profile.email', 'profile.firstName') are strictly preserved
+      if (isSemanticProfileReference(trimmed)) {
+        safeParams[key] = trimmed;
+        continue;
+      }
 
-    safeParams[key] = value;
+      // Sensitive parameter keys must NOT be copied into the model-facing payload
+      if (isSensitiveParameterKey(key)) {
+        continue;
+      }
+
+      // Non-sensitive parameter keys: redact free-form PII / credentials
+      const sanitized = sanitizeFreeFormText(trimmed);
+      if (sanitized !== undefined && sanitized !== '') {
+        safeParams[key] = sanitized;
+      }
+    } else if (typeof rawValue === 'number' || typeof rawValue === 'boolean') {
+      if (isSensitiveParameterKey(key)) {
+        continue;
+      }
+      safeParams[key] = String(rawValue);
+    } else if (typeof rawValue === 'object' && rawValue !== null && !Array.isArray(rawValue)) {
+      if (isSensitiveParameterKey(key)) {
+        continue;
+      }
+      const nestedSafe = filterSafeGoalParameters(rawValue as Record<string, unknown>);
+      if (nestedSafe && Object.keys(nestedSafe).length > 0) {
+        safeParams[key] = JSON.stringify(nestedSafe);
+      }
+    }
   }
 
   return Object.keys(safeParams).length > 0 ? safeParams : undefined;
@@ -147,6 +273,8 @@ export function filterSafeGoalParameters(
 /**
  * Builds the allowlisted model-facing DTO from PlannerInput.
  * Deterministic: preserves candidate ordering and allowlists safe fields only.
+ * Sanitizes all model-facing free-form text (goal description, targetHint, page title,
+ * page URL via sanitizeUrl, and candidate accessibleName / visibleText).
  */
 export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload {
   const pageRep = input.context.page;
@@ -170,7 +298,7 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
 
     const matchedElement = elementMap.get(target.elementId);
     const role = target.role || matchedElement?.role;
-    const accessibleName = matchedElement?.accessibleName;
+    const rawAccessibleName = matchedElement?.accessibleName;
 
     // Check if element could contain sensitive user input
     const isPassword =
@@ -185,17 +313,24 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
       matchedElement?.tagName?.toLowerCase() === 'textarea';
 
     // Never forward visibleText for password or input/textarea elements
-    const visibleText = isInputOrTextarea ? undefined : matchedElement?.visibleText;
+    const rawVisibleText = isInputOrTextarea ? undefined : matchedElement?.visibleText;
+
+    // Sanitize accessibleName and visibleText with privacy sanitizer
+    const accessibleName =
+      rawAccessibleName !== undefined && rawAccessibleName.trim() !== ''
+        ? sanitizeFreeFormText(rawAccessibleName.trim())
+        : undefined;
+
+    const visibleText =
+      rawVisibleText !== undefined && rawVisibleText.trim() !== ''
+        ? sanitizeFreeFormText(rawVisibleText.trim())
+        : undefined;
 
     candidateTargets.push({
       elementId: target.elementId,
       ...(role !== undefined ? { role } : {}),
-      ...(accessibleName !== undefined && accessibleName.trim() !== ''
-        ? { accessibleName: accessibleName.trim() }
-        : {}),
-      ...(visibleText !== undefined && visibleText.trim() !== ''
-        ? { visibleText: visibleText.trim() }
-        : {}),
+      ...(accessibleName !== undefined ? { accessibleName } : {}),
+      ...(visibleText !== undefined ? { visibleText } : {}),
       confidence: target.confidence,
       bounds: {
         x: target.viewportBounds.x,
@@ -208,17 +343,35 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
 
   const safeParameters = filterSafeGoalParameters(input.goal.parameters);
 
+  // Sanitize goal description and targetHint
+  const sanitizedDescription = sanitizeFreeFormText(input.goal.description) || '';
+  const sanitizedTargetHint =
+    input.goal.targetHint !== undefined
+      ? sanitizeFreeFormText(input.goal.targetHint)
+      : undefined;
+
+  // Sanitize page title and URL
+  const sanitizedTitle =
+    pageRep.metadata?.title !== undefined
+      ? sanitizeFreeFormText(pageRep.metadata.title)
+      : undefined;
+
+  const sanitizedUrlValue =
+    pageRep.metadata?.url !== undefined
+      ? sanitizeUrl(pageRep.metadata.url)
+      : undefined;
+
   return {
     goal: {
       id: input.goal.id,
-      description: input.goal.description,
+      description: sanitizedDescription,
       ...(input.goal.intent !== undefined ? { intent: input.goal.intent } : {}),
-      ...(input.goal.targetHint !== undefined ? { targetHint: input.goal.targetHint } : {}),
+      ...(sanitizedTargetHint !== undefined ? { targetHint: sanitizedTargetHint } : {}),
       ...(safeParameters !== undefined ? { parameters: safeParameters } : {})
     },
     page: {
-      ...(pageRep.metadata?.title !== undefined ? { title: pageRep.metadata.title } : {}),
-      ...(pageRep.metadata?.url !== undefined ? { url: pageRep.metadata.url } : {})
+      ...(sanitizedTitle !== undefined ? { title: sanitizedTitle } : {}),
+      ...(sanitizedUrlValue !== undefined ? { url: sanitizedUrlValue } : {})
     },
     availableTargets: candidateTargets,
     ...(input.context.stepIndex !== undefined ? { stepIndex: input.context.stepIndex } : {})

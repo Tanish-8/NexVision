@@ -18,6 +18,10 @@ import {
   buildAgentUserPrompt,
   parseAdvisoryResponse,
   filterSafeGoalParameters,
+  isSensitiveParameterKey,
+  isSemanticProfileReference,
+  sanitizeFreeFormText,
+  redactObviousCredentials,
   LOCAL_AGENT_SYSTEM_PROMPT,
   type LocalLlamaChatClient,
   DefaultLocalLlamaChatClient
@@ -815,6 +819,396 @@ describe('Phase 5A — Local AI Agent / PlannerDriver Integration', () => {
       if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('offline or unreachable');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Privacy Boundary Hardening Tests (Phase 5A Requirements 1-8)
+  // -------------------------------------------------------------------------
+
+  describe('Privacy Boundary Hardening (Requirements 1-8)', () => {
+    describe('Deterministic Credential Redaction (Requirement 6)', () => {
+      it('redacts obvious Bearer tokens', () => {
+        const text = 'Authorization: Bearer my-secret-bearer-token-123456';
+        const redacted = redactObviousCredentials(text);
+        expect(redacted).not.toContain('my-secret-bearer-token-123456');
+        expect(redacted).toBe('Authorization: [REDACTED_TOKEN]');
+      });
+
+      it('redacts obvious API key formats (sk-..., ghp_..., glpat-...)', () => {
+        const text1 = 'API key is sk-1234567890abcdef1234567890abcdef for OpenAI';
+        expect(redactObviousCredentials(text1)).toBe('API key is [REDACTED_TOKEN] for OpenAI');
+
+        const text2 = 'GitHub token ghp_123456789012345678901234567890123456 used here';
+        expect(redactObviousCredentials(text2)).toBe('GitHub token [REDACTED_TOKEN] used here');
+      });
+
+      it('redacts explicit credential key-value assignments', () => {
+        const text = 'credentials: api_key=secretKeyABC123 and password="SuperSecretPassword"';
+        const redacted = redactObviousCredentials(text);
+        expect(redacted).not.toContain('secretKeyABC123');
+        expect(redacted).not.toContain('SuperSecretPassword');
+        expect(redacted).toBe('credentials: [REDACTED_TOKEN] and [REDACTED_TOKEN]');
+      });
+
+      it('leaves safe task text untouched', () => {
+        expect(redactObviousCredentials('Search for laptops')).toBe('Search for laptops');
+        expect(redactObviousCredentials('Submit search form')).toBe('Submit search form');
+      });
+    });
+
+    describe('Sensitive Parameter Keys (Requirement 3)', () => {
+      it('correctly identifies all 20 required sensitive parameter keys', () => {
+        const requiredKeys = [
+          'password',
+          'passwd',
+          'secret',
+          'token',
+          'auth',
+          'credential',
+          'cookie',
+          'card',
+          'cvv',
+          'cvc',
+          'email',
+          'phone',
+          'telephone',
+          'name',
+          'firstName',
+          'lastName',
+          'address',
+          'street',
+          'postal',
+          'zip'
+        ];
+
+        for (const key of requiredKeys) {
+          expect(isSensitiveParameterKey(key)).toBe(true);
+          expect(isSensitiveParameterKey(key.toLowerCase())).toBe(true);
+          expect(isSensitiveParameterKey(key.toUpperCase())).toBe(true);
+        }
+      });
+
+      it('identifies compound sensitive keys', () => {
+        expect(isSensitiveParameterKey('first_name')).toBe(true);
+        expect(isSensitiveParameterKey('last_name')).toBe(true);
+        expect(isSensitiveParameterKey('user_password')).toBe(true);
+        expect(isSensitiveParameterKey('auth_token')).toBe(true);
+        expect(isSensitiveParameterKey('phone_number')).toBe(true);
+        expect(isSensitiveParameterKey('zip_code')).toBe(true);
+        expect(isSensitiveParameterKey('postal_code')).toBe(true);
+        expect(isSensitiveParameterKey('credit_card')).toBe(true);
+      });
+
+      it('returns false for safe task/query keys', () => {
+        expect(isSensitiveParameterKey('query')).toBe(false);
+        expect(isSensitiveParameterKey('category')).toBe(false);
+        expect(isSensitiveParameterKey('sort')).toBe(false);
+        expect(isSensitiveParameterKey('filter')).toBe(false);
+        expect(isSensitiveParameterKey('brand')).toBe(false);
+        expect(isSensitiveParameterKey('maxPrice')).toBe(false);
+      });
+    });
+
+    describe('Semantic Profile References (Requirement 4)', () => {
+      it('identifies semantic profile references', () => {
+        expect(isSemanticProfileReference('profile.email')).toBe(true);
+        expect(isSemanticProfileReference('profile.firstName')).toBe(true);
+        expect(isSemanticProfileReference('profile.lastName')).toBe(true);
+        expect(isSemanticProfileReference('profile.phone')).toBe(true);
+        expect(isSemanticProfileReference('profile.address')).toBe(true);
+        expect(isSemanticProfileReference('profile.street')).toBe(true);
+        expect(isSemanticProfileReference('profile.zip')).toBe(true);
+      });
+
+      it('rejects raw PII values from being considered profile references', () => {
+        expect(isSemanticProfileReference('test@example.com')).toBe(false);
+        expect(isSemanticProfileReference('John Doe')).toBe(false);
+        expect(isSemanticProfileReference('+91 98765 43210')).toBe(false);
+        expect(isSemanticProfileReference('MyPassword123')).toBe(false);
+        expect(isSemanticProfileReference('4532012345678910')).toBe(false);
+      });
+    });
+
+    describe('Goal Parameters Filtering (Requirements 3, 4, 5)', () => {
+      it('drops sensitive keys when values are raw PII / credentials', () => {
+        const filtered = filterSafeGoalParameters({
+          password: 'SecretPassword!',
+          passwd: 'oldPassword',
+          secret: 'apiSecretKey',
+          token: 'token123456',
+          auth: 'bearer abc',
+          credential: 'myCredential',
+          cookie: 'session=12345',
+          card: '4532012345678910',
+          cvv: '123',
+          cvc: '456',
+          email: 'user@example.com',
+          phone: '+91 98765 43210',
+          telephone: '022-12345678',
+          name: 'Alice Smith',
+          firstName: 'Alice',
+          lastName: 'Smith',
+          address: '123 Main St',
+          street: 'Main St',
+          postal: '10001',
+          zip: '90210'
+        });
+
+        expect(filtered).toBeUndefined();
+      });
+
+      it('preserves semantic profile references even on sensitive keys', () => {
+        const filtered = filterSafeGoalParameters({
+          email: 'profile.email',
+          firstName: 'profile.firstName',
+          lastName: 'profile.lastName',
+          phone: 'profile.phone',
+          address: 'profile.address'
+        });
+
+        expect(filtered).toEqual({
+          email: 'profile.email',
+          firstName: 'profile.firstName',
+          lastName: 'profile.lastName',
+          phone: 'profile.phone',
+          address: 'profile.address'
+        });
+      });
+
+      it('preserves non-sensitive task parameters and redacts free-form PII within them', () => {
+        const filtered = filterSafeGoalParameters({
+          query: 'Search for laptops',
+          note: 'Please email invoice to billing@example.com or call +91 98765 43210 with Bearer secret-auth-tok-123'
+        });
+
+        expect(filtered).toBeDefined();
+        expect(filtered?.query).toBe('Search for laptops');
+        expect(filtered?.note).not.toContain('billing@example.com');
+        expect(filtered?.note).not.toContain('+91 98765 43210');
+        expect(filtered?.note).not.toContain('secret-auth-tok-123');
+        expect(filtered?.note).toContain('[REDACTED_EMAIL]');
+        expect(filtered?.note).toContain('[REDACTED_PHONE]');
+        expect(filtered?.note).toContain('[REDACTED_TOKEN]');
+      });
+    });
+
+    describe('Sanitization of Model-Facing Free-Form Text (Requirement 2)', () => {
+      it('sanitizes goal.description, goal.targetHint, page.title, page.url, accessibleName, and visibleText', () => {
+        const pageWithPii: PageRepresentation = {
+          schemaVersion: '1.0',
+          metadata: {
+            title: 'Account Settings for +91 98765 43210',
+            url: 'https://example.com/checkout?token=secret-token-xyz&user=test%40example.com&orderId=100'
+          },
+          viewport: { width: 1280, height: 800 },
+          elements: [
+            {
+              id: 'elem-support-btn',
+              role: 'button',
+              accessibleName: 'Call support at +91 98765 43210',
+              visibleText: 'Support: test@example.com',
+              interactive: true,
+              bounds: { x: 10, y: 10, width: 200, height: 40 }
+            }
+          ]
+        };
+
+        const target: ActionTarget = {
+          elementId: 'elem-support-btn',
+          point: { x: 110, y: 30 },
+          viewportBounds: { x: 10, y: 10, width: 200, height: 40 },
+          confidence: 0.95,
+          observationId: 'obs-pii-btn',
+          role: 'button'
+        };
+
+        const input = createMockPlannerInput({
+          goal: {
+            id: 'goal-pii-check',
+            description: 'Notify test@example.com and call +91 98765 43210 with Bearer secret-token-456',
+            targetHint: 'Button near user@company.org'
+          },
+          context: {
+            page: pageWithPii,
+            availableTargets: [target],
+            capturedAt: FIXED_TIME - 500,
+            currentTime: FIXED_TIME,
+            stepIndex: 1,
+            completion: { satisfied: false }
+          }
+        });
+
+        const payload = buildModelPromptPayload(input);
+
+        // goal.description sanitized
+        expect(payload.goal.description).not.toContain('test@example.com');
+        expect(payload.goal.description).not.toContain('+91 98765 43210');
+        expect(payload.goal.description).not.toContain('secret-token-456');
+        expect(payload.goal.description).toContain('[REDACTED_EMAIL]');
+        expect(payload.goal.description).toContain('[REDACTED_PHONE]');
+        expect(payload.goal.description).toContain('[REDACTED_TOKEN]');
+
+        // goal.targetHint sanitized
+        expect(payload.goal.targetHint).not.toContain('user@company.org');
+        expect(payload.goal.targetHint).toContain('[REDACTED_EMAIL]');
+
+        // page.title sanitized
+        expect(payload.page.title).not.toContain('+91 98765 43210');
+        expect(payload.page.title).toContain('[REDACTED_PHONE]');
+
+        // page.url sanitized via sanitizeUrl()
+        expect(payload.page.url).not.toContain('secret-token-xyz');
+        expect(payload.page.url).not.toContain('test@example.com');
+        expect(payload.page.url).toContain('[REDACTED_PARAM]');
+
+        // candidate.accessibleName sanitized
+        expect(payload.availableTargets[0].accessibleName).not.toContain('+91 98765 43210');
+        expect(payload.availableTargets[0].accessibleName).toContain('[REDACTED_PHONE]');
+
+        // candidate.visibleText sanitized
+        expect(payload.availableTargets[0].visibleText).not.toContain('test@example.com');
+        expect(payload.availableTargets[0].visibleText).toContain('[REDACTED_EMAIL]');
+      });
+    });
+
+    describe('Final Model Prompt PII Exclusion (Requirement 7)', () => {
+      it('guarantees buildAgentUserPrompt(input) does NOT contain raw PII or credentials', () => {
+        const RAW_EMAIL = 'test@example.com';
+        const RAW_PHONE = '+91 98765 43210';
+        const RAW_CARD = '4532012345678910'; // Valid Luhn Visa card number
+        const RAW_PASSWORD = 'SuperSecretPassword!999';
+        const RAW_SECRET = 'my_top_secret_token_abc123';
+        const RAW_TOKEN = 'bearer-auth-xyz-789';
+
+        const pageWithPii: PageRepresentation = {
+          schemaVersion: '1.0',
+          metadata: {
+            title: `Account for ${RAW_PHONE}`,
+            url: `https://example.com/checkout?token=${RAW_SECRET}&email=${RAW_EMAIL}`
+          },
+          viewport: { width: 1280, height: 800 },
+          elements: [
+            {
+              id: 'elem-card-btn',
+              role: 'button',
+              accessibleName: `Pay with card ${RAW_CARD}`,
+              visibleText: `Contact ${RAW_EMAIL}`,
+              interactive: true,
+              bounds: { x: 10, y: 10, width: 200, height: 40 }
+            }
+          ]
+        };
+
+        const target: ActionTarget = {
+          elementId: 'elem-card-btn',
+          point: { x: 110, y: 30 },
+          viewportBounds: { x: 10, y: 10, width: 200, height: 40 },
+          confidence: 0.95,
+          observationId: 'obs-card',
+          role: 'button'
+        };
+
+        const input = createMockPlannerInput({
+          goal: {
+            id: 'goal-pii-comprehensive',
+            description: `Send payment receipt to ${RAW_EMAIL} or call ${RAW_PHONE}`,
+            targetHint: `Click button for ${RAW_EMAIL}`,
+            parameters: {
+              password: RAW_PASSWORD,
+              secret: RAW_SECRET,
+              token: RAW_TOKEN,
+              email: RAW_EMAIL,
+              phone: RAW_PHONE,
+              card: RAW_CARD,
+              query: 'Purchase subscription'
+            }
+          },
+          context: {
+            page: pageWithPii,
+            availableTargets: [target],
+            capturedAt: FIXED_TIME - 500,
+            currentTime: FIXED_TIME,
+            stepIndex: 1,
+            completion: { satisfied: false }
+          }
+        });
+
+        const prompt = buildAgentUserPrompt(input);
+
+        // Strict assertions: raw PII and credentials must NEVER appear anywhere in the serialized prompt
+        expect(prompt).not.toContain(RAW_EMAIL);
+        expect(prompt).not.toContain(RAW_PHONE);
+        expect(prompt).not.toContain(RAW_CARD);
+        expect(prompt).not.toContain(RAW_PASSWORD);
+        expect(prompt).not.toContain(RAW_SECRET);
+        expect(prompt).not.toContain(RAW_TOKEN);
+
+        // Valid JSON check
+        expect(() => JSON.parse(prompt)).not.toThrow();
+      });
+    });
+
+    describe('Safe Semantic and Task Content Preservation (Requirement 8)', () => {
+      it('preserves safe task descriptions, element text, and semantic profile references', () => {
+        const page: PageRepresentation = {
+          schemaVersion: '1.0',
+          metadata: {
+            title: 'Shop NexVision',
+            url: 'https://example.com/shop'
+          },
+          viewport: { width: 1280, height: 800 },
+          elements: [
+            {
+              id: 'elem-search-btn',
+              role: 'button',
+              accessibleName: 'Search products',
+              visibleText: 'Search products',
+              interactive: true,
+              bounds: { x: 50, y: 50, width: 120, height: 40 }
+            }
+          ]
+        };
+
+        const target: ActionTarget = {
+          elementId: 'elem-search-btn',
+          point: { x: 110, y: 70 },
+          viewportBounds: { x: 50, y: 50, width: 120, height: 40 },
+          confidence: 0.95,
+          observationId: 'obs-search',
+          role: 'button'
+        };
+
+        const input = createMockPlannerInput({
+          goal: {
+            id: 'goal-safe-content',
+            description: 'Search for laptops',
+            parameters: {
+              query: 'Search for laptops',
+              email: 'profile.email',
+              firstName: 'profile.firstName',
+              phone: 'profile.phone'
+            }
+          },
+          context: {
+            page,
+            availableTargets: [target],
+            capturedAt: FIXED_TIME - 500,
+            currentTime: FIXED_TIME,
+            stepIndex: 1,
+            completion: { satisfied: false }
+          }
+        });
+
+        const prompt = buildAgentUserPrompt(input);
+
+        // Positive assertions: safe semantic/task content must be preserved
+        expect(prompt).toContain('Search for laptops');
+        expect(prompt).toContain('Search products');
+        expect(prompt).toContain('profile.email');
+        expect(prompt).toContain('profile.firstName');
+        expect(prompt).toContain('profile.phone');
+      });
     });
   });
 });
