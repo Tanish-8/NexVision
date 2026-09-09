@@ -26,10 +26,11 @@ export const EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
 export const GLOBAL_EMAIL_PATTERN = new RegExp(EMAIL_PATTERN.source, 'gi');
 
 /**
- * Bounded phone pattern matching international and national numbers.
- * Requires at least 7 digits and standard delimiters to prevent false positives on short numbers.
+ * Bounded phone pattern matching complete international and national numbers.
+ * Enforces non-digit boundaries on both sides so substrings inside larger numbers cannot match.
  */
-export const PHONE_PATTERN = /(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/;
+export const PHONE_PATTERN =
+  /(?<!\d[-.\s]?)(?<![\d+])(?:\+\d{1,4}[-.\s]?)?(?:\(?\d{2,5}\)?[-.\s]?)?\d{3,5}[-.\s]?\d{4,5}(?![-.\s]?\d)/;
 export const GLOBAL_PHONE_PATTERN = new RegExp(PHONE_PATTERN.source, 'g');
 
 /** Candidate card number pattern: 13-19 digits with optional spaces or hyphens. */
@@ -102,31 +103,41 @@ function containsValidCard(text: string): boolean {
 }
 
 /**
- * Verifies digit count for phone candidates to avoid flagging simple numbers or dates.
- * Excludes substrings that are valid Luhn payment cards.
+ * Extracts all valid complete phone number candidates from a text string.
+ * Enforces ITU-T E.164 digit length rules (7-15 digits), rejects malformed
+ * fragments and longer digit sequences, and excludes payment cards.
  */
-function containsValidPhone(text: string): boolean {
-  // Strip out valid card matches to prevent card numbers from being misidentified as phones
-  let candidateText = text;
-  const cardMatches = text.match(GLOBAL_CARD_CANDIDATE_PATTERN);
-  if (cardMatches) {
-    for (const card of cardMatches) {
-      if (isValidLuhn(card)) {
-        candidateText = candidateText.split(card).join(' ');
-      }
-    }
-  }
+export function getValidPhoneMatches(text: string | undefined): string[] {
+  if (!text) return [];
+  const matches = text.match(GLOBAL_PHONE_PATTERN);
+  if (!matches) return [];
 
-  const matches = candidateText.match(GLOBAL_PHONE_PATTERN);
-  if (!matches) return false;
-
+  const results: string[] = [];
   for (const match of matches) {
     const digitsOnly = match.replace(/\D/g, '');
-    if (digitsOnly.length >= 7 && digitsOnly.length <= 15) {
-      return true;
+    // Phone numbers must have between 7 and 15 digits
+    if (digitsOnly.length < 7 || digitsOnly.length > 15) continue;
+
+    // Compact numbers without country prefix or formatting delimiters should not exceed 11 digits
+    const hasDelimiters = /[\s().-]/.test(match);
+    const hasCountryPrefix = match.trim().startsWith('+');
+    if (!hasDelimiters && !hasCountryPrefix && digitsOnly.length > 11) {
+      continue;
     }
+
+    // Must not be a valid Luhn payment card
+    if (isValidLuhn(match)) continue;
+
+    results.push(match);
   }
-  return false;
+  return results;
+}
+
+/**
+ * Verifies if text contains at least one valid complete phone number.
+ */
+function containsValidPhone(text: string): boolean {
+  return getValidPhoneMatches(text).length > 0;
 }
 
 /**

@@ -15,7 +15,7 @@ import {
   detectPrivacyFindings,
   GLOBAL_CARD_CANDIDATE_PATTERN,
   GLOBAL_EMAIL_PATTERN,
-  GLOBAL_PHONE_PATTERN
+  getValidPhoneMatches
 } from './detector.js';
 import { isValidLuhn } from './luhn.js';
 import {
@@ -70,28 +70,15 @@ export function redactText(text: string | undefined): string | undefined {
     }
   }
 
-  // 3. Redact phone numbers (validated by digit length 7-15)
-  const phoneMatches = result.match(GLOBAL_PHONE_PATTERN);
-  if (phoneMatches) {
-    for (const candidate of phoneMatches) {
-      const digitsOnly = candidate.replace(/\D/g, '');
-      if (digitsOnly.length >= 7 && digitsOnly.length <= 15) {
-        result = result.split(candidate).join(REDACTION_PHONE_OR_LEAVE(candidate));
-      }
-    }
+  // 3. Redact phone numbers (validated complete candidates)
+  const phoneMatches = getValidPhoneMatches(result);
+  for (const candidate of phoneMatches) {
+    result = result.split(candidate).join(REDACTION_TOKENS.PHONE);
   }
 
   return result;
 }
 
-function REDACTION_PHONE_OR_LEAVE(candidate: string): string {
-  // Avoid redacting pure 4-digit years or non-phone substrings
-  const digitsOnly = candidate.replace(/\D/g, '');
-  if (digitsOnly.length >= 7 && digitsOnly.length <= 15) {
-    return REDACTION_TOKENS.PHONE;
-  }
-  return candidate;
-}
 
 /**
  * Sanitizes a URL by preserving scheme, domain, and path while redacting

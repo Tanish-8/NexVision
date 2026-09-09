@@ -208,8 +208,8 @@ describe('Local Privacy Engine (Phase 4)', () => {
     expect(sanitizedResult.findings.length).toBe(0);
   });
 
-  // 8. Deterministic sanitization
-  it('produces byte-for-byte deterministic output across repeated executions', () => {
+  // 8. Deterministic sanitization content
+  it('produces identical sanitized PageRepresentation and findings across repeated executions', () => {
     const page = createBaseRepresentation([
       {
         id: 'elem-1',
@@ -221,11 +221,11 @@ describe('Local Privacy Engine (Phase 4)', () => {
     const result1 = sanitizePageRepresentation(page);
     const result2 = sanitizePageRepresentation(page);
 
-    // Ensure identical redacted texts and findings
-    expect(result1.pageRepresentation.elements[0].visibleText).toBe(
-      result2.pageRepresentation.elements[0].visibleText
-    );
+    // Verify sanitized PageRepresentation and findings are identical (excluding execution timestamp)
+    expect(result1.pageRepresentation).toEqual(result2.pageRepresentation);
     expect(result1.findings).toEqual(result2.findings);
+    expect(result1.metadata.totalFindings).toBe(result2.metadata.totalFindings);
+    expect(result1.metadata.categoryCounts).toEqual(result2.metadata.categoryCounts);
   });
 
   // 9. Original sensitive values absent from sanitized representation
@@ -465,5 +465,116 @@ describe('Local Privacy Engine (Phase 4)', () => {
     expect(sanitizedUrl).not.toContain(SYNTHETIC_EMAIL);
     expect(sanitizedUrl).toContain('tab=settings');
     expect(sanitizedUrl).toContain(REDACTION_TOKENS.PARAM);
+  });
+
+  // 21. Phone regression suite (Fix 2)
+  describe('Phone regression suite (Fix 2)', () => {
+    // A. Indian international format
+    it('sanitizes Indian international format (+91 98765 43210) completely with no trailing digits', () => {
+      const rawPhone = '+91 98765 43210';
+      const page = createBaseRepresentation([
+        { id: 'elem-in-intl', tagName: 'p', visibleText: `Reach us at ${rawPhone} for inquiries` }
+      ]);
+
+      const result = sanitizePageRepresentation(page);
+      const text = result.pageRepresentation.elements[0].visibleText || '';
+
+      expect(text).toContain(REDACTION_TOKENS.PHONE);
+      expect(text).not.toContain(rawPhone);
+      expect(text).toBe(`Reach us at ${REDACTION_TOKENS.PHONE} for inquiries`);
+    });
+
+    // B. Indian hyphenated format
+    it('sanitizes Indian hyphenated format (+91-98765-43210) completely', () => {
+      const rawPhone = '+91-98765-43210';
+      const page = createBaseRepresentation([
+        { id: 'elem-in-hyphen', tagName: 'span', visibleText: `Helpdesk: ${rawPhone}` }
+      ]);
+
+      const result = sanitizePageRepresentation(page);
+      const text = result.pageRepresentation.elements[0].visibleText || '';
+
+      expect(text).toContain(REDACTION_TOKENS.PHONE);
+      expect(text).not.toContain(rawPhone);
+      expect(text).toBe(`Helpdesk: ${REDACTION_TOKENS.PHONE}`);
+    });
+
+    // C. Indian domestic spaced format
+    it('sanitizes Indian domestic spaced format (98765 43210) completely', () => {
+      const rawPhone = '98765 43210';
+      const page = createBaseRepresentation([
+        { id: 'elem-in-spaced', tagName: 'div', visibleText: `Call ${rawPhone} today.` }
+      ]);
+
+      const result = sanitizePageRepresentation(page);
+      const text = result.pageRepresentation.elements[0].visibleText || '';
+
+      expect(text).toContain(REDACTION_TOKENS.PHONE);
+      expect(text).not.toContain(rawPhone);
+      expect(text).toBe(`Call ${REDACTION_TOKENS.PHONE} today.`);
+    });
+
+    // D. Indian domestic compact format
+    it('sanitizes Indian domestic compact format (9876543210) completely', () => {
+      const rawPhone = '9876543210';
+      const page = createBaseRepresentation([
+        { id: 'elem-in-compact', tagName: 'p', visibleText: `Mobile: ${rawPhone}` }
+      ]);
+
+      const result = sanitizePageRepresentation(page);
+      const text = result.pageRepresentation.elements[0].visibleText || '';
+
+      expect(text).toContain(REDACTION_TOKENS.PHONE);
+      expect(text).not.toContain(rawPhone);
+      expect(text).toBe(`Mobile: ${REDACTION_TOKENS.PHONE}`);
+    });
+
+    // E. Existing international format
+    it('sanitizes existing international format (+1-555-867-5309) completely', () => {
+      const rawPhone = '+1-555-867-5309';
+      const page = createBaseRepresentation([
+        { id: 'elem-us-intl', tagName: 'p', visibleText: `US Office: ${rawPhone}` }
+      ]);
+
+      const result = sanitizePageRepresentation(page);
+      const text = result.pageRepresentation.elements[0].visibleText || '';
+
+      expect(text).toContain(REDACTION_TOKENS.PHONE);
+      expect(text).not.toContain(rawPhone);
+      expect(text).toBe(`US Office: ${REDACTION_TOKENS.PHONE}`);
+    });
+
+    // F. Partial / malformed candidates
+    it('rejects malformed or incomplete phone candidates without classifying or redacting them', () => {
+      const page = createBaseRepresentation([
+        { id: 'elem-short-1', tagName: 'span', visibleText: 'Postal code: 12345' },
+        { id: 'elem-short-2', tagName: 'span', visibleText: 'Invalid country code: +91 123' },
+        { id: 'elem-short-3', tagName: 'span', visibleText: 'Incomplete sequence: 555-43' }
+      ]);
+
+      const result = sanitizePageRepresentation(page);
+
+      expect(result.pageRepresentation.elements[0].visibleText).toBe('Postal code: 12345');
+      expect(result.pageRepresentation.elements[1].visibleText).toBe('Invalid country code: +91 123');
+      expect(result.pageRepresentation.elements[2].visibleText).toBe('Incomplete sequence: 555-43');
+      expect(result.findings.some((f) => f.category === 'phone')).toBe(false);
+    });
+
+    // G. Longer numeric sequence (catching the original partial-match bug)
+    it('prevents partial phone redaction when phone-like substrings appear inside larger numeric sequences', () => {
+      const page = createBaseRepresentation([
+        { id: 'elem-order', tagName: 'p', visibleText: 'Order 9999876543210000 processed.' },
+        { id: 'elem-tracking', tagName: 'p', visibleText: 'Tracking: 9998765432101234' },
+        { id: 'elem-continuous', tagName: 'p', visibleText: 'ID 12345678901234567890' }
+      ]);
+
+      const result = sanitizePageRepresentation(page);
+
+      // Verify that larger sequences are NOT partially redacted with [REDACTED_PHONE]
+      expect(result.pageRepresentation.elements[0].visibleText).toBe('Order 9999876543210000 processed.');
+      expect(result.pageRepresentation.elements[1].visibleText).toBe('Tracking: 9998765432101234');
+      expect(result.pageRepresentation.elements[2].visibleText).toBe('ID 12345678901234567890');
+      expect(result.findings.some((f) => f.category === 'phone')).toBe(false);
+    });
   });
 });
