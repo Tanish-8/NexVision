@@ -1,141 +1,46 @@
 /**
  * Phase 5A — Local AI Agent / Task Understanding Integration.
  *
- * Implements the first AI-agent reasoning layer for NexVision, connecting
- * local LLM inference infrastructure to the Phase 2F-3 action contracts.
+ * Connects local LLM inference infrastructure to the authoritative Phase 3A
+ * Planner architecture by implementing the PlannerDriver contract.
  *
  * Invariants:
- * - Reasoning layer only: NO DOM execution, NO clicks, NO typing, NO navigation (Phase 6 boundary).
- * - NO autonomous loops, NO SEE->THINK->ACT loop, NO recovery loops (Phase 7 boundary).
+ * - Implements PlannerDriver; delegates ALL validation, coordinate resolution,
+ *   role compatibility, and IntendedAction creation to Phase 3A planNextStep().
+ * - Reasoning layer only: NO browser execution, NO clicks, NO typing, NO DOM mutation (Phase 6).
+ * - NO autonomous loops, NO SEE->THINK->ACT loops, NO recovery loops (Phase 7).
  * - Strictly local LLM inference: connects only to local llama-server (default 127.0.0.1:8080).
  * - Privacy-first: model receives only an allowlisted, sanitized DTO.
  * - Never forwards raw DOM, passwords, input values, cookies, storage, or screenshot bytes.
- * - Security boundary: LLM may ONLY select from availableTargets; never synthesizes coordinates or targets.
  * - Single atomic action per cycle: exactly one of 'click' | 'type' | 'focus', or 'COMPLETED'.
  * - Strict JSON advisory response parsing; rejects prose, malformed JSON, and out-of-bounds values.
- * - Passes proposals through the existing Phase 2F-3 action validation pipeline.
  */
 
+import type { ActionType } from '../shared/actions.js';
+import type { PageElement } from '../shared/types.js';
 import {
-  type ActionTarget,
-  type ActionType,
-  type IntendedAction,
-  type TypeActionPayload,
-  createIntendedAction,
-  validateIntendedAction
-} from '../shared/actions.js';
-
-import type {
-  PageElement,
-  PageRepresentation,
-  SanitizedPageRepresentation
-} from '../shared/types.js';
+  type AdvisoryProposalResult,
+  type AdvisoryStepProposal,
+  type PlannerDriver,
+  type PlannerInput,
+  type PlannerResult,
+  planNextStep
+} from '../shared/planner.js';
 
 import { stripMarkdownFences } from './llamaVisionAdapter.js';
 
-// ---------------------------------------------------------------------------
-// 1. Contracts & Types
-// ---------------------------------------------------------------------------
-
-/**
- * Natural language user goal and optional structured intent/parameters.
- */
-export interface GoalInput {
-  readonly description: string;
-  readonly intent?: string;
-  readonly parameters?: Record<string, unknown>;
-}
-
-/**
- * Planner context containing sanitized page state and grounded candidate targets.
- */
-export interface PlannerContext {
-  readonly page: PageRepresentation | SanitizedPageRepresentation;
-  readonly availableTargets: readonly ActionTarget[];
-  /** Explicit completion flag from planner context. */
-  readonly isCompleted?: boolean;
-}
-
-/**
- * Complete input contract provided to the local agent planner.
- */
-export interface PlannerInput {
-  readonly goal: GoalInput;
-  readonly context: PlannerContext;
-  readonly stepIndex?: number;
-  readonly currentTime?: number;
-}
-
-/**
- * Strict structured advisory step proposal produced by the local LLM.
- */
-export type AdvisoryStepProposal =
-  | {
-      readonly type: 'ACTION';
-      readonly targetElementId: string;
-      readonly actionType: ActionType;
-      readonly payload?: TypeActionPayload;
-      readonly rationale?: string;
-      readonly estimatedProgress?: number;
-    }
-  | {
-      readonly type: 'COMPLETED';
-      readonly rationale?: string;
-    };
-
-/**
- * Result of advisory response parsing.
- */
-export type AdvisoryProposalResult =
-  | {
-      readonly success: true;
-      readonly proposal: AdvisoryStepProposal;
-    }
-  | {
-      readonly success: false;
-      readonly reason: PlannerFailureReason;
-      readonly message: string;
-    };
-
-/**
- * Failure reasons aligned with Phase 3A / 5A planner vocabulary.
- */
-export type PlannerFailureReason =
-  | 'INVALID_INPUT'
-  | 'STALE_PERCEPTION'
-  | 'NO_FEASIBLE_TARGET'
-  | 'LOW_CONFIDENCE'
-  | 'UNKNOWN_TARGET'
-  | 'INCOMPATIBLE_ACTION'
-  | 'INVALID_ACTION_INTENT'
-  | 'UNSUPPORTED_GOAL'
-  | 'MODEL_ERROR';
-
-/**
- * Validated planner result returned by the local agent.
- */
-export type PlannerResult =
-  | {
-      readonly success: true;
-      readonly status: 'ACTION_PLANNED';
-      readonly action: IntendedAction;
-      readonly rationale?: string;
-      readonly estimatedProgress?: number;
-    }
-  | {
-      readonly success: true;
-      readonly status: 'COMPLETED';
-      readonly rationale?: string;
-    }
-  | {
-      readonly success: false;
-      readonly status: 'FAILED';
-      readonly reason: PlannerFailureReason;
-      readonly message: string;
-    };
+// Re-export authoritative planner contracts for consumers
+export type {
+  AdvisoryProposalResult,
+  AdvisoryStepProposal,
+  PlannerDriver,
+  PlannerInput,
+  PlannerResult
+};
+export { planNextStep };
 
 // ---------------------------------------------------------------------------
-// 2. Allowlisted Model-Facing DTO (Privacy Boundary)
+// 1. Allowlisted Model-Facing DTO (Privacy Boundary)
 // ---------------------------------------------------------------------------
 
 /**
@@ -166,13 +71,15 @@ export interface ModelPageContext {
 
 /**
  * Explicit model-facing DTO constructed from PlannerInput.
- * Blind serialization is prohibited.
+ * Blind serialization of raw structures is prohibited.
  */
 export interface ModelPromptPayload {
   readonly goal: {
+    readonly id: string;
     readonly description: string;
     readonly intent?: string;
-    readonly parameters?: Record<string, unknown>;
+    readonly targetHint?: string;
+    readonly parameters?: Record<string, string>;
   };
   readonly page: ModelPageContext;
   readonly availableTargets: readonly ModelCandidateTarget[];
@@ -180,7 +87,7 @@ export interface ModelPromptPayload {
 }
 
 // ---------------------------------------------------------------------------
-// 3. System Instruction & Prompt Construction
+// 2. System Instruction & Prompt Construction
 // ---------------------------------------------------------------------------
 
 export const LOCAL_AGENT_SYSTEM_PROMPT =
@@ -198,16 +105,43 @@ export const LOCAL_AGENT_SYSTEM_PROMPT =
   'Schema for completion:\n' +
   '{"type": "COMPLETED", "rationale": "<brief reason>"}';
 
+const SENSITIVE_PARAM_KEY_PATTERN =
+  /password|secret|token|cookie|credential|auth|card|cvv|ssn|pin/i;
+
+const SENSITIVE_PARAM_VALUE_PATTERN =
+  /bearer\s+[a-zA-Z0-9_\-\.]+|session=[a-zA-Z0-9_\-\.]+|\b[0-9]{13,19}\b/i;
+
 /**
- * Helper to unwrap PageRepresentation from either PageRepresentation or SanitizedPageRepresentation.
+ * Filters goal parameters to allow ONLY safe keys or semantic references (e.g. 'profile.email').
+ * Strips any sensitive credentials or raw PII values.
  */
-function unwrapPageRepresentation(
-  page: PageRepresentation | SanitizedPageRepresentation
-): PageRepresentation {
-  if ('pageRepresentation' in page && typeof page.pageRepresentation === 'object') {
-    return page.pageRepresentation;
+export function filterSafeGoalParameters(
+  params?: Record<string, string>
+): Record<string, string> | undefined {
+  if (!params || typeof params !== 'object') {
+    return undefined;
   }
-  return page as PageRepresentation;
+
+  const safeParams: Record<string, string> = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof key !== 'string' || typeof value !== 'string') {
+      continue;
+    }
+
+    // Reject keys with sensitive identifiers
+    if (SENSITIVE_PARAM_KEY_PATTERN.test(key)) {
+      continue;
+    }
+
+    // Reject values containing raw tokens/cards/sessions
+    if (SENSITIVE_PARAM_VALUE_PATTERN.test(value)) {
+      continue;
+    }
+
+    safeParams[key] = value;
+  }
+
+  return Object.keys(safeParams).length > 0 ? safeParams : undefined;
 }
 
 /**
@@ -215,7 +149,7 @@ function unwrapPageRepresentation(
  * Deterministic: preserves candidate ordering and allowlists safe fields only.
  */
 export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload {
-  const pageRep = unwrapPageRepresentation(input.context.page);
+  const pageRep = input.context.page;
 
   // Build element lookup map for enriching candidate targets
   const elementMap = new Map<string, PageElement>();
@@ -237,6 +171,8 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
     const matchedElement = elementMap.get(target.elementId);
     const role = target.role || matchedElement?.role;
     const accessibleName = matchedElement?.accessibleName;
+
+    // Check if element could contain sensitive user input
     const isPassword =
       matchedElement?.inputType?.toLowerCase() === 'password' ||
       matchedElement?.role?.toLowerCase() === 'password' ||
@@ -270,18 +206,22 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
     });
   }
 
+  const safeParameters = filterSafeGoalParameters(input.goal.parameters);
+
   return {
     goal: {
+      id: input.goal.id,
       description: input.goal.description,
       ...(input.goal.intent !== undefined ? { intent: input.goal.intent } : {}),
-      ...(input.goal.parameters !== undefined ? { parameters: input.goal.parameters } : {})
+      ...(input.goal.targetHint !== undefined ? { targetHint: input.goal.targetHint } : {}),
+      ...(safeParameters !== undefined ? { parameters: safeParameters } : {})
     },
     page: {
       ...(pageRep.metadata?.title !== undefined ? { title: pageRep.metadata.title } : {}),
       ...(pageRep.metadata?.url !== undefined ? { url: pageRep.metadata.url } : {})
     },
     availableTargets: candidateTargets,
-    ...(input.stepIndex !== undefined ? { stepIndex: input.stepIndex } : {})
+    ...(input.context.stepIndex !== undefined ? { stepIndex: input.context.stepIndex } : {})
   };
 }
 
@@ -294,7 +234,7 @@ export function buildAgentUserPrompt(input: PlannerInput): string {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Strict Output Parsing
+// 3. Strict Output Parsing into AdvisoryProposalResult
 // ---------------------------------------------------------------------------
 
 const SUPPORTED_ACTION_TYPES: readonly ActionType[] = ['click', 'type', 'focus'];
@@ -306,9 +246,8 @@ const SUPPORTED_ACTION_TYPES: readonly ActionType[] = ['click', 'type', 'focus']
 export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResult {
   if (typeof rawContent !== 'string' || rawContent.trim() === '') {
     return {
-      success: false,
-      reason: 'MODEL_ERROR',
-      message: 'Model returned empty or non-string response'
+      status: 'FAILED',
+      reason: 'Model returned empty or non-string response'
     };
   }
 
@@ -320,17 +259,15 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
     parsed = JSON.parse(cleaned);
   } catch {
     return {
-      success: false,
-      reason: 'MODEL_ERROR',
-      message: 'Failed to parse model output as valid JSON'
+      status: 'FAILED',
+      reason: 'Failed to parse model output as valid JSON'
     };
   }
 
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     return {
-      success: false,
-      reason: 'MODEL_ERROR',
-      message: 'Model output must be a non-null JSON object'
+      status: 'FAILED',
+      reason: 'Model output must be a non-null JSON object'
     };
   }
 
@@ -339,9 +276,8 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
   // 1. Validate type discriminator
   if (typeof obj['type'] !== 'string') {
     return {
-      success: false,
-      reason: 'MODEL_ERROR',
-      message: 'Model response missing required "type" property'
+      status: 'FAILED',
+      reason: 'Model response missing required "type" property'
     };
   }
 
@@ -349,17 +285,16 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
 
   // 2. Handle COMPLETED
   if (type === 'COMPLETED') {
-    const rationale =
+    const summary =
       typeof obj['rationale'] === 'string' && obj['rationale'].trim() !== ''
         ? obj['rationale'].trim()
-        : undefined;
+        : typeof obj['summary'] === 'string' && obj['summary'].trim() !== ''
+          ? obj['summary'].trim()
+          : 'Goal completed according to model reasoning';
 
     return {
-      success: true,
-      proposal: {
-        type: 'COMPLETED',
-        ...(rationale !== undefined ? { rationale } : {})
-      }
+      status: 'COMPLETED',
+      summary
     };
   }
 
@@ -371,9 +306,8 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
       obj['targetElementId'].trim() === ''
     ) {
       return {
-        success: false,
-        reason: 'MODEL_ERROR',
-        message: 'Model ACTION proposal missing required non-empty "targetElementId"'
+        status: 'FAILED',
+        reason: 'Model ACTION proposal missing required non-empty "targetElementId"'
       };
     }
     const targetElementId = obj['targetElementId'].trim();
@@ -384,9 +318,8 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
       !SUPPORTED_ACTION_TYPES.includes(obj['actionType'] as ActionType)
     ) {
       return {
-        success: false,
-        reason: 'INCOMPATIBLE_ACTION',
-        message: `Unsupported actionType "${String(obj['actionType'])}". Supported: ${SUPPORTED_ACTION_TYPES.join(', ')}`
+        status: 'FAILED',
+        reason: `Unsupported actionType "${String(obj['actionType'])}". Supported: ${SUPPORTED_ACTION_TYPES.join(', ')}`
       };
     }
     const actionType = obj['actionType'] as ActionType;
@@ -402,31 +335,28 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
         prog > 1
       ) {
         return {
-          success: false,
-          reason: 'INVALID_INPUT',
-          message: `Invalid estimatedProgress "${String(prog)}": must be a finite number between 0 and 1`
+          status: 'FAILED',
+          reason: `Invalid estimatedProgress "${String(prog)}": must be a finite number between 0 and 1`
         };
       }
       estimatedProgress = prog;
     }
 
     // Validate payload
-    let payload: TypeActionPayload | undefined;
+    let payload: AdvisoryStepProposal['payload'];
     if (actionType === 'type') {
       if (typeof obj['payload'] !== 'object' || obj['payload'] === null) {
         return {
-          success: false,
-          reason: 'INVALID_ACTION_INTENT',
-          message: 'Action "type" requires a payload object with a "text" string'
+          status: 'FAILED',
+          reason: 'Action "type" requires a payload object with a "text" string'
         };
       }
 
       const rawPayload = obj['payload'] as Record<string, unknown>;
       if (typeof rawPayload['text'] !== 'string') {
         return {
-          success: false,
-          reason: 'INVALID_ACTION_INTENT',
-          message: 'payload.text must be a string for "type" actions'
+          status: 'FAILED',
+          reason: 'payload.text must be a string for "type" actions'
         };
       }
 
@@ -435,9 +365,8 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
         typeof rawPayload['clearFirst'] !== 'boolean'
       ) {
         return {
-          success: false,
-          reason: 'INVALID_ACTION_INTENT',
-          message: 'payload.clearFirst must be a boolean when supplied'
+          status: 'FAILED',
+          reason: 'payload.clearFirst must be a boolean when supplied'
         };
       }
 
@@ -446,9 +375,8 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
         typeof rawPayload['pressEnter'] !== 'boolean'
       ) {
         return {
-          success: false,
-          reason: 'INVALID_ACTION_INTENT',
-          message: 'payload.pressEnter must be a boolean when supplied'
+          status: 'FAILED',
+          reason: 'payload.pressEnter must be a boolean when supplied'
         };
       }
 
@@ -466,16 +394,15 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
     const rationale =
       typeof obj['rationale'] === 'string' && obj['rationale'].trim() !== ''
         ? obj['rationale'].trim()
-        : undefined;
+        : `Action '${actionType}' planned for target '${targetElementId}'`;
 
     return {
-      success: true,
+      status: 'ACTION',
       proposal: {
-        type: 'ACTION',
         targetElementId,
         actionType,
         ...(payload !== undefined ? { payload } : {}),
-        ...(rationale !== undefined ? { rationale } : {}),
+        rationale,
         ...(estimatedProgress !== undefined ? { estimatedProgress } : {})
       }
     };
@@ -483,160 +410,13 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
 
   // Unrecognized type
   return {
-    success: false,
-    reason: 'MODEL_ERROR',
-    message: `Unrecognized proposal type "${type}". Expected "ACTION" or "COMPLETED"`
+    status: 'FAILED',
+    reason: `Unrecognized proposal type "${type}". Expected "ACTION" or "COMPLETED"`
   };
 }
 
 // ---------------------------------------------------------------------------
-// 5. Proposal Validation & Action Pipeline
-// ---------------------------------------------------------------------------
-
-/** Non-textual roles that cannot receive a 'type' action. */
-const NON_TEXTUAL_ROLES: readonly string[] = [
-  'button',
-  'link',
-  'image',
-  'heading',
-  'navigation',
-  'alert',
-  'dialog',
-  'progressbar',
-  'status',
-  'region'
-];
-
-/**
- * Validates an AdvisoryStepProposal against the PlannerInput context and creates
- * a validated IntendedAction via Phase 2F-3 contracts.
- */
-export function validateProposalAndCreateAction(
-  proposal: AdvisoryStepProposal,
-  input: PlannerInput
-): PlannerResult {
-  // 1. Completion handling (Section 17)
-  if (proposal.type === 'COMPLETED') {
-    if (input.context.isCompleted !== true) {
-      return {
-        success: false,
-        status: 'FAILED',
-        reason: 'UNSUPPORTED_GOAL',
-        message:
-          'Model proposed COMPLETED but planner context does not indicate completion is valid'
-      };
-    }
-    return {
-      success: true,
-      status: 'COMPLETED',
-      ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {})
-    };
-  }
-
-  // 2. Target membership validation (Section 9 Security Rule)
-  // LLM can NEVER synthesize coordinates or elements; MUST select from availableTargets.
-  const target = input.context.availableTargets.find(
-    (t) => t.elementId === proposal.targetElementId
-  );
-
-  if (!target) {
-    return {
-      success: false,
-      status: 'FAILED',
-      reason: 'UNKNOWN_TARGET',
-      message: `Target element "${proposal.targetElementId}" is not in availableTargets`
-    };
-  }
-
-  // 3. Interactivity & Role/Action Compatibility Validation (Section 10)
-  const pageRep = unwrapPageRepresentation(input.context.page);
-  const matchedElement = Array.isArray(pageRep.elements)
-    ? pageRep.elements.find((el) => el?.id === proposal.targetElementId)
-    : undefined;
-
-  // Interactivity check
-  if (matchedElement?.interactive === false) {
-    return {
-      success: false,
-      status: 'FAILED',
-      reason: 'INCOMPATIBLE_ACTION',
-      message: `Target element "${proposal.targetElementId}" is marked non-interactive`
-    };
-  }
-
-  // Disabled check
-  if (matchedElement?.state?.disabled === true) {
-    return {
-      success: false,
-      status: 'FAILED',
-      reason: 'INCOMPATIBLE_ACTION',
-      message: `Target element "${proposal.targetElementId}" is disabled`
-    };
-  }
-
-  // Role compatibility for 'type'
-  const effectiveRole = target.role || matchedElement?.role;
-  if (
-    proposal.actionType === 'type' &&
-    effectiveRole &&
-    NON_TEXTUAL_ROLES.includes(effectiveRole.toLowerCase())
-  ) {
-    return {
-      success: false,
-      status: 'FAILED',
-      reason: 'INCOMPATIBLE_ACTION',
-      message: `Action "type" is incompatible with target role "${effectiveRole}"`
-    };
-  }
-
-  // 4. Create IntendedAction via existing Phase 2F-3 contract
-  const actionCreation = createIntendedAction({
-    type: proposal.actionType,
-    target,
-    payload: proposal.payload,
-    timestamp: input.currentTime
-  });
-
-  if (!actionCreation.success) {
-    let mappedReason: PlannerFailureReason = 'INVALID_ACTION_INTENT';
-    if (actionCreation.reason === 'INVALID_TARGET') {
-      mappedReason = 'NO_FEASIBLE_TARGET';
-    } else if (actionCreation.reason === 'UNSUPPORTED_ACTION_TYPE') {
-      mappedReason = 'INCOMPATIBLE_ACTION';
-    }
-
-    return {
-      success: false,
-      status: 'FAILED',
-      reason: mappedReason,
-      message: actionCreation.message
-    };
-  }
-
-  // 5. Validate IntendedAction via existing Phase 2F-3 contract
-  const actionValidation = validateIntendedAction(actionCreation.action);
-  if (!actionValidation.success) {
-    return {
-      success: false,
-      status: 'FAILED',
-      reason: 'INVALID_ACTION_INTENT',
-      message: actionValidation.message
-    };
-  }
-
-  return {
-    success: true,
-    status: 'ACTION_PLANNED',
-    action: actionValidation.action,
-    ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
-    ...(proposal.estimatedProgress !== undefined
-      ? { estimatedProgress: proposal.estimatedProgress }
-      : {})
-  };
-}
-
-// ---------------------------------------------------------------------------
-// 6. Local LLM Client Abstraction & Factory
+// 4. Local LLM Client Abstraction & Factory
 // ---------------------------------------------------------------------------
 
 /**
@@ -817,13 +597,15 @@ export class DefaultLocalLlamaChatClient implements LocalLlamaChatClient {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Local Agent Implementation
+// 5. Local Agent PlannerDriver Implementation
 // ---------------------------------------------------------------------------
 
 /**
- * Local AI agent reasoning layer for browser task understanding and planning.
+ * Local AI agent advisory driver implementing the Phase 3A PlannerDriver contract.
+ * Generates structured AdvisoryStepProposal outputs for Phase 3A validation.
  */
-export class LocalAgent {
+export class LocalAgentDriver implements PlannerDriver {
+  readonly name: string = 'LocalAgentDriver';
   private readonly client: LocalLlamaChatClient;
 
   constructor(clientOrOptions?: LocalLlamaChatClient | LocalLlamaAgentOptions) {
@@ -835,60 +617,13 @@ export class LocalAgent {
   }
 
   /**
-   * Plans the single next atomic step for a given user goal and planner context.
+   * Proposes the next advisory step for a given PlannerInput context.
    */
-  async planNextStep(input: PlannerInput): Promise<PlannerResult> {
-    // 1. Validate input structure
-    if (!input || typeof input !== 'object') {
-      return {
-        success: false,
-        status: 'FAILED',
-        reason: 'INVALID_INPUT',
-        message: 'PlannerInput must be a non-null object'
-      };
-    }
-
-    if (!input.goal || typeof input.goal.description !== 'string' || input.goal.description.trim() === '') {
-      return {
-        success: false,
-        status: 'FAILED',
-        reason: 'INVALID_INPUT',
-        message: 'goal.description must be a non-empty string'
-      };
-    }
-
-    if (!input.context || typeof input.context !== 'object') {
-      return {
-        success: false,
-        status: 'FAILED',
-        reason: 'INVALID_INPUT',
-        message: 'PlannerInput.context must be a non-null object'
-      };
-    }
-
-    if (!Array.isArray(input.context.availableTargets)) {
-      return {
-        success: false,
-        status: 'FAILED',
-        reason: 'INVALID_INPUT',
-        message: 'PlannerInput.context.availableTargets must be an array'
-      };
-    }
-
-    // Check if targets are available when completion is not signaled
-    if (input.context.availableTargets.length === 0 && input.context.isCompleted !== true) {
-      return {
-        success: false,
-        status: 'FAILED',
-        reason: 'NO_FEASIBLE_TARGET',
-        message: 'No available action targets provided in planner context'
-      };
-    }
-
-    // 2. Safe allowlisted prompt construction
+  async proposeStep(input: PlannerInput): Promise<AdvisoryProposalResult> {
+    // 1. Safe allowlisted prompt construction
     const userPrompt = buildAgentUserPrompt(input);
 
-    // 3. Asynchronous local inference call
+    // 2. Asynchronous local inference call
     const chatResult = await this.client.chat({
       systemPrompt: LOCAL_AGENT_SYSTEM_PROMPT,
       userPrompt
@@ -896,26 +631,57 @@ export class LocalAgent {
 
     if (!chatResult.success) {
       return {
-        success: false,
         status: 'FAILED',
-        reason: 'MODEL_ERROR',
-        message: chatResult.error.message
+        reason: chatResult.error.message
       };
     }
 
-    // 4. Strict response parsing
-    const parseResult = parseAdvisoryResponse(chatResult.content);
-    if (!parseResult.success) {
-      return {
-        success: false,
-        status: 'FAILED',
-        reason: parseResult.reason,
-        message: parseResult.message
-      };
+    // 3. Strict response parsing
+    const parsed = parseAdvisoryResponse(chatResult.content);
+
+    // 4. Respect explicit completion preconditions
+    if (parsed.status === 'COMPLETED') {
+      if (input.context.completion?.satisfied !== true) {
+        return {
+          status: 'FAILED',
+          reason: 'UNSUPPORTED_GOAL'
+        };
+      }
     }
 
-    // 5. Action validation pipeline (target membership, compatibility, createIntendedAction)
-    return validateProposalAndCreateAction(parseResult.proposal, input);
+    return parsed;
+  }
+}
+
+/**
+ * Factory function creating a LocalAgentDriver.
+ */
+export function createLocalAgentDriver(
+  clientOrOptions?: LocalLlamaChatClient | LocalLlamaAgentOptions
+): LocalAgentDriver {
+  return new LocalAgentDriver(clientOrOptions);
+}
+
+// ---------------------------------------------------------------------------
+// 6. High-Level LocalAgent Wrapper
+// ---------------------------------------------------------------------------
+
+/**
+ * High-level LocalAgent combining LocalAgentDriver with the authoritative
+ * Phase 3A planNextStep() validation pipeline.
+ */
+export class LocalAgent {
+  readonly driver: LocalAgentDriver;
+
+  constructor(clientOrOptions?: LocalLlamaChatClient | LocalLlamaAgentOptions) {
+    this.driver = new LocalAgentDriver(clientOrOptions);
+  }
+
+  /**
+   * Plans the next validated step by delegating to Phase 3A planNextStep().
+   */
+  async planNextStep(input: PlannerInput): Promise<PlannerResult> {
+    return planNextStep(input, this.driver);
   }
 }
 

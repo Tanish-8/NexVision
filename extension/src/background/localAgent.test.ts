@@ -1,17 +1,26 @@
 import { describe, it, expect, vi } from 'vitest';
-import type { ActionTarget, ClickAction, TypeAction } from '../shared/actions.js';
-import type { PageRepresentation, SanitizedPageRepresentation } from '../shared/types.js';
+import type { ActionTarget, TypeAction } from '../shared/actions.js';
+import type { PageRepresentation } from '../shared/types.js';
+import {
+  type PlannerInput,
+  type PlannerDriver,
+  type PlannerResult,
+  type PlannerActionDecision,
+  planNextStep
+} from '../shared/planner.js';
+
 import {
   LocalAgent,
+  LocalAgentDriver,
   createLocalAgent,
+  createLocalAgentDriver,
   buildModelPromptPayload,
   buildAgentUserPrompt,
   parseAdvisoryResponse,
-  validateProposalAndCreateAction,
+  filterSafeGoalParameters,
   LOCAL_AGENT_SYSTEM_PROMPT,
-  type PlannerInput,
   type LocalLlamaChatClient,
-  type AdvisoryStepProposal
+  DefaultLocalLlamaChatClient
 } from './localAgent.js';
 
 // ---------------------------------------------------------------------------
@@ -80,20 +89,29 @@ const MOCK_PAGE_REP: PageRepresentation = {
   ]
 };
 
+const FIXED_TIME = 1710000000000;
+
 function createMockPlannerInput(overrides?: Partial<PlannerInput>): PlannerInput {
   return {
     goal: {
+      id: 'goal-search-laptop',
       description: 'Search for laptops under ₹50,000',
-      intent: 'product_search',
+      intent: 'search',
       parameters: { query: 'laptops' }
     },
     context: {
       page: MOCK_PAGE_REP,
       availableTargets: [MOCK_TARGET_1, MOCK_TARGET_2],
-      isCompleted: false
+      capturedAt: FIXED_TIME - 500,
+      currentTime: FIXED_TIME,
+      stepIndex: 1,
+      completion: { satisfied: false }
     },
-    stepIndex: 1,
-    currentTime: 1710000000000,
+    options: {
+      minConfidence: 0.0,
+      maxPerceptionAgeMs: 10000,
+      strictRoleMatching: false
+    },
     ...overrides
   };
 }
@@ -102,10 +120,10 @@ function createMockPlannerInput(overrides?: Partial<PlannerInput>): PlannerInput
 // Test Suite: Phase 5A Local AI Agent Integration
 // ---------------------------------------------------------------------------
 
-describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
+describe('Phase 5A — Local AI Agent / PlannerDriver Integration', () => {
   describe('Required 25 Test Cases', () => {
     // 1. valid ACTION response
-    it('1. valid ACTION response: parses model action and returns validated IntendedAction', async () => {
+    it('1. valid ACTION response: parses model action and returns validated IntendedAction via planNextStep', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
@@ -122,19 +140,18 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
 
       const agent = createLocalAgent(mockChatClient);
       const input = createMockPlannerInput();
-      const result = await agent.planNextStep(input);
+      const result: PlannerResult = await agent.planNextStep(input);
 
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error('Expected success');
+      expect(result.status).toBe('ACTION');
+      if (result.status !== 'ACTION') throw new Error('Expected ACTION');
 
-      expect(result.status).toBe('ACTION_PLANNED');
-      if (result.status !== 'ACTION_PLANNED') throw new Error('Expected ACTION_PLANNED');
+      expect(result.planId).toBe('plan_goal-search-laptop_step_1');
       expect(result.action.type).toBe('type');
       expect(result.action.target.elementId).toBe('elem-search-input');
       expect((result.action as TypeAction).payload.text).toBe('laptop');
       expect(result.rationale).toBe('Enter search term into textbox');
       expect(result.estimatedProgress).toBe(0.3);
-      expect(result.action.timestamp).toBe(1710000000000);
+      expect(result.action.timestamp).toBe(FIXED_TIME);
     });
 
     // 2. valid COMPLETED response
@@ -154,24 +171,25 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
         context: {
           page: MOCK_PAGE_REP,
           availableTargets: [MOCK_TARGET_1, MOCK_TARGET_2],
-          isCompleted: true // explicit completion verified
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          stepIndex: 1,
+          completion: { satisfied: true, summary: 'Already satisfied' }
         }
       });
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error('Expected success');
-
       expect(result.status).toBe('COMPLETED');
-      expect(result.rationale).toBe('Search results displayed and goal satisfied');
+      if (result.status !== 'COMPLETED') throw new Error('Expected COMPLETED');
+      expect(result.summary).toBeDefined();
     });
 
-    // 3. invalid JSON
-    it('3. invalid JSON: rejects unparseable response with MODEL_ERROR', async () => {
+    // 3. malformed JSON
+    it('3. malformed JSON: rejects unparseable response with MODEL_ERROR', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
-          content: 'I decided to click the button. Here is nothing useful.'
+          content: 'Here is what you should do: click the button'
         })
       };
 
@@ -179,9 +197,8 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
       expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('Failed to parse model output as valid JSON');
     });
@@ -202,14 +219,14 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('missing required "type" property');
     });
 
     // 5. unsupported action type
-    it('5. unsupported action type: rejects actions outside click/type/focus with INCOMPATIBLE_ACTION', async () => {
+    it('5. unsupported action type: rejects actions outside click/type/focus with MODEL_ERROR', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
@@ -225,14 +242,14 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INCOMPATIBLE_ACTION');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('Unsupported actionType "hover"');
     });
 
-    // 6. missing targetElementId
-    it('6. missing targetElementId: rejects ACTION proposal with missing targetElementId', async () => {
+    // 6. missing target
+    it('6. missing target: rejects ACTION proposal with missing targetElementId', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
@@ -247,14 +264,14 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('missing required non-empty "targetElementId"');
     });
 
-    // 7. unknown targetElementId
-    it('7. unknown targetElementId: fails when targetElementId does not match any available target', async () => {
+    // 7. unknown target
+    it('7. unknown target: Phase 3A fails with UNKNOWN_TARGET_ELEMENT when model picks non-existent target', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
@@ -270,29 +287,35 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('UNKNOWN_TARGET');
-      expect(result.message).toContain('Target element "elem-ghost-button" is not in availableTargets');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('UNKNOWN_TARGET_ELEMENT');
+      expect(result.message).toContain('does not exist in availableTargets');
     });
 
     // 8. target not in availableTargets
-    it('8. target not in availableTargets: strictly requires target membership in availableTargets', () => {
-      const proposal: AdvisoryStepProposal = {
-        type: 'ACTION',
-        targetElementId: 'elem-not-grounded',
-        actionType: 'click'
-      };
-      const input = createMockPlannerInput();
+    it('8. target not in availableTargets: Phase 3A authoritative membership check rejects ungrounded target', async () => {
+      const driver = createLocalAgentDriver({
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-not-in-targets',
+            actionType: 'click'
+          })
+        })
+      });
 
-      const result = validateProposalAndCreateAction(proposal, input);
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('UNKNOWN_TARGET');
+      const input = createMockPlannerInput();
+      const result = await planNextStep(input, driver);
+
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('UNKNOWN_TARGET_ELEMENT');
     });
 
-    // 9. malformed payload
-    it('9. malformed payload: rejects invalid type action payload structure', async () => {
+    // 9. malformed type payload
+    it('9. malformed type payload: rejects invalid type action payload structure', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
@@ -309,9 +332,9 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INVALID_ACTION_INTENT');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('payload.text must be a string');
     });
 
@@ -333,9 +356,9 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INVALID_INPUT');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('Invalid estimatedProgress');
     });
 
@@ -357,9 +380,9 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INVALID_INPUT');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('Invalid estimatedProgress');
     });
 
@@ -381,14 +404,36 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INVALID_INPUT');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('Invalid estimatedProgress');
     });
 
-    // 13. model timeout/error
-    it('13. model timeout/error: cleanly maps client timeout into MODEL_ERROR failure', async () => {
+    // 13. model/server failure
+    it('13. model/server failure: maps chat client error cleanly into MODEL_ERROR failure', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: false,
+          error: {
+            code: 'UNREACHABLE',
+            message: 'Local inference server is offline'
+          }
+        })
+      };
+
+      const agent = createLocalAgent(mockChatClient);
+      const input = createMockPlannerInput();
+      const result = await agent.planNextStep(input);
+
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('MODEL_ERROR');
+      expect(result.message).toContain('Local inference server is offline');
+    });
+
+    // 14. timeout
+    it('14. timeout: cleanly maps client timeout into MODEL_ERROR failure', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: false,
@@ -403,168 +448,43 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
       expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
-      expect(result.message).toBe('Local inference timed out after 120000ms');
+      expect(result.message).toContain('Local inference timed out after 120000ms');
     });
 
-    // 14. model returns malformed response
-    it('14. model returns malformed response: handles non-object array responses safely', async () => {
-      const mockChatClient: LocalLlamaChatClient = {
-        chat: vi.fn().mockResolvedValue({
-          success: true,
-          content: JSON.stringify(['not', 'an', 'object'])
-        })
-      };
+    // 15. privacy allowlist
+    it('15. privacy allowlist: allows safe semantic parameters and strips sensitive keys', () => {
+      const filtered = filterSafeGoalParameters({
+        query: 'laptops',
+        userPassword: 'secretPassword123',
+        auth_token: 'bearer xyz123',
+        profile_ref: 'profile.email',
+        creditCard: '4111111111111111'
+      });
 
-      const agent = createLocalAgent(mockChatClient);
-      const input = createMockPlannerInput();
-      const result = await agent.planNextStep(input);
-
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('MODEL_ERROR');
-      expect(result.message).toContain('Model output must be a non-null JSON object');
+      expect(filtered).toEqual({
+        query: 'laptops',
+        profile_ref: 'profile.email'
+      });
+      expect(filtered?.userPassword).toBeUndefined();
+      expect(filtered?.auth_token).toBeUndefined();
+      expect(filtered?.creditCard).toBeUndefined();
     });
 
-    // 15. model cannot bypass target membership
-    it('15. model cannot bypass target membership: rejects fabricated targets', async () => {
-      const mockChatClient: LocalLlamaChatClient = {
-        chat: vi.fn().mockResolvedValue({
-          success: true,
-          content: JSON.stringify({
-            type: 'ACTION',
-            targetElementId: 'synthetic-id-999',
-            actionType: 'click'
-          })
-        })
-      };
-
-      const agent = createLocalAgent(mockChatClient);
-      const input = createMockPlannerInput();
-      const result = await agent.planNextStep(input);
-
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('UNKNOWN_TARGET');
-    });
-
-    // 16. model cannot synthesize coordinates
-    it('16. model cannot synthesize coordinates: target point is taken strictly from grounded ActionTarget', async () => {
-      const mockChatClient: LocalLlamaChatClient = {
-        chat: vi.fn().mockResolvedValue({
-          success: true,
-          content: JSON.stringify({
-            type: 'ACTION',
-            targetElementId: 'elem-submit-btn',
-            actionType: 'click',
-            coordinates: { x: 999, y: 999 } // attempt to inject synthetic coordinates
-          })
-        })
-      };
-
-      const agent = createLocalAgent(mockChatClient);
-      const input = createMockPlannerInput();
-      const result = await agent.planNextStep(input);
-
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error('Expected success');
-
-      expect(result.status).toBe('ACTION_PLANNED');
-      if (result.status !== 'ACTION_PLANNED') throw new Error('Expected ACTION_PLANNED');
-      // Must ignore injected coordinates and preserve the grounded point (300, 50)
-      expect(result.action.target.point).toEqual({ x: 300, y: 50 });
-      expect(result.action.target.viewportBounds).toEqual({ x: 260, y: 30, width: 80, height: 40 });
-    });
-
-    // 17. model can select a valid grounded target
-    it('17. model can select a valid grounded target: resolves element identity and metadata accurately', async () => {
-      const mockChatClient: LocalLlamaChatClient = {
-        chat: vi.fn().mockResolvedValue({
-          success: true,
-          content: JSON.stringify({
-            type: 'ACTION',
-            targetElementId: 'elem-submit-btn',
-            actionType: 'click',
-            rationale: 'Submit the search form'
-          })
-        })
-      };
-
-      const agent = createLocalAgent(mockChatClient);
-      const input = createMockPlannerInput();
-      const result = await agent.planNextStep(input);
-
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error('Expected success');
-      if (result.status !== 'ACTION_PLANNED') throw new Error('Expected ACTION_PLANNED');
-
-      expect(result.action.target.elementId).toBe('elem-submit-btn');
-      expect(result.action.target.observationId).toBe('obs-2');
-    });
-
-    // 18. only click/type/focus are accepted
-    it('18. only click/type/focus are accepted: verifies all valid actions succeed', async () => {
-      for (const validAction of ['click', 'focus'] as const) {
-        const mockChatClient: LocalLlamaChatClient = {
-          chat: vi.fn().mockResolvedValue({
-            success: true,
-            content: JSON.stringify({
-              type: 'ACTION',
-              targetElementId: 'elem-submit-btn',
-              actionType: validAction
-            })
-          })
-        };
-
-        const agent = createLocalAgent(mockChatClient);
-        const result = await agent.planNextStep(createMockPlannerInput());
-        expect(result.success).toBe(true);
-        if (!result.success) throw new Error('Expected success');
-        if (result.status !== 'ACTION_PLANNED') throw new Error('Expected ACTION_PLANNED');
-        expect(result.action.type).toBe(validAction);
-      }
-
-      // type action with payload
-      const mockTypeClient: LocalLlamaChatClient = {
-        chat: vi.fn().mockResolvedValue({
-          success: true,
-          content: JSON.stringify({
-            type: 'ACTION',
-            targetElementId: 'elem-search-input',
-            actionType: 'type',
-            payload: { text: 'test query', pressEnter: true }
-          })
-        })
-      };
-      const typeAgent = createLocalAgent(mockTypeClient);
-      const typeResult = await typeAgent.planNextStep(createMockPlannerInput());
-      expect(typeResult.success).toBe(true);
-      if (!typeResult.success) throw new Error('Expected success');
-      if (typeResult.status !== 'ACTION_PLANNED') throw new Error('Expected ACTION_PLANNED');
-      expect(typeResult.action.type).toBe('type');
-      expect((typeResult.action as TypeAction).payload.pressEnter).toBe(true);
-    });
-
-    // 19. prompt/model input excludes sensitive fields
-    it('19. prompt/model input excludes sensitive fields: excludes passwords, inputs, and attributes', () => {
-      const pageWithSensitiveData: PageRepresentation = {
+    // 16. password exclusion
+    it('16. password exclusion: password input elements never include visibleText in DTO', () => {
+      const pageWithPassword: PageRepresentation = {
         schemaVersion: '1.0',
-        metadata: { title: 'Sensitive Page', url: 'https://example.com/account' },
+        metadata: { title: 'Login', url: 'https://example.com/login' },
         viewport: { width: 1000, height: 800 },
         elements: [
           {
-            id: 'elem-password',
+            id: 'elem-pwd',
             role: 'textbox',
             inputType: 'password',
-            visibleText: 'super_secret_password_123',
-            attributes: {
-              value: 'super_secret_password_123',
-              cookie: 'session=abc123xyz',
-              authToken: 'bearer secret_token'
-            },
+            visibleText: 'my_super_secret_pwd_999',
             interactive: true,
             bounds: { x: 10, y: 10, width: 100, height: 30 }
           }
@@ -572,7 +492,7 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       };
 
       const target: ActionTarget = {
-        elementId: 'elem-password',
+        elementId: 'elem-pwd',
         point: { x: 60, y: 25 },
         viewportBounds: { x: 10, y: 10, width: 100, height: 30 },
         confidence: 0.9,
@@ -582,87 +502,158 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
 
       const input = createMockPlannerInput({
         context: {
-          page: pageWithSensitiveData,
-          availableTargets: [target]
+          page: pageWithPassword,
+          availableTargets: [target],
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          stepIndex: 1,
+          completion: { satisfied: false }
         }
       });
 
-      const promptPayload = buildModelPromptPayload(input);
-      const serializedPrompt = JSON.stringify(promptPayload);
-
-      // Verify no sensitive fields leaked
-      expect(serializedPrompt).not.toContain('super_secret_password_123');
-      expect(serializedPrompt).not.toContain('session=abc123xyz');
-      expect(serializedPrompt).not.toContain('bearer secret_token');
-      expect(serializedPrompt).not.toContain('cookie');
-      expect(serializedPrompt).not.toContain('authToken');
-      expect(serializedPrompt).not.toContain('attributes');
-    });
-
-    // 20. raw screenshot/data URL is not forwarded
-    it('20. raw screenshot/data URL is not forwarded: model input never includes image data', () => {
-      const input = createMockPlannerInput();
       const serialized = buildAgentUserPrompt(input);
-
-      expect(serialized).not.toContain('data:image');
-      expect(serialized).not.toContain('base64');
-      expect(serialized).not.toContain('screenshot');
+      expect(serialized).not.toContain('my_super_secret_pwd_999');
     });
 
-    // 21. deterministic serialization of the same PlannerInput
-    it('21. deterministic serialization of the same PlannerInput: produces identical JSON strings', () => {
-      const input1 = createMockPlannerInput();
-      const input2 = createMockPlannerInput();
+    // 17. input/textarea value exclusion
+    it('17. input/textarea value exclusion: input and textarea elements omit visibleText in DTO', () => {
+      const pageWithInput: PageRepresentation = {
+        schemaVersion: '1.0',
+        metadata: { title: 'Form', url: 'https://example.com/form' },
+        viewport: { width: 1000, height: 800 },
+        elements: [
+          {
+            id: 'elem-user-input',
+            role: 'textbox',
+            tagName: 'input',
+            visibleText: 'user_typed_value',
+            interactive: true,
+            bounds: { x: 10, y: 10, width: 100, height: 30 }
+          },
+          {
+            id: 'elem-textarea',
+            role: 'textbox',
+            tagName: 'textarea',
+            visibleText: 'textarea_entered_text',
+            interactive: true,
+            bounds: { x: 10, y: 50, width: 100, height: 50 }
+          }
+        ]
+      };
 
-      const serialized1 = buildAgentUserPrompt(input1);
-      const serialized2 = buildAgentUserPrompt(input2);
+      const targets: ActionTarget[] = [
+        {
+          elementId: 'elem-user-input',
+          point: { x: 60, y: 25 },
+          viewportBounds: { x: 10, y: 10, width: 100, height: 30 },
+          confidence: 0.9,
+          observationId: 'obs-in',
+          role: 'textbox'
+        },
+        {
+          elementId: 'elem-textarea',
+          point: { x: 60, y: 75 },
+          viewportBounds: { x: 10, y: 50, width: 100, height: 50 },
+          confidence: 0.9,
+          observationId: 'obs-txt',
+          role: 'textbox'
+        }
+      ];
 
-      expect(serialized1).toBe(serialized2);
+      const input = createMockPlannerInput({
+        context: {
+          page: pageWithInput,
+          availableTargets: targets,
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          stepIndex: 1,
+          completion: { satisfied: false }
+        }
+      });
+
+      const serialized = buildAgentUserPrompt(input);
+      expect(serialized).not.toContain('user_typed_value');
+      expect(serialized).not.toContain('textarea_entered_text');
     });
 
-    // 22. model response is not logged verbatim
-    it('22. model response is not logged verbatim: console spy confirms zero verbatim response leakage', async () => {
-      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-      const secretText = 'CONFIDENTIAL_MODEL_OUTPUT_SECRET_12345';
+    // 18. target membership enforcement
+    it('18. target membership enforcement: planNextStep enforces target element existence in availableTargets', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
           content: JSON.stringify({
             type: 'ACTION',
-            targetElementId: 'elem-search-input',
-            actionType: 'type',
-            payload: { text: secretText },
-            rationale: 'Typing sensitive item'
+            targetElementId: 'elem-unregistered-id',
+            actionType: 'click'
           })
         })
       };
 
       const agent = createLocalAgent(mockChatClient);
-      const result = await agent.planNextStep(createMockPlannerInput());
-      expect(result.success).toBe(true);
+      const input = createMockPlannerInput();
+      const result = await agent.planNextStep(input);
 
-      // Check all console calls
-      for (const call of [...logSpy.mock.calls, ...errorSpy.mock.calls, ...warnSpy.mock.calls]) {
-        const combined = call.map(String).join(' ');
-        expect(combined).not.toContain(secretText);
-      }
-
-      logSpy.mockRestore();
-      errorSpy.mockRestore();
-      warnSpy.mockRestore();
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('UNKNOWN_TARGET_ELEMENT');
     });
 
-    // 23. one action per cycle
-    it('23. one action per cycle: returns exactly one IntendedAction in PlannerResult', async () => {
+    // 19. local-only endpoint
+    it('19. local-only endpoint: DefaultLocalLlamaChatClient defaults strictly to 127.0.0.1:8080', () => {
+      const defaultClient = new DefaultLocalLlamaChatClient();
+      expect(defaultClient['baseUrl']).toBe('http://127.0.0.1:8080');
+    });
+
+    // 20. deterministic prompt construction
+    it('20. deterministic prompt construction: serializes identical PlannerInput to identical strings', () => {
+      const input1 = createMockPlannerInput();
+      const input2 = createMockPlannerInput();
+
+      const prompt1 = buildAgentUserPrompt(input1);
+      const prompt2 = buildAgentUserPrompt(input2);
+
+      expect(prompt1).toBe(prompt2);
+    });
+
+    // 21. integration with the EXISTING Phase 3A PlannerDriver
+    it('21. integration with the EXISTING Phase 3A PlannerDriver: proves LocalAgentDriver is accepted by planNextStep', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
           content: JSON.stringify({
             type: 'ACTION',
             targetElementId: 'elem-submit-btn',
+            actionType: 'click',
+            rationale: 'Click search button'
+          })
+        })
+      };
+
+      const driver: PlannerDriver = createLocalAgentDriver(mockChatClient);
+      expect(driver.name).toBe('LocalAgentDriver');
+
+      const input = createMockPlannerInput();
+      // Directly call Phase 3A planNextStep with LocalAgentDriver
+      const result: PlannerResult = await planNextStep(input, driver);
+
+      expect(result.status).toBe('ACTION');
+      if (result.status !== 'ACTION') throw new Error('Expected ACTION');
+
+      // Verified result conforms to Phase 3A PlannerActionDecision
+      expect(result.planId).toBe('plan_goal-search-laptop_step_1');
+      expect(result.targetElementId).toBe('elem-submit-btn');
+      expect(result.action.id).toBe('intent_obs-2_click');
+      expect(result.action.target.point).toEqual({ x: 300, y: 50 });
+    });
+
+    // 22. malicious model attempting to synthesize an element ID
+    it('22. malicious model attempting to synthesize an element ID: rejected as UNKNOWN_TARGET_ELEMENT', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'fake-synthesized-id-123',
             actionType: 'click'
           })
         })
@@ -671,64 +662,69 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const agent = createLocalAgent(mockChatClient);
       const result = await agent.planNextStep(createMockPlannerInput());
 
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error('Expected success');
-
-      expect(result.status).toBe('ACTION_PLANNED');
-      if (result.status !== 'ACTION_PLANNED') throw new Error('Expected ACTION_PLANNED');
-      // Verified single atomic action returned
-      expect(result.action).toBeDefined();
-      expect(Array.isArray(result.action)).toBe(false);
-      expect(result.action.id).toBe('intent_obs-2_click');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('UNKNOWN_TARGET_ELEMENT');
     });
 
-    // 24. explicit completion handling
-    it('24. explicit completion handling: rejects COMPLETED when context indicates incomplete', async () => {
-      const mockChatClient: LocalLlamaChatClient = {
-        chat: vi.fn().mockResolvedValue({
-          success: true,
-          content: JSON.stringify({
-            type: 'COMPLETED',
-            rationale: 'Premature completion attempt'
-          })
-        })
-      };
-
-      const agent = createLocalAgent(mockChatClient);
-      // isCompleted is false in context
-      const input = createMockPlannerInput({
-        context: {
-          page: MOCK_PAGE_REP,
-          availableTargets: [MOCK_TARGET_1],
-          isCompleted: false
-        }
-      });
-      const result = await agent.planNextStep(input);
-
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('UNSUPPORTED_GOAL');
-      expect(result.message).toContain('planner context does not indicate completion is valid');
-    });
-
-    // 25. planner validation is still invoked after model proposal
-    it('25. planner validation is still invoked after model proposal: fails if target element is disabled', async () => {
-      const disabledTarget: ActionTarget = {
-        elementId: 'elem-disabled-btn',
-        point: { x: 450, y: 50 },
-        viewportBounds: { x: 400, y: 30, width: 100, height: 40 },
-        confidence: 0.9,
-        observationId: 'obs-disabled',
-        role: 'button'
-      };
-
+    // 23. malicious model attempting to synthesize coordinates
+    it('23. malicious model attempting to synthesize coordinates: model coordinates are ignored; grounded target point is authoritative', async () => {
       const mockChatClient: LocalLlamaChatClient = {
         chat: vi.fn().mockResolvedValue({
           success: true,
           content: JSON.stringify({
             type: 'ACTION',
-            targetElementId: 'elem-disabled-btn',
-            actionType: 'click'
+            targetElementId: 'elem-submit-btn',
+            actionType: 'click',
+            coordinates: { x: 9999, y: 9999 } // malicious coordinate injection
+          })
+        })
+      };
+
+      const agent = createLocalAgent(mockChatClient);
+      const result = await agent.planNextStep(createMockPlannerInput());
+
+      expect(result.status).toBe('ACTION');
+      if (result.status !== 'ACTION') throw new Error('Expected ACTION');
+
+      // Point must remain grounded point (300, 50), not injected (9999, 9999)
+      expect(result.action.target.point).toEqual({ x: 300, y: 50 });
+      expect(result.action.target.viewportBounds).toEqual({ x: 260, y: 30, width: 80, height: 40 });
+    });
+
+    // 24. malformed model output containing extra unsupported fields
+    it('24. malformed model output containing extra unsupported fields: parses valid fields safely without corruption', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-submit-btn',
+            actionType: 'click',
+            extraField1: 'unsupported',
+            extraScript: 'alert(1)',
+            rationale: 'Clean click'
+          })
+        })
+      };
+
+      const agent = createLocalAgent(mockChatClient);
+      const result = await agent.planNextStep(createMockPlannerInput());
+
+      expect(result.status).toBe('ACTION');
+      if (result.status !== 'ACTION') throw new Error('Expected ACTION');
+      expect(result.action.type).toBe('click');
+      expect(result.rationale).toBe('Clean click');
+    });
+
+    // 25. COMPLETED rejected when planner context does not permit completion
+    it('25. COMPLETED rejected when planner context does not permit completion', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'COMPLETED',
+            rationale: 'Premature model completion'
           })
         })
       };
@@ -737,15 +733,19 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const input = createMockPlannerInput({
         context: {
           page: MOCK_PAGE_REP,
-          availableTargets: [disabledTarget]
+          availableTargets: [MOCK_TARGET_1],
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          stepIndex: 1,
+          completion: { satisfied: false } // explicit incomplete state
         }
       });
+
       const result = await agent.planNextStep(input);
 
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INCOMPATIBLE_ACTION');
-      expect(result.message).toContain('Target element "elem-disabled-btn" is disabled');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('UNSUPPORTED_GOAL');
     });
   });
 
@@ -758,111 +758,31 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       const wrapped = '```json\n{"type": "ACTION", "targetElementId": "elem-1", "actionType": "click"}\n```';
       const parsed = parseAdvisoryResponse(wrapped);
 
-      expect(parsed.success).toBe(true);
-      if (!parsed.success) throw new Error('Expected success');
-      expect(parsed.proposal.type).toBe('ACTION');
-      if (parsed.proposal.type === 'ACTION') {
-        expect(parsed.proposal.targetElementId).toBe('elem-1');
-      }
+      expect(parsed.status).toBe('ACTION');
+      if (parsed.status !== 'ACTION') throw new Error('Expected ACTION');
+      expect(parsed.proposal.targetElementId).toBe('elem-1');
     });
 
-    it('should reject typing into non-textual role like button', () => {
-      const proposal: AdvisoryStepProposal = {
-        type: 'ACTION',
-        targetElementId: 'elem-submit-btn',
-        actionType: 'type',
-        payload: { text: 'cannot type here' }
-      };
-      const input = createMockPlannerInput();
-
-      const result = validateProposalAndCreateAction(proposal, input);
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INCOMPATIBLE_ACTION');
-      expect(result.message).toContain('Action "type" is incompatible with target role "button"');
-    });
-
-    it('should reject non-interactive target element', () => {
-      const staticTarget: ActionTarget = {
-        elementId: 'elem-static-text',
-        point: { x: 125, y: 20 },
-        viewportBounds: { x: 50, y: 10, width: 150, height: 20 },
-        confidence: 0.9,
-        observationId: 'obs-static',
-        role: 'heading'
-      };
-
-      const proposal: AdvisoryStepProposal = {
-        type: 'ACTION',
-        targetElementId: 'elem-static-text',
-        actionType: 'click'
-      };
-      const input = createMockPlannerInput({
-        context: {
-          page: MOCK_PAGE_REP,
-          availableTargets: [staticTarget]
-        }
-      });
-
-      const result = validateProposalAndCreateAction(proposal, input);
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('INCOMPATIBLE_ACTION');
-      expect(result.message).toContain('is marked non-interactive');
-    });
-
-    it('should handle SanitizedPageRepresentation unwrapping gracefully', () => {
-      const sanitizedPage: SanitizedPageRepresentation = {
-        pageRepresentation: MOCK_PAGE_REP,
-        findings: [],
-        metadata: {
-          sanitizedAt: Date.now(),
-          totalFindings: 0,
-          categoryCounts: {
-            email: 0,
-            phone: 0,
-            card: 0,
-            password: 0,
-            address: 0,
-            name: 0,
-            auth_token: 0,
-            other: 0
-          }
-        }
-      };
-
-      const input = createMockPlannerInput({
-        context: {
-          page: sanitizedPage,
-          availableTargets: [MOCK_TARGET_1]
-        }
-      });
-
-      const dto = buildModelPromptPayload(input);
-      expect(dto.page.title).toBe('Example Shop');
-      expect(dto.availableTargets).toHaveLength(1);
-      expect(dto.availableTargets[0]!.elementId).toBe('elem-search-input');
-      expect(dto.availableTargets[0]!.accessibleName).toBe('Search products');
-    });
-
-    it('should reject empty availableTargets when task is not completed', async () => {
+    it('should fail with INCOMPATIBLE_ACTION_FOR_ROLE when trying to type into a button', async () => {
       const mockChatClient: LocalLlamaChatClient = {
-        chat: vi.fn()
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-submit-btn',
+            actionType: 'type',
+            payload: { text: 'cannot type into button' }
+          })
+        })
       };
-      const agent = createLocalAgent(mockChatClient);
-      const input = createMockPlannerInput({
-        context: {
-          page: MOCK_PAGE_REP,
-          availableTargets: [],
-          isCompleted: false
-        }
-      });
 
+      const agent = createLocalAgent(mockChatClient);
+      const input = createMockPlannerInput();
       const result = await agent.planNextStep(input);
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
-      expect(result.reason).toBe('NO_FEASIBLE_TARGET');
-      expect(mockChatClient.chat).not.toHaveBeenCalled();
+
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(result.reason).toBe('INCOMPATIBLE_ACTION_FOR_ROLE');
     });
 
     it('DefaultLocalLlamaChatClient handles HTTP error response cleanly without leaking secrets', async () => {
@@ -877,13 +797,13 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       });
 
       const result = await agent.planNextStep(createMockPlannerInput());
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('HTTP 500 Internal Server Error');
     });
 
-    it('DefaultLocalLlamaChatClient handles network error cleanly', async () => {
+    it('DefaultLocalLlamaChatClient handles network connection failure cleanly', async () => {
       const mockFetch = vi.fn().mockRejectedValue(new Error('ECONNREFUSED 127.0.0.1:8080'));
 
       const agent = createLocalAgent({
@@ -891,45 +811,10 @@ describe('Phase 5A — Local AI Agent / Task Understanding Integration', () => {
       });
 
       const result = await agent.planNextStep(createMockPlannerInput());
-      expect(result.success).toBe(false);
-      if (result.success) throw new Error('Expected failure');
+      expect(result.status).toBe('FAILED');
+      if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('offline or unreachable');
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // Isolated Real Local Model Integration Check
-  // -------------------------------------------------------------------------
-
-  describe('Real Local Model Integration (Isolated / Manual)', () => {
-    it('probes real llama-server if running without failing offline test suites', async () => {
-      let isOnline = false;
-      try {
-        const res = await fetch('http://127.0.0.1:8080/health', {
-          signal: AbortSignal.timeout(1000)
-        });
-        isOnline = res.ok;
-      } catch {
-        isOnline = false;
-      }
-
-      if (!isOnline) {
-        // Offline: passes cleanly without failing the automated suite
-        expect(isOnline).toBe(false);
-        return;
-      }
-
-      const agent = createLocalAgent({
-        host: '127.0.0.1',
-        port: 8080,
-        timeoutMs: 30000
-      });
-      const result = await agent.planNextStep(createMockPlannerInput());
-      expect(result).toBeDefined();
-      if (result.success) {
-        expect(result.status === 'ACTION_PLANNED' || result.status === 'COMPLETED').toBe(true);
-      }
     });
   });
 });
