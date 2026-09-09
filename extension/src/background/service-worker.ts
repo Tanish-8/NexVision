@@ -261,6 +261,28 @@ router.register(MessageType.UNIFIED_PERCEPTION_REQUEST, async (
 });
 
 /**
+ * Handle action execution requests.
+ */
+router.register(MessageType.EXECUTE_ACTION_REQUEST, async (
+  payload: any,
+  _sender: chrome.runtime.MessageSender
+): Promise<ExtensionResponse> => {
+  try {
+    const { executeAction } = await import('./executor.js');
+    const result = await executeAction(payload);
+    return {
+      success: true,
+      data: result
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Action execution failed'
+    };
+  }
+});
+
+/**
  * Register Chrome runtime listeners.
  * Guarded so the module can be imported in test environments where
  * chrome is not defined at module load time. The exported helper

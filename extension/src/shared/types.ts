@@ -185,7 +185,9 @@ export const MessageType = {
   PAGE_SNAPSHOT: 'page-snapshot',
   EXTENSION_READY: 'extension-ready',
   CAPTURE_SCREENSHOT_REQUEST: 'capture-screenshot-request',
-  UNIFIED_PERCEPTION_REQUEST: 'unified-perception-request'
+  UNIFIED_PERCEPTION_REQUEST: 'unified-perception-request',
+  EXECUTE_ACTION_REQUEST: 'execute-action-request',
+  EXECUTE_ACTION_RESPONSE: 'execute-action-response'
 } as const;
 
 export type MessageType = typeof MessageType[keyof typeof MessageType];
@@ -271,3 +273,58 @@ export type {
   CssViewportRect,
   ScreenshotPixelRect
 } from './coordinates.js';
+
+import type { ActionType, IntendedAction } from './actions.js';
+
+/**
+ * Phase 3B — Execution Failure Reason categories.
+ */
+export type ExecutionFailureReason =
+  | 'INVALID_ACTION'
+  | 'INVALID_TARGET'
+  | 'TARGET_NOT_FOUND'
+  | 'TARGET_NOT_ACTIONABLE'
+  | 'TARGET_DISABLED'
+  | 'TARGET_ROLE_MISMATCH'
+  | 'TAB_NOT_FOUND'
+  | 'EXECUTION_ERROR';
+
+/**
+ * Successful execution result.
+ * Strictly contains safe metadata only: NEVER leaks typed text, passwords, or input values.
+ */
+export interface ExecutionSuccessResult {
+  readonly success: true;
+  readonly actionType: ActionType;
+  readonly elementId: string;
+  readonly actionId: string;
+  readonly timestamp: number;
+}
+
+/**
+ * Failed execution result.
+ * Strictly contains structured failure reason and safe message: NEVER leaks sensitive values.
+ */
+export interface ExecutionFailureResult {
+  readonly success: false;
+  readonly actionType?: ActionType;
+  readonly elementId?: string;
+  readonly actionId?: string;
+  readonly reason: ExecutionFailureReason;
+  readonly message: string;
+  readonly timestamp: number;
+}
+
+/** Complete execution result contract. */
+export type ExecutionResult = ExecutionSuccessResult | ExecutionFailureResult;
+
+/** Request payload for executing an IntendedAction in a browser tab. */
+export interface ExecuteActionRequest {
+  readonly action: IntendedAction;
+  readonly tabId?: number;
+}
+
+/** Configuration options for the action executor. */
+export interface ExecuteActionOptions {
+  readonly timeoutMs?: number;
+}
