@@ -48,3 +48,12 @@ export {
   type LocalVisionInferenceFn,
   type LocalVisionAdapterOptions
 } from './localVisionAdapter.js';
+
+export {
+  LlamaServerInference,
+  formatImageDataUrl,
+  stripMarkdownFences,
+  LLAMA_VISION_SYSTEM_PROMPT,
+  LLAMA_VISION_USER_PROMPT,
+  type LlamaServerConfig
+} from './llamaInference.js';
