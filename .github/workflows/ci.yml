@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  verify:
+    name: Verify & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Extension TypeScript typecheck
+        run: npm --prefix extension run typecheck
+
+      - name: Vision TypeScript typecheck
+        run: npm --prefix vision run typecheck
+
+      - name: Extension tests
+        run: npm --prefix extension test -- --run
+
+      - name: Vision tests
+        run: npm --prefix vision test -- --run
+
+      - name: Extension production build
+        run: npm --prefix extension run build
