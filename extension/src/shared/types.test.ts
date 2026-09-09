@@ -7,7 +7,7 @@ import {
   MessageType,
   PAGE_REPRESENTATION_SCHEMA_VERSION
 } from './types.js';
-import type { PageRepresentation } from './types.js';
+import type { PageRepresentation, ScreenshotCaptureResult } from './types.js';
 
 describe('MessageType', () => {
   it('should contain inspect page request', () => {
@@ -24,6 +24,10 @@ describe('MessageType', () => {
 
   it('should contain extension ready', () => {
     expect(MessageType.EXTENSION_READY).toBe('extension-ready');
+  });
+
+  it('should contain capture screenshot request', () => {
+    expect(MessageType.CAPTURE_SCREENSHOT_REQUEST).toBe('capture-screenshot-request');
   });
 
   it('should have unique values', () => {
@@ -94,5 +98,39 @@ describe('PageRepresentation', () => {
     }
 
     expect(JSON.parse(serialized)).toEqual(representation);
+  });
+});
+
+describe('ScreenshotCaptureResult', () => {
+  it('should be JSON serializable with minimal fields', () => {
+    const result: ScreenshotCaptureResult = {
+      dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      format: 'png',
+      timestamp: 1725883200000
+    };
+
+    const serialized = JSON.stringify(result);
+    expect(serialized).toBeTypeOf('string');
+    expect(JSON.parse(serialized)).toEqual(result);
+  });
+
+  it('should not contain DOM, form, password, or credential properties', () => {
+    const result: ScreenshotCaptureResult = {
+      dataUrl: 'data:image/png;base64,fakebytes',
+      format: 'png',
+      timestamp: Date.now()
+    };
+
+    const keys = Object.keys(result);
+    expect(keys).toContain('dataUrl');
+    expect(keys).toContain('format');
+    expect(keys).toContain('timestamp');
+    expect(keys).not.toContain('dom');
+    expect(keys).not.toContain('html');
+    expect(keys).not.toContain('form');
+    expect(keys).not.toContain('password');
+    expect(keys).not.toContain('credentials');
+    expect(keys).not.toContain('elements');
+    expect(keys).toHaveLength(3);
   });
 });
