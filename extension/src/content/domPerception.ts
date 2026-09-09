@@ -116,10 +116,13 @@ const PERCEPTION_SELECTOR = [
 ].join(', ');
 
 /**
- * Normalizes text by collapsing whitespace and trimming.
+ * Normalizes text by collapsing whitespace, formatting punctuation spacing, and trimming.
  */
 function normalizeText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.:;!?])/g, '$1')
+    .trim();
 }
 
 /** Gets the first explicit ARIA role token without preserving arbitrary values. */
@@ -187,25 +190,76 @@ function isRepresentationCandidate(element: Element): boolean {
   return nativeCandidate || hasTabindex || meaningfulContent;
 }
 
+/** Tags whose content is not user-facing rendered text. */
+const IGNORED_TEXT_TAGS = new Set([
+  'script',
+  'style',
+  'noscript',
+  'template'
+]);
+
 /**
  * Checks CSS visibility without requiring layout. This is used for text nodes
  * below a visible element; the root element still goes through the layout check
  * in isElementVisible().
  */
 function hasVisibleCss(element: Element): boolean {
-  if (element.hasAttribute('hidden') || element.getAttribute('aria-hidden') === 'true') {
+  if (element.hasAttribute('hidden')) {
     return false;
   }
 
-  const style = window.getComputedStyle(element);
-  return style.display !== 'none'
-    && style.visibility !== 'hidden'
-    && style.visibility !== 'collapse';
+  if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+    try {
+      const style = window.getComputedStyle(element);
+      if (style) {
+        if (style.display === 'none') {
+          return false;
+        }
+        if (style.visibility === 'hidden' || style.visibility === 'collapse') {
+          return false;
+        }
+      }
+    } catch {
+      // In case getComputedStyle fails in mock environments
+    }
+  }
+
+  if (element instanceof HTMLElement) {
+    const inlineDisplay = element.style?.display;
+    if (inlineDisplay === 'none') {
+      return false;
+    }
+    const inlineVisibility = element.style?.visibility;
+    if (inlineVisibility === 'hidden' || inlineVisibility === 'collapse') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Determines whether an element or any of its ancestors is inert.
+ */
+function isInert(element: Element): boolean {
+  let current: Element | null = element;
+  while (current) {
+    if (
+      current.hasAttribute('inert')
+      || ('inert' in current && Boolean((current as HTMLElement).inert))
+    ) {
+      return true;
+    }
+    current = current.parentElement;
+  }
+  return false;
 }
 
 /**
  * Determines if an element is visible. A non-zero layout rectangle is required
  * in production so that displayable but zero-sized elements are not actionable.
+ * Off-screen elements that are rendered retain positive dimensions and are not
+ * considered invisible merely because they lie outside the viewport.
  */
 function isElementVisible(element: Element): boolean {
   if (!(element instanceof HTMLElement)) {
@@ -229,16 +283,16 @@ function isElementVisible(element: Element): boolean {
   // Keep this layout check: happy-dom tests mock this method because it has no
   // browser layout engine, while the extension uses the real browser result.
   const rect = element.getBoundingClientRect();
-  return rect.width !== 0 && rect.height !== 0;
+  return rect.width > 0 && rect.height > 0;
 }
 
 /**
- * Collects rendered text while excluding hidden descendants. Form controls
- * whose text is user-entered are intentionally excluded from this function.
+ * Collects rendered text while excluding hidden descendants, script/style/template
+ * content, and sensitive form control values.
  */
 function getVisibleText(element: Element): string | undefined {
   const tagName = element.tagName.toLowerCase();
-  if (tagName === 'input' || tagName === 'textarea') {
+  if (tagName === 'input' || tagName === 'textarea' || IGNORED_TEXT_TAGS.has(tagName)) {
     return undefined;
   }
 
@@ -256,11 +310,15 @@ function getVisibleText(element: Element): string | undefined {
     }
 
     if (node instanceof Element) {
+      const childTag = node.tagName.toLowerCase();
+      if (IGNORED_TEXT_TAGS.has(childTag)) {
+        return '';
+      }
       // Exclude user-entered controls even when they are descendants of a
       // represented container such as a form.
       if (
         !isRoot
-        && (node.tagName.toLowerCase() === 'input' || node.tagName.toLowerCase() === 'textarea')
+        && (childTag === 'input' || childTag === 'textarea')
       ) {
         return '';
       }
@@ -268,13 +326,11 @@ function getVisibleText(element: Element): string | undefined {
         return '';
       }
       return Array.from(node.childNodes)
-        .map((child) => collectText(child))
+        .map((child) => collectText(child, false))
         .join(' ');
     }
 
-    return Array.from(node.childNodes || [])
-      .map((child) => collectText(child))
-      .join(' ');
+    return '';
   }
 
   const text = normalizeText(collectText(element, true));
@@ -378,22 +434,75 @@ function getElementRole(element: Element): ElementRole {
 }
 
 /**
- * Gets text from an element that can safely be used as an accessible name.
+ * Resolves all <label> elements associated with an element through native
+ * form control relationship, explicit label[for] matching, or wrapping labels.
  */
-function getNameText(element: Element): string | undefined {
-  return getVisibleText(element);
+function getAssociatedLabels(element: Element): Element[] {
+  const labels: Element[] = [];
+  const seen = new Set<Element>();
+
+  // 1. Native form control .labels property if available
+  if ('labels' in element) {
+    const nativeLabels = (element as HTMLInputElement).labels;
+    if (nativeLabels) {
+      for (const label of Array.from(nativeLabels)) {
+        if (!seen.has(label)) {
+          seen.add(label);
+          labels.push(label);
+        }
+      }
+    }
+  }
+
+  // 2. Explicit label[for="id"] matching
+  const id = element.getAttribute('id');
+  if (id) {
+    try {
+      const matchingLabels = document.querySelectorAll(`label[for="${CSS.escape(id)}"]`);
+      for (const label of Array.from(matchingLabels)) {
+        if (!seen.has(label)) {
+          seen.add(label);
+          labels.push(label);
+        }
+      }
+    } catch {
+      // Ignore selector errors if any
+    }
+  }
+
+  // 3. Wrapping label ancestor
+  let parent = element.parentElement;
+  while (parent) {
+    if (parent.tagName.toLowerCase() === 'label') {
+      if (!seen.has(parent)) {
+        seen.add(parent);
+        labels.push(parent);
+      }
+      break;
+    }
+    parent = parent.parentElement;
+  }
+
+  return labels;
 }
 
 /**
- * Extracts an accessible name using the useful, privacy-safe subset of the
- * accessible-name algorithm needed by this phase.
+ * Gets text from an element that can safely be used as an accessible name.
  */
-function getAccessibleName(element: Element): string | undefined {
+function getNameText(element: Element): string | undefined {
   const ariaLabel = normalizeText(element.getAttribute('aria-label') || '');
   if (ariaLabel) {
     return ariaLabel;
   }
+  return getVisibleText(element);
+}
 
+/**
+ * Extracts an accessible name using lightweight deterministic precedence rules.
+ * Supports aria-labelledby, aria-label, associated and wrapping labels, button/link text
+ * (and child img alt), img alt, and placeholder fallback.
+ */
+function getAccessibleName(element: Element): string | undefined {
   const labelledBy = normalizeText(element.getAttribute('aria-labelledby') || '');
   if (labelledBy) {
     const names = labelledBy
@@ -408,28 +517,21 @@ function getAccessibleName(element: Element): string | undefined {
     }
   }
 
-  if (element.matches('input, textarea, select')) {
-    const formControl = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-    const labels = formControl.labels;
-    if (labels && labels.length > 0) {
-      const labelName = normalizeText(
-        Array.from(labels).map((label) => getNameText(label) || '').join(' ')
-      );
-      if (labelName) {
-        return labelName;
-      }
-    }
+  const ariaLabel = normalizeText(element.getAttribute('aria-label') || '');
+  if (ariaLabel) {
+    return ariaLabel;
+  }
 
-    let parent = element.parentElement;
-    while (parent) {
-      if (parent.tagName.toLowerCase() === 'label') {
-        const labelName = getNameText(parent);
-        if (labelName) {
-          return labelName;
-        }
-        break;
+  if (element.matches('input, textarea, select, progress, meter, output')) {
+    const labels = getAssociatedLabels(element);
+    if (labels.length > 0) {
+      const labelNames = labels
+        .map((label) => getNameText(label) || '')
+        .filter(Boolean);
+      const combinedLabelName = normalizeText(labelNames.join(' '));
+      if (combinedLabelName) {
+        return combinedLabelName;
       }
-      parent = parent.parentElement;
     }
   }
 
@@ -450,7 +552,26 @@ function getAccessibleName(element: Element): string | undefined {
     || role === 'tab'
     || role === 'menuitem'
   ) {
-    return getVisibleText(element);
+    const visibleText = getVisibleText(element);
+    if (visibleText) {
+      return visibleText;
+    }
+    const childImg = element.querySelector('img[alt]');
+    if (childImg) {
+      const childAlt = normalizeText(childImg.getAttribute('alt') || '');
+      if (childAlt) {
+        return childAlt;
+      }
+    }
+  }
+
+  if (element.matches('input, textarea')) {
+    const placeholder = normalizeText(
+      (element as HTMLInputElement | HTMLTextAreaElement).placeholder || ''
+    );
+    if (placeholder) {
+      return placeholder;
+    }
   }
 
   const title = normalizeText(element.getAttribute('title') || '');
@@ -477,8 +598,10 @@ function extractAttributes(element: Element): Record<string, string> {
     'aria-checked',
     'aria-selected',
     'aria-disabled',
+    'aria-hidden',
     'disabled',
-    'readonly'
+    'readonly',
+    'inert'
   ];
 
   const attributes: Record<string, string> = {};
@@ -493,12 +616,13 @@ function extractAttributes(element: Element): Record<string, string> {
 }
 
 /**
- * Determines whether a native or ARIA element is disabled.
+ * Determines whether a native or ARIA element is disabled or inert.
  */
 function isElementDisabled(element: Element): boolean {
   if (
     element.hasAttribute('disabled')
     || element.getAttribute('aria-disabled')?.toLowerCase() === 'true'
+    || isInert(element)
   ) {
     return true;
   }
@@ -608,6 +732,11 @@ export function extractPageRepresentationFromDom(): PageRepresentation {
       .map((child) => elementIdMap.get(child))
       .filter((childId): childId is string => childId !== undefined);
 
+    const associatedLabels = getAssociatedLabels(element);
+    const labelIds = associatedLabels
+      .map((lbl) => elementIdMap.get(lbl))
+      .filter((lblId): lblId is string => lblId !== undefined);
+
     const provenance: ElementProvenance = 'dom';
     const interactive = state.visible === true && !state.disabled && isInteractive(element, role);
 
@@ -625,6 +754,7 @@ export function extractPageRepresentationFromDom(): PageRepresentation {
       attributes: extractAttributes(element),
       parentId,
       childIds: childIds.length > 0 ? childIds : undefined,
+      labelIds: labelIds.length > 0 ? labelIds : undefined,
       provenance
     };
   });

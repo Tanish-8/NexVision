@@ -129,6 +129,7 @@ export interface PageElement {
   /** Relationships are represented by ids rather than nested elements. */
   parentId?: string;
   childIds?: string[];
+  labelIds?: string[];
   provenance?: ElementProvenance;
 }
 

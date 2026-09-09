@@ -489,4 +489,377 @@ describe('DOM Perception', () => {
     expect(firstRepresentation.elements.map((element) => element.id)).not.toContain('First');
     expect(firstRepresentation.elements.map((element) => element.id)).not.toContain('Second');
   });
+
+  describe('Phase 1C-2: Visibility detection', () => {
+    it('should detect [hidden] elements as invisible and non-interactive', () => {
+      setUpHtml('<button hidden>Hidden button</button>');
+      mockBoundingClientRect(document.querySelector('button'));
+
+      const representation = extractPageRepresentationFromDom();
+      const btn = requirePageElement(representation, (el) => el.tagName === 'button');
+
+      expect(btn.state?.visible).toBe(false);
+      expect(btn.interactive).toBe(false);
+    });
+
+    it('should detect display:none elements as invisible and non-interactive', () => {
+      setUpHtml('<button style="display: none">Display none</button>');
+      mockBoundingClientRect(document.querySelector('button'));
+
+      const representation = extractPageRepresentationFromDom();
+      const btn = requirePageElement(representation, (el) => el.tagName === 'button');
+
+      expect(btn.state?.visible).toBe(false);
+      expect(btn.interactive).toBe(false);
+    });
+
+    it('should detect visibility:hidden and visibility:collapse elements as invisible', () => {
+      setUpHtml(`
+        <button style="visibility: hidden">Visibility hidden</button>
+        <button style="visibility: collapse">Visibility collapse</button>
+      `);
+      document.querySelectorAll('button').forEach((b) => mockBoundingClientRect(b));
+
+      const representation = extractPageRepresentationFromDom();
+      const hiddenBtn = requirePageElement(representation, (el) => el.visibleText === 'Visibility hidden');
+      const collapseBtn = requirePageElement(representation, (el) => el.visibleText === 'Visibility collapse');
+
+      expect(hiddenBtn.state?.visible).toBe(false);
+      expect(hiddenBtn.interactive).toBe(false);
+      expect(collapseBtn.state?.visible).toBe(false);
+      expect(collapseBtn.interactive).toBe(false);
+    });
+
+    it('should detect elements within hidden ancestors as invisible', () => {
+      setUpHtml(`
+        <div style="display: none">
+          <button id="in-display-none">Inside display none</button>
+        </div>
+        <div hidden>
+          <button id="in-hidden-attr">Inside hidden attr</button>
+        </div>
+      `);
+      document.querySelectorAll('button').forEach((b) => mockBoundingClientRect(b));
+
+      const representation = extractPageRepresentationFromDom();
+      const btn1 = requirePageElement(representation, (el) => el.visibleText === 'Inside display none');
+      const btn2 = requirePageElement(representation, (el) => el.visibleText === 'Inside hidden attr');
+
+      expect(btn1.state?.visible).toBe(false);
+      expect(btn1.interactive).toBe(false);
+      expect(btn2.state?.visible).toBe(false);
+      expect(btn2.interactive).toBe(false);
+    });
+
+    it('should detect zero-width or zero-height elements as invisible', () => {
+      setUpHtml(`
+        <button id="zero-w">Zero Width</button>
+        <button id="zero-h">Zero Height</button>
+      `);
+      const zeroW = document.querySelector('#zero-w');
+      const zeroH = document.querySelector('#zero-h');
+      mockBoundingClientRect(zeroW, { width: 0, height: 30 });
+      mockBoundingClientRect(zeroH, { width: 30, height: 0 });
+
+      const representation = extractPageRepresentationFromDom();
+      const btnW = requirePageElement(representation, (el) => el.visibleText === 'Zero Width');
+      const btnH = requirePageElement(representation, (el) => el.visibleText === 'Zero Height');
+
+      expect(btnW.state?.visible).toBe(false);
+      expect(btnW.interactive).toBe(false);
+      expect(btnH.state?.visible).toBe(false);
+      expect(btnH.interactive).toBe(false);
+    });
+
+    it('should NOT consider off-screen rendered elements invisible if rendered', () => {
+      setUpHtml(`
+        <button id="below-viewport">Far Below Viewport</button>
+        <button id="left-of-viewport">Far Left Viewport</button>
+      `);
+      const below = document.querySelector('#below-viewport');
+      const left = document.querySelector('#left-of-viewport');
+      mockBoundingClientRect(below, { left: 0, top: 4000, width: 120, height: 40 });
+      mockBoundingClientRect(left, { left: -3000, top: 0, width: 120, height: 40 });
+
+      const representation = extractPageRepresentationFromDom();
+      const belowBtn = requirePageElement(representation, (el) => el.visibleText === 'Far Below Viewport');
+      const leftBtn = requirePageElement(representation, (el) => el.visibleText === 'Far Left Viewport');
+
+      expect(belowBtn.state?.visible).toBe(true);
+      expect(belowBtn.interactive).toBe(true);
+      expect(leftBtn.state?.visible).toBe(true);
+      expect(leftBtn.interactive).toBe(true);
+    });
+
+    it('should treat inert elements and their descendants as disabled and non-interactive', () => {
+      setUpHtml(`
+        <div inert>
+          <button id="inert-btn">Inert action</button>
+        </div>
+      `);
+      mockBoundingClientRect(document.querySelector('#inert-btn'), { width: 100, height: 30 });
+
+      const representation = extractPageRepresentationFromDom();
+      const btn = requirePageElement(representation, (el) => el.visibleText === 'Inert action');
+
+      expect(btn.state?.visible).toBe(true);
+      expect(btn.state?.disabled).toBe(true);
+      expect(btn.state?.enabled).toBe(false);
+      expect(btn.interactive).toBe(false);
+    });
+
+    it('should keep aria-hidden elements visually visible when rendered, preserving aria-hidden as an attribute', () => {
+      setUpHtml('<button aria-hidden="true">Visible but aria-hidden</button>');
+      mockBoundingClientRect(document.querySelector('button'), { width: 100, height: 40 });
+
+      const representation = extractPageRepresentationFromDom();
+      const btn = requirePageElement(representation, (el) => el.tagName === 'button');
+
+      expect(btn.state?.visible).toBe(true);
+      expect(btn.interactive).toBe(true);
+      expect(btn.attributes?.['aria-hidden']).toBe('true');
+    });
+  });
+
+  describe('Phase 1C-2: Text normalization and extraction', () => {
+    it('should normalize irregular whitespace, newlines, and tabs', () => {
+      setUpHtml('<p>   First \n\n  word \t\t and \r\n second   word.  </p>');
+      mockBoundingClientRect(document.querySelector('p'));
+
+      const representation = extractPageRepresentationFromDom();
+      const p = requirePageElement(representation, (el) => el.tagName === 'p');
+
+      expect(p.visibleText).toBe('First word and second word.');
+    });
+
+    it('should exclude hidden descendants from visible text', () => {
+      setUpHtml(`
+        <article>
+          <p>Visible start <span style="display: none">hidden css</span> and <span hidden>hidden attr</span> visible end.</p>
+        </article>
+      `);
+      document.querySelectorAll('article, p').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const p = requirePageElement(representation, (el) => el.tagName === 'p');
+
+      expect(p.visibleText).toBe('Visible start and visible end.');
+      expect(p.visibleText).not.toContain('hidden css');
+      expect(p.visibleText).not.toContain('hidden attr');
+    });
+
+    it('should ignore script, style, noscript, and template content', () => {
+      setUpHtml(`
+        <main>
+          <h1>Real Heading</h1>
+          <script>var leak = "token_script_content";</script>
+          <style>body { font-size: 14px; }</style>
+          <noscript>Please enable scripts</noscript>
+          <template><p>Invisible template body</p></template>
+          <p>Real paragraph content.</p>
+        </main>
+      `);
+      document.querySelectorAll('main, h1, p').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const main = requirePageElement(representation, (el) => el.tagName === 'main');
+
+      expect(main.visibleText).toBe('Real Heading Real paragraph content.');
+      expect(main.visibleText).not.toContain('token_script_content');
+      expect(main.visibleText).not.toContain('font-size');
+      expect(main.visibleText).not.toContain('enable scripts');
+      expect(main.visibleText).not.toContain('template body');
+    });
+
+    it('should properly collect nested text across inline elements', () => {
+      setUpHtml('<p>Text with <strong>bold</strong>, <em>italic</em>, and <code>code</code> snippets.</p>');
+      mockBoundingClientRect(document.querySelector('p'));
+
+      const representation = extractPageRepresentationFromDom();
+      const p = requirePageElement(representation, (el) => el.tagName === 'p');
+
+      expect(p.visibleText).toBe('Text with bold, italic, and code snippets.');
+    });
+
+    it('should never leak form control values into ancestor text', () => {
+      setUpHtml(`
+        <form>
+          <label for="u">Username</label>
+          <input type="text" id="u" value="super_secret_username_123">
+          <label for="b">Bio</label>
+          <textarea id="b">secret_user_bio_text</textarea>
+          <button type="submit">Submit</button>
+        </form>
+      `);
+      document.querySelectorAll('form, label, input, textarea, button').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const form = requirePageElement(representation, (el) => el.tagName === 'form');
+
+      expect(form.visibleText).toBe('Username Bio Submit');
+      expect(form.visibleText).not.toContain('super_secret_username_123');
+      expect(form.visibleText).not.toContain('secret_user_bio_text');
+    });
+  });
+
+  describe('Phase 1C-2: Accessibility & label relationships', () => {
+    it('should prioritize aria-labelledby over aria-label and visible text', () => {
+      setUpHtml(`
+        <div id="lbl">Referenced Label</div>
+        <button aria-labelledby="lbl" aria-label="Aria Label">Visible Button Text</button>
+      `);
+      document.querySelectorAll('div, button').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const btn = requirePageElement(representation, (el) => el.tagName === 'button');
+
+      expect(btn.accessibleName).toBe('Referenced Label');
+    });
+
+    it('should prioritize aria-label over visible text and placeholders', () => {
+      setUpHtml('<input type="text" aria-label="Search Catalog" placeholder="Type here..." value="shoes">');
+      mockBoundingClientRect(document.querySelector('input'));
+
+      const representation = extractPageRepresentationFromDom();
+      const input = requirePageElement(representation, (el) => el.tagName === 'input');
+
+      expect(input.accessibleName).toBe('Search Catalog');
+    });
+
+    it('should associate label[for] with form control and populate labelIds', () => {
+      setUpHtml(`
+        <label for="email-field">Your Email Address</label>
+        <input type="email" id="email-field">
+      `);
+      document.querySelectorAll('label, input').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const label = requirePageElement(representation, (el) => el.tagName === 'label');
+      const input = requirePageElement(representation, (el) => el.tagName === 'input');
+
+      expect(input.accessibleName).toBe('Your Email Address');
+      expect(input.labelIds).toEqual([label.id]);
+    });
+
+    it('should associate wrapping label with form control and populate labelIds', () => {
+      setUpHtml(`
+        <label>
+          Subscribe to Newsletter
+          <input type="checkbox">
+        </label>
+      `);
+      document.querySelectorAll('label, input').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const label = requirePageElement(representation, (el) => el.tagName === 'label');
+      const checkbox = requirePageElement(representation, (el) => el.tagName === 'input');
+
+      expect(checkbox.accessibleName).toBe('Subscribe to Newsletter');
+      expect(checkbox.labelIds).toEqual([label.id]);
+    });
+
+    it('should extract button/link accessible names from text or child img alt', () => {
+      setUpHtml(`
+        <button id="text-btn">Send Message</button>
+        <button id="img-btn"><img src="send.png" alt="Send Message Icon"></button>
+        <a href="/home" id="img-link"><img src="logo.png" alt="Home Dashboard"></a>
+      `);
+      document.querySelectorAll('button, a, img').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const textBtn = requirePageElement(representation, (el) => el.id === 'elem-1');
+      const imgBtn = requirePageElement(representation, (el) => el.id === 'elem-2');
+      const imgLink = requirePageElement(representation, (el) => el.id === 'elem-4');
+
+      expect(textBtn.accessibleName).toBe('Send Message');
+      expect(imgBtn.accessibleName).toBe('Send Message Icon');
+      expect(imgLink.accessibleName).toBe('Home Dashboard');
+    });
+
+    it('should fallback to placeholder when no label or aria-label exists', () => {
+      setUpHtml(`
+        <input type="text" placeholder="Search keywords...">
+        <textarea placeholder="Write your review here..."></textarea>
+      `);
+      document.querySelectorAll('input, textarea').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const input = requirePageElement(representation, (el) => el.tagName === 'input');
+      const textarea = requirePageElement(representation, (el) => el.tagName === 'textarea');
+
+      expect(input.accessibleName).toBe('Search keywords...');
+      expect(textarea.accessibleName).toBe('Write your review here...');
+    });
+
+    it('should NOT use placeholder as accessible name if a label exists', () => {
+      setUpHtml(`
+        <label for="search-box">Search Store</label>
+        <input type="text" id="search-box" placeholder="e.g. laptop">
+      `);
+      document.querySelectorAll('label, input').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const input = requirePageElement(representation, (el) => el.tagName === 'input');
+
+      expect(input.accessibleName).toBe('Search Store');
+    });
+  });
+
+  describe('Phase 1C-2: Privacy regression tests', () => {
+    it('should never contain input values, passwords, textarea values, tokens, cookies, or web storage', () => {
+      if (typeof document !== 'undefined') {
+        document.cookie = 'session_id=secret_cookie_token_999888';
+      }
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem('auth_jwt', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret_token');
+      }
+      if (typeof window !== 'undefined' && window.sessionStorage) {
+        window.sessionStorage.setItem('temp_secret', 'transient_secret_value_123');
+      }
+
+      setUpHtml(`
+        <form id="login-form">
+          <label for="email">User Email</label>
+          <input type="email" id="email" value="fake.user@confidential-domain.example">
+          <label for="pwd">User Password</label>
+          <input type="password" id="pwd" value="VerySecretPassword!#2026">
+          <label for="tok">API Token</label>
+          <input type="text" id="tok" value="ghp_1234567890abcdefghijklmnopqrstuvwxyz">
+          <label for="notes">Private Notes</label>
+          <textarea id="notes">Client SSN: 000-12-3456 and token sk-live-987654321</textarea>
+          <input type="hidden" id="csrf" value="csrf_token_secret_abcdef">
+          <button type="submit">Log In</button>
+        </form>
+      `);
+      document.querySelectorAll('form, label, input, textarea, button').forEach((el) => mockBoundingClientRect(el));
+
+      const representation = extractPageRepresentationFromDom();
+      const serialized = JSON.stringify(representation);
+
+      expect(serialized).not.toContain('fake.user@confidential-domain.example');
+      expect(serialized).not.toContain('VerySecretPassword!#2026');
+      expect(serialized).not.toContain('ghp_1234567890abcdefghijklmnopqrstuvwxyz');
+      expect(serialized).not.toContain('Client SSN: 000-12-3456');
+      expect(serialized).not.toContain('sk-live-987654321');
+      expect(serialized).not.toContain('csrf_token_secret_abcdef');
+      expect(serialized).not.toContain('secret_cookie_token_999888');
+      expect(serialized).not.toContain('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9');
+      expect(serialized).not.toContain('transient_secret_value_123');
+
+      representation.elements.forEach((elem) => {
+        expect(elem.attributes).not.toHaveProperty('value');
+      });
+
+      const emailInput = requirePageElement(representation, (el) => el.inputType === 'email');
+      const passwordInput = requirePageElement(representation, (el) => el.inputType === 'password');
+      const notesTextarea = requirePageElement(representation, (el) => el.tagName === 'textarea');
+
+      expect(emailInput.accessibleName).toBe('User Email');
+      expect(passwordInput.accessibleName).toBe('User Password');
+      expect(notesTextarea.accessibleName).toBe('Private Notes');
+      expect(emailInput.visibleText).toBeUndefined();
+      expect(passwordInput.visibleText).toBeUndefined();
+      expect(notesTextarea.visibleText).toBeUndefined();
+    });
+  });
 });
