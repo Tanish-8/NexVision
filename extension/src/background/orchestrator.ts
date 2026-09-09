@@ -1,5 +1,5 @@
 /**
- * Unified Perception Orchestrator — Phase 2C.
+ * Unified Perception Orchestrator — Phase 2C / Phase 2D.
  *
  * Combines DOM perception, local screenshot capture, and visual perception
  * into a single structured result.
@@ -15,6 +15,9 @@
  * - All three providers are injected via interfaces, keeping each module
  *   independently testable.
  * - Error types are discriminated so callers can distinguish the failure origin.
+ * - DomPerceptionProvider is async (Phase 2D): in the Chrome extension, DOM
+ *   extraction must cross a process boundary via chrome.tabs.sendMessage from
+ *   the service worker to the content script.
  */
 
 import type { ElementProvenance, PageRepresentation, ScreenshotCaptureResult } from '../shared/types.js';
@@ -25,10 +28,14 @@ import type { ElementProvenance, PageRepresentation, ScreenshotCaptureResult } f
 
 /**
  * Provider interface for DOM-based page perception.
- * Fulfilled in production by extractPageRepresentationFromDom().
+ *
+ * Phase 2D: async to accommodate Chrome IPC reality.
+ * In the service worker context, DOM extraction requires an async
+ * chrome.tabs.sendMessage round-trip to the content script.
+ * In tests, return Promise.resolve(mockDom).
  */
 export interface DomPerceptionProvider {
-  (): PageRepresentation;
+  (): Promise<PageRepresentation>;
 }
 
 /**
@@ -214,10 +221,10 @@ export async function perceivePage(
   options?: UnifiedPerceptionOptions
 ): Promise<UnifiedPerceptionResult> {
 
-  // 1. DOM perception — synchronous, throws on failure.
+  // 1. DOM perception — async IPC in production (Phase 2D); async rejection caught here.
   let domRepresentation: PageRepresentation;
   try {
-    domRepresentation = domProvider();
+    domRepresentation = await domProvider();
   } catch (error) {
     return {
       success: false,

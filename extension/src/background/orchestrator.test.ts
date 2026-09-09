@@ -56,14 +56,14 @@ const MOCK_OBSERVATION: VisualObservation = {
   confidence: 0.95
 };
 
-/** Creates a DOM provider that returns a fixed PageRepresentation. */
+/** Creates a DOM provider that returns a fixed PageRepresentation (async, Phase 2D contract). */
 function makeDomProvider(dom: PageRepresentation = MOCK_DOM): DomPerceptionProvider {
-  return () => dom;
+  return () => Promise.resolve(dom);
 }
 
-/** Creates a DOM provider that throws. */
+/** Creates a DOM provider that rejects with an error (async, Phase 2D contract). */
 function makeFailingDomProvider(message = 'DOM failure'): DomPerceptionProvider {
-  return () => { throw new Error(message); };
+  return async () => { throw new Error(message); };
 }
 
 /** Creates a screenshot provider that returns a fixed reference. */
