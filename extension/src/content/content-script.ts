@@ -8,7 +8,7 @@ import { sendToTab, MessageRouter } from '../shared/messaging.js';
 import type { ExtensionMessage, PageSnapshot, ExtensionResponse } from '../shared/types.js';
 import { extractPageRepresentationFromDom } from './domPerception.js';
 import { executeDomAction } from './domExecutor.js';
-import type { PageRepresentation, ExecutionResult } from '../shared/types.js';
+import type { PageRepresentation, ExecutionResult, ExecuteActionRequest } from '../shared/types.js';
 
 const router = new MessageRouter();
 
@@ -32,8 +32,8 @@ router.register(MessageType.INSPECT_PAGE_REQUEST, async (
 });
 
 // Handle action execution requests from background service worker
-router.register(MessageType.EXECUTE_ACTION_REQUEST, async (
-  payload: any,
+router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async (
+  payload: ExecuteActionRequest,
   _sender
 ): Promise<ExtensionResponse<ExecutionResult>> => {
   try {

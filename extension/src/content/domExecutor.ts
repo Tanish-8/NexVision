@@ -48,7 +48,20 @@ const NON_TEXT_INPUT_TYPES = new Set([
 ]);
 
 /**
+ * Checks whether an element is contenteditable.
+ */
+function isContentEditableElement(element: Element): boolean {
+  if ((element as HTMLElement).isContentEditable) {
+    return true;
+  }
+  const attr = element.getAttribute('contenteditable');
+  return attr === 'true' || attr === '' || attr === 'plaintext-only';
+}
+
+/**
  * Checks whether an element is suitable for text input.
+ * Must match actual writable capability: native text input, textarea, or contenteditable.
+ * A role="textbox"/"searchbox" element that is not actually editable must not pass.
  */
 function isTextEntryElement(element: Element): boolean {
   const tagName = element.tagName.toLowerCase();
@@ -62,15 +75,11 @@ function isTextEntryElement(element: Element): boolean {
     return !NON_TEXT_INPUT_TYPES.has(inputType);
   }
 
-  if (
-    (element as HTMLElement).isContentEditable ||
-    element.getAttribute('contenteditable') === 'true'
-  ) {
+  if (isContentEditableElement(element)) {
     return true;
   }
 
-  const role = getElementRole(element);
-  return role === 'textbox' || role === 'searchbox';
+  return false;
 }
 
 /**
@@ -396,10 +405,7 @@ export function executeDomAction(
             element.value = '';
             element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
             element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          } else if (
-            (element as HTMLElement).isContentEditable ||
-            element.getAttribute('contenteditable') === 'true'
-          ) {
+          } else if (isContentEditableElement(element)) {
             element.textContent = '';
             element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
             element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
@@ -426,10 +432,7 @@ export function executeDomAction(
 
           element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
           element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        } else if (
-          (element as HTMLElement).isContentEditable ||
-          element.getAttribute('contenteditable') === 'true'
-        ) {
+        } else if (isContentEditableElement(element)) {
           const currentText = element.textContent || '';
           element.textContent = currentText + payload.text;
 
@@ -448,6 +451,12 @@ export function executeDomAction(
 
           element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
           element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        } else {
+          return makeFailureResult(
+            'TARGET_NOT_ACTIONABLE',
+            `Target element "${target.elementId}" is not writable`,
+            action
+          );
         }
 
         // Press enter if requested
@@ -484,11 +493,14 @@ export function executeDomAction(
           );
         }
 
+        // Exactly ONE logical focus operation:
+        // Native .focus() performs element focus and dispatches native focus events.
+        // Fall back to synthetic FocusEvent only if native focus is unavailable.
         if (typeof (element as HTMLElement).focus === 'function') {
           (element as HTMLElement).focus();
+        } else {
+          element.dispatchEvent(new FocusEvent('focus', { bubbles: false, cancelable: false }));
         }
-
-        element.dispatchEvent(new FocusEvent('focus', { bubbles: false, cancelable: false }));
 
         const successResult: ExecutionSuccessResult = {
           success: true,

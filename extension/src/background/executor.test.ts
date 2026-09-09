@@ -997,6 +997,118 @@ describe('Phase 3B — DOM Action Executor (executeDomAction)', () => {
       expect(JSON.stringify(result)).not.toContain('EXISTING_SECRET_DATA');
     });
   });
+
+  // =========================================================================
+  // PR #10 PRE-MERGE CORRECTIONS REGRESSION TESTS (ISSUES 1 & 2)
+  // =========================================================================
+
+  describe('PR #10 Pre-Merge Corrections: Non-Editable ARIA Textbox & Single Focus', () => {
+    // ISSUE 1: TYPE MUST NOT SUCCEED FOR NON-EDITABLE ARIA TEXTBOX
+    it('PR10-1. div role="textbox" without contenteditable fails closed with TARGET_NOT_ACTIONABLE', () => {
+      const div = document.createElement('div');
+      div.setAttribute('role', 'textbox');
+      div.textContent = 'Static div text';
+      document.body.appendChild(div);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'typing attempt');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.reason).toBe('TARGET_NOT_ACTIONABLE');
+        expect(result.message).toContain('not a text entry element');
+      }
+      expect(div.textContent).toBe('Static div text');
+    });
+
+    it('PR10-2. div role="searchbox" without contenteditable fails closed with TARGET_NOT_ACTIONABLE', () => {
+      const div = document.createElement('div');
+      div.setAttribute('role', 'searchbox');
+      div.textContent = 'Static searchbox text';
+      document.body.appendChild(div);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'searchbox' });
+      const action = makeTypeAction(target, 'search attempt');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.reason).toBe('TARGET_NOT_ACTIONABLE');
+        expect(result.message).toContain('not a text entry element');
+      }
+      expect(div.textContent).toBe('Static searchbox text');
+    });
+
+    it('PR10-3. contenteditable textbox succeeds with typing', () => {
+      const div = document.createElement('div');
+      div.setAttribute('contenteditable', 'true');
+      div.setAttribute('role', 'textbox');
+      document.body.appendChild(div);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'contenteditable typed text');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(div.textContent).toBe('contenteditable typed text');
+    });
+
+    it('PR10-4. normal input succeeds with typing', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'normal input text');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(input.value).toBe('normal input text');
+    });
+
+    it('PR10-5. textarea succeeds with typing', () => {
+      const textarea = document.createElement('textarea');
+      document.body.appendChild(textarea);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'textarea text');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(textarea.value).toBe('textarea text');
+    });
+
+    // ISSUE 2: FOCUS MUST NOT DUPLICATE FOCUS EVENTS
+    it('PR10-6. focus action invokes focus listener exactly once and sets activeElement', () => {
+      const input = document.createElement('input');
+      let focusCount = 0;
+      input.addEventListener('focus', () => {
+        focusCount++;
+      });
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeFocusAction(target);
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(document.activeElement).toBe(input);
+      expect(focusCount).toBe(1);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

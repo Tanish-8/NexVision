@@ -10,7 +10,9 @@ import type {
   PageRepresentation,
   ScreenshotCaptureOptions,
   ScreenshotCaptureResult,
-  UnifiedPerceptionRequest
+  UnifiedPerceptionRequest,
+  ExecuteActionRequest,
+  ExecutionResult
 } from '../shared/types.js';
 import { captureVisibleTab } from './screenshot.js';
 import { perceivePage } from './orchestrator.js';
@@ -263,10 +265,10 @@ router.register(MessageType.UNIFIED_PERCEPTION_REQUEST, async (
 /**
  * Handle action execution requests.
  */
-router.register(MessageType.EXECUTE_ACTION_REQUEST, async (
-  payload: any,
+router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async (
+  payload: ExecuteActionRequest,
   _sender: chrome.runtime.MessageSender
-): Promise<ExtensionResponse> => {
+): Promise<ExtensionResponse<ExecutionResult>> => {
   try {
     const { executeAction } = await import('./executor.js');
     const result = await executeAction(payload);
