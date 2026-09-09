@@ -9,7 +9,14 @@
 **Next phase:** Phase 1C-3 — final DOM perception hardening and representation consistency  
 **Current milestone:** M1 — Extension understands DOM  
 **Overall completion:** Approximately 17%  
-**Status:** 🟡 Phase 1C-1 and Phase 1C-2 are complete and verified; Phase 1C-3 is the next implementation increment.
+**Status:** Phase 1C-1 ✅ Complete
+Phase 1C-2 ✅ Complete
+Phase 1C-3 ✅ Complete
+
+Phase 1C ✅ Complete
+
+Next:
+Phase 2 — Visual Perception
 
 > **Important:** Phase 1C remains in progress. Do not mark M1 or Phase 1C complete until the remaining DOM quality/unification work is implemented and verified.
 

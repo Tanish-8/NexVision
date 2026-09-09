@@ -35,3 +35,16 @@ export {
   MockVisionPerception,
   type MockVisionPerceptionOptions
 } from './mockAdapter.js';
+
+export {
+  LocalVisionAdapter,
+  validateLocalVisionModelConfig,
+  type LocalVisionModelConfig,
+  type LocalDetectionOutput,
+  type LocalInferenceSuccess,
+  type LocalInferenceFailure,
+  type LocalInferenceResult,
+  type LocalVisionInference,
+  type LocalVisionInferenceFn,
+  type LocalVisionAdapterOptions
+} from './localVisionAdapter.js';
