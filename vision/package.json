@@ -1,0 +1,15 @@
+{
+  "name": "sih26171-vision",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vision perception abstraction interfaces and adapters for NexVision (Phase 2B)",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.4.0"
+  }
+}

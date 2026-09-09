@@ -184,10 +184,20 @@ export const MessageType = {
   INSPECT_PAGE_RESPONSE: 'inspect-page-response',
   PAGE_SNAPSHOT: 'page-snapshot',
   EXTENSION_READY: 'extension-ready',
-  CAPTURE_SCREENSHOT_REQUEST: 'capture-screenshot-request'
+  CAPTURE_SCREENSHOT_REQUEST: 'capture-screenshot-request',
+  UNIFIED_PERCEPTION_REQUEST: 'unified-perception-request'
 } as const;
 
 export type MessageType = typeof MessageType[keyof typeof MessageType];
+
+/**
+ * Payload for UNIFIED_PERCEPTION_REQUEST.
+ * No caller-supplied options in Phase 2D; the service worker selects all providers.
+ */
+export interface UnifiedPerceptionRequest {
+  // reserved for future caller-supplied options (Phase 3+)
+}
+
 
 /** Sensitive data categories classified by local privacy processing. */
 export type PrivacyCategory =

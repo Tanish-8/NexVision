@@ -862,4 +862,193 @@ describe('DOM Perception', () => {
       expect(notesTextarea.visibleText).toBeUndefined();
     });
   });
+
+  describe('Phase 1C-3: Hardening and representation consistency', () => {
+    it('should never produce duplicate representation for an element matching multiple selectors', () => {
+      setUpHtml('<button role="button" tabindex="0" class="btn">Multi-matched action</button>');
+      mockBoundingClientRect(document.querySelector('button'), { width: 100, height: 30 });
+
+      const representation = extractPageRepresentationFromDom();
+      const matching = representation.elements.filter((el) => el.tagName === 'button');
+
+      expect(matching).toHaveLength(1);
+      expect(representation.elements).toHaveLength(1);
+    });
+
+    it('should produce identical representations across repeated perception runs', () => {
+      setUpHtml(`
+        <header>
+          <nav><a href="#home">Home</a></nav>
+        </header>
+        <main>
+          <h1>Dashboard</h1>
+          <form id="sample-form">
+            <label for="query">Search</label>
+            <input type="text" id="query" placeholder="Type query">
+            <button type="submit">Go</button>
+          </form>
+        </main>
+      `);
+      document.querySelectorAll('header, nav, a, main, h1, form, label, input, button').forEach((el) => {
+        mockBoundingClientRect(el, { width: 100, height: 25 });
+      });
+
+      const rep1 = extractPageRepresentationFromDom();
+      const rep2 = extractPageRepresentationFromDom();
+
+      expect(rep1).toEqual(rep2);
+      expect(rep1.elements.map((el) => el.id)).toEqual(rep2.elements.map((el) => el.id));
+    });
+
+    it('should maintain consistent semantic states across all element variants', () => {
+      setUpHtml(`
+        <button id="b-enabled">Enabled Button</button>
+        <button id="b-disabled" disabled>Disabled Button</button>
+        <div inert>
+          <button id="b-inert">Inert Button</button>
+          <input id="in-inert" type="text">
+        </div>
+        <button id="b-hidden" style="display: none">Hidden Button</button>
+        <p id="p-content">Informational paragraph</p>
+        <button id="b-pres" role="presentation">Native with presentation role</button>
+        <div id="d-focus" tabindex="0">Focusable div</div>
+        <div id="d-prog" tabindex="-1">Programmatic focus div</div>
+      `);
+      document.querySelectorAll('button, input, p, div[tabindex]').forEach((el) => {
+        mockBoundingClientRect(el, { width: 80, height: 25 });
+      });
+
+      const rep = extractPageRepresentationFromDom();
+
+      // 1. Visible enabled button
+      const bEnabled = requirePageElement(rep, (el) => el.id === 'elem-1');
+      expect(bEnabled.state?.visible).toBe(true);
+      expect(bEnabled.state?.enabled).toBe(true);
+      expect(bEnabled.state?.disabled).toBe(false);
+      expect(bEnabled.interactive).toBe(true);
+
+      // 2. Visible disabled button
+      const bDisabled = requirePageElement(rep, (el) => el.id === 'elem-2');
+      expect(bDisabled.state?.visible).toBe(true);
+      expect(bDisabled.state?.enabled).toBe(false);
+      expect(bDisabled.state?.disabled).toBe(true);
+      expect(bDisabled.interactive).toBe(false);
+
+      // 3. Visible inert button & input
+      const bInert = requirePageElement(rep, (el) => el.id === 'elem-3');
+      expect(bInert.state?.visible).toBe(true);
+      expect(bInert.state?.enabled).toBe(false);
+      expect(bInert.state?.disabled).toBe(true);
+      expect(bInert.interactive).toBe(false);
+
+      const inInert = requirePageElement(rep, (el) => el.id === 'elem-4');
+      expect(inInert.state?.enabled).toBe(false);
+      expect(inInert.state?.disabled).toBe(true);
+      expect(inInert.interactive).toBe(false);
+
+      // 4. Hidden button
+      const bHidden = requirePageElement(rep, (el) => el.id === 'elem-5');
+      expect(bHidden.state?.visible).toBe(false);
+      expect(bHidden.interactive).toBe(false);
+
+      // 5. Non-interactive paragraph
+      const pContent = requirePageElement(rep, (el) => el.id === 'elem-6');
+      expect(pContent.state?.visible).toBe(true);
+      expect(pContent.state?.enabled).toBe(true);
+      expect(pContent.interactive).toBe(false);
+
+      // 6. Native button with role="presentation" retains native semantics
+      const bPres = requirePageElement(rep, (el) => el.id === 'elem-7');
+      expect(bPres.role).toBe('button');
+      expect(bPres.interactive).toBe(true);
+
+      // 7. Tabindex elements
+      const dFocus = requirePageElement(rep, (el) => el.id === 'elem-8');
+      expect(dFocus.interactive).toBe(true);
+
+      const dProg = requirePageElement(rep, (el) => el.id === 'elem-9');
+      expect(dProg.interactive).toBe(false);
+    });
+
+    it('should correctly perceive rendered SVG elements without classifying them as invisible', () => {
+      setUpHtml('<svg role="img" aria-label="Status icon" width="24" height="24"></svg>');
+      mockBoundingClientRect(document.querySelector('svg'), { width: 24, height: 24 });
+
+      const representation = extractPageRepresentationFromDom();
+      const svg = requirePageElement(representation, (el) => el.accessibleName === 'Status icon');
+
+      expect(svg.role).toBe('image');
+      expect(svg.state?.visible).toBe(true);
+      expect(svg.accessibleName).toBe('Status icon');
+    });
+
+    it('should prevent <label> elements from having labelIds pointing to themselves', () => {
+      setUpHtml(`
+        <label id="main-lbl" for="field">
+          Email Field
+          <input type="email" id="field">
+        </label>
+      `);
+      document.querySelectorAll('label, input').forEach((el) => {
+        mockBoundingClientRect(el, { width: 120, height: 30 });
+      });
+
+      const representation = extractPageRepresentationFromDom();
+      const label = requirePageElement(representation, (el) => el.tagName === 'label');
+      const input = requirePageElement(representation, (el) => el.tagName === 'input');
+
+      expect(label.labelIds).toBeUndefined();
+      expect(input.labelIds).toEqual([label.id]);
+    });
+
+    it('should extract accessible names for custom ARIA widget roles from visible text', () => {
+      setUpHtml(`
+        <div role="switch" tabindex="0">Airplane Mode</div>
+        <div role="checkbox" tabindex="0">Accept Policy</div>
+      `);
+      document.querySelectorAll('div[role]').forEach((el) => {
+        mockBoundingClientRect(el, { width: 100, height: 30 });
+      });
+
+      const representation = extractPageRepresentationFromDom();
+      const switchEl = requirePageElement(representation, (el) => el.role === 'switch');
+      const checkboxEl = requirePageElement(representation, (el) => el.role === 'checkbox');
+
+      expect(switchEl.accessibleName).toBe('Airplane Mode');
+      expect(checkboxEl.accessibleName).toBe('Accept Policy');
+    });
+
+    it('should enforce representation contract invariants across all emitted elements', () => {
+      setUpHtml(`
+        <form>
+          <fieldset>
+            <legend>Account Details</legend>
+            <label for="usr">User</label>
+            <input type="text" id="usr" placeholder="Enter username">
+            <button type="submit">Save</button>
+          </fieldset>
+        </form>
+      `);
+      document.querySelectorAll('form, fieldset, legend, label, input, button').forEach((el) => {
+        mockBoundingClientRect(el, { width: 100, height: 25 });
+      });
+
+      const representation = extractPageRepresentationFromDom();
+
+      expect(representation.schemaVersion).toBe('1.0');
+      expect(representation.elements.length).toBeGreaterThan(0);
+
+      representation.elements.forEach((el) => {
+        expect(el.id).toMatch(/^elem-\d+$/);
+        expect(el.tagName).toBe(el.tagName?.toLowerCase());
+        expect(typeof el.state?.visible).toBe('boolean');
+        expect(typeof el.interactive).toBe('boolean');
+        expect(el.provenance).toBe('dom');
+        expect(el.bounds).toBeDefined();
+        expect(el.bounds?.width).toBeGreaterThanOrEqual(0);
+        expect(el.bounds?.height).toBeGreaterThanOrEqual(0);
+        expect(el.attributes).not.toHaveProperty('value');
+      });
+    });
+  });
 });

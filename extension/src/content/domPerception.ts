@@ -262,7 +262,7 @@ function isInert(element: Element): boolean {
  * considered invisible merely because they lie outside the viewport.
  */
 function isElementVisible(element: Element): boolean {
-  if (!(element instanceof HTMLElement)) {
+  if (!(element instanceof HTMLElement || (typeof SVGElement !== 'undefined' && element instanceof SVGElement))) {
     return false;
   }
 
@@ -441,6 +441,11 @@ function getAssociatedLabels(element: Element): Element[] {
   const labels: Element[] = [];
   const seen = new Set<Element>();
 
+  // A label element itself does not have associated labels
+  if (element.tagName.toLowerCase() === 'label') {
+    return labels;
+  }
+
   // 1. Native form control .labels property if available
   if ('labels' in element) {
     const nativeLabels = (element as HTMLInputElement).labels;
@@ -458,7 +463,10 @@ function getAssociatedLabels(element: Element): Element[] {
   const id = element.getAttribute('id');
   if (id) {
     try {
-      const matchingLabels = document.querySelectorAll(`label[for="${CSS.escape(id)}"]`);
+      const escapedId = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+        ? CSS.escape(id)
+        : id.replace(/["\\]/g, '\\$&');
+      const matchingLabels = document.querySelectorAll(`label[for="${escapedId}"]`);
       for (const label of Array.from(matchingLabels)) {
         if (!seen.has(label)) {
           seen.add(label);
@@ -551,6 +559,9 @@ function getAccessibleName(element: Element): string | undefined {
     || role === 'option'
     || role === 'tab'
     || role === 'menuitem'
+    || role === 'checkbox'
+    || role === 'radio'
+    || role === 'switch'
   ) {
     const visibleText = getVisibleText(element);
     if (visibleText) {
@@ -697,8 +708,17 @@ function extractState(element: Element): ElementState {
 export function extractPageRepresentationFromDom(): PageRepresentation {
   // querySelectorAll already returns document order, which makes the IDs
   // deterministic for a given representation without relying on page data.
-  const elementsArray = Array.from(document.querySelectorAll<Element>(PERCEPTION_SELECTOR))
-    .filter(isRepresentationCandidate);
+  const rawElements = Array.from(document.querySelectorAll<Element>(PERCEPTION_SELECTOR));
+  const seenElements = new Set<Element>();
+  const elementsArray: Element[] = [];
+
+  for (const element of rawElements) {
+    if (!seenElements.has(element) && isRepresentationCandidate(element)) {
+      seenElements.add(element);
+      elementsArray.push(element);
+    }
+  }
+
   const elementIdMap = new Map<Element, string>();
 
   elementsArray.forEach((element, index) => {
