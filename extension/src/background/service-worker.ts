@@ -10,7 +10,9 @@ import type {
   PageRepresentation,
   ScreenshotCaptureOptions,
   ScreenshotCaptureResult,
-  UnifiedPerceptionRequest
+  UnifiedPerceptionRequest,
+  ExecuteActionRequest,
+  ExecutionResult
 } from '../shared/types.js';
 import { captureVisibleTab } from './screenshot.js';
 import { perceivePage } from './orchestrator.js';
@@ -256,6 +258,28 @@ router.register(MessageType.UNIFIED_PERCEPTION_REQUEST, async (
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unified perception failed'
+    };
+  }
+});
+
+/**
+ * Handle action execution requests.
+ */
+router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async (
+  payload: ExecuteActionRequest,
+  _sender: chrome.runtime.MessageSender
+): Promise<ExtensionResponse<ExecutionResult>> => {
+  try {
+    const { executeAction } = await import('./executor.js');
+    const result = await executeAction(payload);
+    return {
+      success: true,
+      data: result
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Action execution failed'
     };
   }
 });

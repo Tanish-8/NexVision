@@ -703,6 +703,34 @@ function extractState(element: Element): ElementState {
 }
 
 /**
+ * Safe identity bridge between DOM perception and DOM execution.
+ * Ephemerally maps perception-assigned element IDs (e.g. 'elem-1') to live DOM Elements.
+ * Cleared and refreshed each time extractPageRepresentationFromDom() runs.
+ */
+const perceptionElementRegistry = new Map<string, Element>();
+
+/**
+ * Registers an element in the perception identity bridge (for testing or grounding binding).
+ */
+export function registerPerceptionElement(id: string, element: Element): void {
+  perceptionElementRegistry.set(id, element);
+}
+
+/**
+ * Clears the perception identity bridge registry.
+ */
+export function clearPerceptionElementRegistry(): void {
+  perceptionElementRegistry.clear();
+}
+
+/**
+ * Returns a readonly view of the perception identity bridge.
+ */
+export function getPerceptionElementRegistry(): ReadonlyMap<string, Element> {
+  return perceptionElementRegistry;
+}
+
+/**
  * Extracts a PageRepresentation from the current DOM.
  */
 export function extractPageRepresentationFromDom(): PageRepresentation {
@@ -721,8 +749,11 @@ export function extractPageRepresentationFromDom(): PageRepresentation {
 
   const elementIdMap = new Map<Element, string>();
 
+  perceptionElementRegistry.clear();
   elementsArray.forEach((element, index) => {
-    elementIdMap.set(element, `elem-${index + 1}`);
+    const id = `elem-${index + 1}`;
+    elementIdMap.set(element, id);
+    perceptionElementRegistry.set(id, element);
   });
 
   const pageElements: PageElement[] = elementsArray.map((element) => {
@@ -839,3 +870,53 @@ function isInteractive(element: Element, role: ElementRole): boolean {
 
   return false;
 }
+
+/**
+ * Resolves an element ID to its live DOM Element using the safe identity bridge.
+ *
+ * Target Identity Invariants:
+ * 1. Direct DOM ID lookup if element has a native id matching elementId.
+ * 2. Identity bridge lookup (verifies the exact Element perceived with that ID is still connected in doc).
+ * 3. Fails closed (returns null) if identity cannot be verified or if the element was removed/replaced.
+ *    Never falls back to blind positional candidate traversal across DOM mutations.
+ */
+export function resolveElementFromDom(
+  elementId: string,
+  doc: Document = document
+): Element | null {
+  if (!elementId || typeof elementId !== 'string') {
+    return null;
+  }
+
+  // 1. Direct DOM ID attribute lookup (for elements with native id attributes)
+  try {
+    const byId = doc.getElementById(elementId);
+    if (byId && byId.id === elementId && byId.isConnected) {
+      return byId;
+    }
+  } catch {
+    // Ignore in mock environments
+  }
+
+  // 2. Safe identity bridge lookup (from perception snapshot)
+  const tracked = perceptionElementRegistry.get(elementId);
+  if (tracked) {
+    // Must belong to the requested document and still be connected in the live DOM
+    if (tracked.ownerDocument === doc && tracked.isConnected) {
+      return tracked;
+    }
+    // Tracked element was removed or replaced in DOM: FAIL CLOSED!
+    return null;
+  }
+
+  // 3. Unknown or ungrounded element ID: FAIL CLOSED!
+  return null;
+}
+
+export {
+  getElementRole,
+  isElementDisabled,
+  isElementVisible,
+  isInteractive,
+  isInert
+};

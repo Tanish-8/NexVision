@@ -7,7 +7,8 @@ import { MessageType } from '../shared/types.js';
 import { sendToTab, MessageRouter } from '../shared/messaging.js';
 import type { ExtensionMessage, PageSnapshot, ExtensionResponse } from '../shared/types.js';
 import { extractPageRepresentationFromDom } from './domPerception.js';
-import type { PageRepresentation } from '../shared/types.js';
+import { executeDomAction } from './domExecutor.js';
+import type { PageRepresentation, ExecutionResult, ExecuteActionRequest } from '../shared/types.js';
 
 const router = new MessageRouter();
 
@@ -30,20 +31,41 @@ router.register(MessageType.INSPECT_PAGE_REQUEST, async (
   }
 });
 
+// Handle action execution requests from background service worker
+router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async (
+  payload: ExecuteActionRequest,
+  _sender
+): Promise<ExtensionResponse<ExecutionResult>> => {
+  try {
+    const result = executeDomAction(payload?.action);
+    return {
+      success: true,
+      data: result
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Action execution failed'
+    };
+  }
+});
+
 /**
  * Listen for messages from the background script / popup
  */
-chrome.runtime.onMessage.addListener(
-  <T = any>(message: ExtensionMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: ExtensionResponse) => void) => {
-    router.route(message, sender).then((response) => {
-      if (sendResponse) {
-        sendResponse(response);
-      }
-    });
-    // Return true to indicate we'll respond asynchronously
-    return true;
-  }
-);
+if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
+  chrome.runtime.onMessage.addListener(
+    <T = any>(message: ExtensionMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: ExtensionResponse) => void) => {
+      router.route(message, sender).then((response) => {
+        if (sendResponse) {
+          sendResponse(response);
+        }
+      });
+      // Return true to indicate we'll respond asynchronously
+      return true;
+    }
+  );
+}
 
-export { extractPageRepresentationFromDom, router };
-export type { PageSnapshot, PageRepresentation };
+export { extractPageRepresentationFromDom, executeDomAction, router };
+export type { PageSnapshot, PageRepresentation, ExecutionResult };
