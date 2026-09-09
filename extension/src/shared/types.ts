@@ -260,3 +260,14 @@ export interface SanitizedPageRepresentation {
   findings: PrivacyFinding[];
   metadata: PrivacySanitizationMetadata;
 }
+
+/**
+ * Coordinate space contract types — Phase 2F-1.
+ */
+export type {
+  CoordinateConversionOptions,
+  CoordinateScale,
+  CoordinateSpaceMetadata,
+  CssViewportRect,
+  ScreenshotPixelRect
+} from './coordinates.js';
