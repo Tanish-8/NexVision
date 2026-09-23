@@ -182,16 +182,16 @@ export class LlamaVisionAdapter implements VisualPerceptionAdapter {
       }
     };
 
-    // 3. Dispatch HTTP request with dedicated timeout
+    // 3. Dispatch HTTP request with dedicated timeout covering entire lifecycle (fetch + body read)
     const endpoint = `${this.baseUrl}/v1/chat/completions`;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
       controller.abort();
     }, this.timeoutMs);
 
-    let response: Response;
+    let rawContent: string;
     try {
-      response = await this.fetchFn(endpoint, {
+      const response = await this.fetchFn(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -199,9 +199,60 @@ export class LlamaVisionAdapter implements VisualPerceptionAdapter {
         body: JSON.stringify(payload),
         signal: controller.signal
       });
-    } catch (fetchError: unknown) {
-      clearTimeout(timeoutId);
 
+      // 4. Verify HTTP status
+      if (!response.ok) {
+        return {
+          success: false,
+          error: {
+            code: 'PERCEPTION_FAILURE',
+            message: `Local vision server returned HTTP ${response.status} ${response.statusText}`
+          }
+        };
+      }
+
+      // 5. Parse outer JSON structure under signal guard
+      let responseBody: any;
+      try {
+        if (typeof response.json === 'function') {
+          responseBody = await response.json();
+        } else if (typeof (response as any).text === 'function') {
+          const rawText = await (response as any).text();
+          responseBody = JSON.parse(rawText);
+        } else {
+          throw new Error('Response body parser unavailable');
+        }
+      } catch (parseError: unknown) {
+        if (controller.signal.aborted) {
+          return {
+            success: false,
+            error: {
+              code: 'PERCEPTION_FAILURE',
+              message: `Local vision inference timed out after ${this.timeoutMs}ms`
+            }
+          };
+        }
+        return {
+          success: false,
+          error: {
+            code: 'PERCEPTION_FAILURE',
+            message: 'Local vision server returned invalid JSON response'
+          }
+        };
+      }
+
+      const content = responseBody?.choices?.[0]?.message?.content;
+      if (typeof content !== 'string' || content.trim() === '') {
+        return {
+          success: false,
+          error: {
+            code: 'PERCEPTION_FAILURE',
+            message: 'Local vision server returned response without text content'
+          }
+        };
+      }
+      rawContent = content;
+    } catch (fetchError: unknown) {
       if (controller.signal.aborted) {
         return {
           success: false,
@@ -221,42 +272,6 @@ export class LlamaVisionAdapter implements VisualPerceptionAdapter {
       };
     } finally {
       clearTimeout(timeoutId);
-    }
-
-    // 4. Verify HTTP status
-    if (!response.ok) {
-      return {
-        success: false,
-        error: {
-          code: 'PERCEPTION_FAILURE',
-          message: `Local vision server returned HTTP ${response.status} ${response.statusText}`
-        }
-      };
-    }
-
-    // 5. Parse outer JSON structure
-    let responseBody: any;
-    try {
-      responseBody = await response.json();
-    } catch {
-      return {
-        success: false,
-        error: {
-          code: 'PERCEPTION_FAILURE',
-          message: 'Local vision server returned invalid JSON response'
-        }
-      };
-    }
-
-    const rawContent = responseBody?.choices?.[0]?.message?.content;
-    if (typeof rawContent !== 'string' || rawContent.trim() === '') {
-      return {
-        success: false,
-        error: {
-          code: 'PERCEPTION_FAILURE',
-          message: 'Local vision server returned response without text content'
-        }
-      };
     }
 
     // 6. Strip code fences and parse structured JSON

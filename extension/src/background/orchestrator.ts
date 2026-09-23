@@ -54,6 +54,8 @@ export interface ScreenshotReference {
    * persist or transmit this value.
    */
   dataUrl?: string;
+  /** Optional physical pixel dimensions of the captured screenshot. */
+  dimensions?: { width: number; height: number };
 }
 
 /**
@@ -250,9 +252,9 @@ export async function perceivePage(
   }
 
   // 3. Build VisionImageInput from the screenshot reference.
-  //    Viewport dimensions come from the DOM representation.
+  //    Physical screenshot dimensions are preferred when known; falls back to CSS viewport dimensions.
   const visionInput = {
-    dimensions: {
+    dimensions: screenshotRef.dimensions ?? {
       width: domRepresentation.viewport.width,
       height: domRepresentation.viewport.height
     },
@@ -290,7 +292,8 @@ export async function perceivePage(
   //    so callers don't accidentally persist image bytes through the metadata path.
   const safeScreenshotRef: ScreenshotReference = {
     format: screenshotRef.format,
-    timestamp: screenshotRef.timestamp
+    timestamp: screenshotRef.timestamp,
+    ...(screenshotRef.dimensions ? { dimensions: screenshotRef.dimensions } : {})
     // dataUrl omitted from the result — it was only needed for the vision step.
   };
 

@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { captureVisibleTab } from './screenshot.js';
+import { captureVisibleTab, extractPngDimensions } from './screenshot.js';
 import { MessageRouter } from '../shared/messaging.js';
 import { MessageType } from '../shared/types.js';
 import type { ExtensionResponse, ScreenshotCaptureResult, ScreenshotCaptureOptions } from '../shared/types.js';
@@ -464,6 +464,39 @@ describe('Screenshot message handling through MessageRouter', () => {
 
     expect(response.success).toBe(false);
     expect(response.error).toContain('Cannot access contents of the page');
+  });
+});
+
+describe('extractPngDimensions', () => {
+  it('should extract width and height from valid PNG data URL', () => {
+    // 100x50 PNG header
+    const dataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGQAAAAy';
+    const dims = extractPngDimensions(dataUrl);
+    expect(dims).toEqual({ width: 100, height: 50 });
+  });
+
+  it('should extract width and height from 1x1 PNG data URL', () => {
+    const dataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const dims = extractPngDimensions(dataUrl);
+    expect(dims).toEqual({ width: 1, height: 1 });
+  });
+
+  it('should return undefined for non-PNG or invalid data URLs', () => {
+    expect(extractPngDimensions('data:image/jpeg;base64,12345')).toBeUndefined();
+    expect(extractPngDimensions('not-a-data-url')).toBeUndefined();
+    expect(extractPngDimensions('data:image/png;base64,short')).toBeUndefined();
+    expect(extractPngDimensions(null as any)).toBeUndefined();
+  });
+
+  it('captureVisibleTab attaches dimensions when PNG is captured', async () => {
+    const fakeDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGQAAAAy';
+    const captureMock = vi.fn().mockResolvedValue(fakeDataUrl);
+    globalThis.chrome = {
+      tabs: { captureVisibleTab: captureMock }
+    } as any;
+
+    const result = await captureVisibleTab(123);
+    expect(result.dimensions).toEqual({ width: 100, height: 50 });
   });
 });
 

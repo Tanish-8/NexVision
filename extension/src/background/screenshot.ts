@@ -16,6 +16,41 @@ import type { ScreenshotCaptureOptions, ScreenshotCaptureResult } from '../share
  * @returns Promise resolving to the minimal ScreenshotCaptureResult.
  * @throws Error if capture fails, rate limit is exceeded, or the API is unavailable.
  */
+/**
+ * Safely parses the physical pixel dimensions from a PNG base64 data URL.
+ * Reads the IHDR chunk width and height directly from the first 24 bytes
+ * without decoding the full image payload. Returns undefined if not a valid PNG.
+ */
+export function extractPngDimensions(
+  dataUrl: string
+): { width: number; height: number } | undefined {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png;base64,')) {
+    return undefined;
+  }
+  try {
+    const base64Header = dataUrl.slice(22, 58);
+    const binary =
+      typeof atob === 'function'
+        ? atob(base64Header)
+        : Buffer.from(base64Header, 'base64').toString('binary');
+    if (binary.length >= 24) {
+      const bytes = new Uint8Array(24);
+      for (let i = 0; i < 24; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const view = new DataView(bytes.buffer);
+      const width = view.getUint32(16, false);
+      const height = view.getUint32(20, false);
+      if (width > 0 && height > 0) {
+        return { width, height };
+      }
+    }
+  } catch {
+    // Non-critical: safe fallback to undefined
+  }
+  return undefined;
+}
+
 export async function captureVisibleTab(
   windowId?: number,
   options?: ScreenshotCaptureOptions
@@ -49,10 +84,13 @@ export async function captureVisibleTab(
     throw new Error('Screenshot capture failed: No image data returned');
   }
 
+  const dimensions = format === 'png' ? extractPngDimensions(dataUrl) : undefined;
+
   return {
     dataUrl,
     format,
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    ...(dimensions ? { dimensions } : {})
   };
 }
 

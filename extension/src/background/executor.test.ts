@@ -1263,3 +1263,131 @@ describe('Phase 3B — Background Executor (executeAction)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// clearFirst regression tests — query-text-replace fix
+// ---------------------------------------------------------------------------
+
+describe('domExecutor clearFirst regression — query-text-replace', () => {
+  beforeEach(() => {
+    document.body.innerHTML = '';
+    clearPerceptionElementRegistry();
+  });
+
+  it('CF-1. TYPE into empty input (no clearFirst) sets value correctly', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    document.body.appendChild(input);
+    extractPageRepresentationFromDom();
+
+    const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+    const action = makeTypeAction(target, 'laptops under 50000', {});
+    const result = executeDomAction(action);
+
+    expect(result.success).toBe(true);
+    expect(input.value).toBe('laptops under 50000');
+  });
+
+  it('CF-2. TYPE with clearFirst:true replaces existing value with complete query', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = 'old query';
+    document.body.appendChild(input);
+    extractPageRepresentationFromDom();
+
+    const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+    const action = makeTypeAction(target, 'new complete query', { clearFirst: true });
+    const result = executeDomAction(action);
+
+    expect(result.success).toBe(true);
+    expect(input.value).toBe('new complete query');
+  });
+
+  it('CF-3. TYPE without clearFirst appends to existing value (intentional append preserved)', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = 'existing ';
+    document.body.appendChild(input);
+    extractPageRepresentationFromDom();
+
+    const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+    const action = makeTypeAction(target, 'appended', { clearFirst: false });
+    const result = executeDomAction(action);
+
+    expect(result.success).toBe(true);
+    expect(input.value).toBe('existing appended');
+  });
+
+  it('CF-4. clearFirst:true + pressEnter:true replaces value and dispatches Enter', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = 'stale text';
+    let enterFired = false;
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') enterFired = true;
+    });
+    document.body.appendChild(input);
+    extractPageRepresentationFromDom();
+
+    const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+    const action = makeTypeAction(target, 'replacement query', { clearFirst: true, pressEnter: true });
+    const result = executeDomAction(action);
+
+    expect(result.success).toBe(true);
+    expect(input.value).toBe('replacement query');
+    expect(enterFired).toBe(true);
+  });
+
+  it('CF-5. clearFirst:true fires input and change events (React reactivity path)', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = 'old';
+    const events: string[] = [];
+    input.addEventListener('input', () => events.push('input'));
+    input.addEventListener('change', () => events.push('change'));
+    document.body.appendChild(input);
+    extractPageRepresentationFromDom();
+
+    const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+    // clearFirst:true fires input+change for clear, then again for the type
+    const action = makeTypeAction(target, 'new value', { clearFirst: true });
+    executeDomAction(action);
+
+    expect(input.value).toBe('new value');
+    // At minimum, input and change events should have fired
+    expect(events).toContain('input');
+    expect(events).toContain('change');
+  });
+
+  it('CF-6. typed text is NOT exposed in ExecutionResult (privacy)', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    document.body.appendChild(input);
+    extractPageRepresentationFromDom();
+
+    const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+    const action = makeTypeAction(target, 'my secret search', { clearFirst: true, pressEnter: true });
+    const result = executeDomAction(action);
+
+    expect(result.success).toBe(true);
+    // The ExecutionResult must never contain typed text
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('my secret search');
+    expect(serialized).not.toContain('secret');
+  });
+
+  it('CF-7. clearFirst:true on textarea replaces existing content', () => {
+    const textarea = document.createElement('textarea');
+    textarea.value = 'existing content in textarea';
+    document.body.appendChild(textarea);
+    extractPageRepresentationFromDom();
+
+    const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+    const action = makeTypeAction(target, 'replacement text', { clearFirst: true });
+    const result = executeDomAction(action);
+
+    expect(result.success).toBe(true);
+    expect(textarea.value).toBe('replacement text');
+  });
+});
+

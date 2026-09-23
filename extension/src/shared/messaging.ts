@@ -77,10 +77,21 @@ export class MessageRouter {
     this.handlers.set(type, handler as MessageHandler);
   }
 
+  hasHandler(type: string): boolean {
+    return this.handlers.has(type);
+  }
+
   async route(
     message: ExtensionMessage,
     sender: chrome.runtime.MessageSender
   ): Promise<ExtensionResponse> {
+    if (!message || typeof message !== 'object' || typeof message.type !== 'string') {
+      return {
+        success: false,
+        error: 'Invalid message structure'
+      };
+    }
+
     const handler = this.handlers.get(message.type);
     if (!handler) {
       return {
@@ -90,7 +101,14 @@ export class MessageRouter {
     }
 
     try {
-      return await handler(message.payload, sender);
+      const response = await handler(message.payload, sender);
+      if (!response || typeof response !== 'object') {
+        return {
+          success: false,
+          error: `Handler for "${message.type}" returned an invalid response`
+        };
+      }
+      return response;
     } catch (error) {
       return {
         success: false,
@@ -98,4 +116,60 @@ export class MessageRouter {
       };
     }
   }
+}
+
+/**
+ * Dispatches an incoming Chrome runtime message through a MessageRouter,
+ * guaranteeing that sendResponse() is called exactly once with a valid ExtensionResponse
+ * regardless of whether the handler succeeds, rejects, throws synchronously,
+ * or returns an invalid payload.
+ *
+ * Always returns true synchronously to maintain asynchronous response capability.
+ */
+export function dispatchMessageToRouter(
+  router: MessageRouter,
+  message: unknown,
+  sender: chrome.runtime.MessageSender,
+  sendResponse: (response: ExtensionResponse) => void
+): boolean {
+  let hasResponded = false;
+
+  const safeSend = (response: ExtensionResponse): void => {
+    if (hasResponded) return;
+    hasResponded = true;
+    try {
+      sendResponse(response);
+    } catch {
+      // Port or message channel might have already been closed
+    }
+  };
+
+  try {
+    router
+      .route(message as ExtensionMessage, sender)
+      .then((response) => {
+        safeSend(
+          response ?? {
+            success: false,
+            error: 'Empty response returned from message handler'
+          }
+        );
+      })
+      .catch((error) => {
+        safeSend({
+          success: false,
+          error: error instanceof Error ? error.message : 'Asynchronous routing failure'
+        });
+      });
+  } catch (syncError) {
+    safeSend({
+      success: false,
+      error:
+        syncError instanceof Error
+          ? syncError.message
+          : 'Synchronous dispatch failure'
+    });
+  }
+
+  return true;
 }

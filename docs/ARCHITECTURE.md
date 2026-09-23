@@ -1,336 +1,560 @@
-# SIH26171 Architecture
+# SIH26171 — NexVision Architecture
 
-**Project:** SIH26171  
-**Problem statement:** On-device Visual Perception for Lightweight Browser Agents  
-**GitHub repository:** NexVision  
-**Document status:** Long-term architecture and development workflow  
-**Current implementation status:** Phase 0, Phase 1A, Phase 1B, Phase 1C-1, and Phase 1C-2 are complete; Phase 1C-3 is next.
+**Project:** SIH26171 — On-device Visual Perception for Lightweight Browser Agents  
+**Repository:** `Tanish-8/NexVision`  
+**Document status:** Current architectural source of truth for handoff  
+**Last updated:** 2026-09-17
 
-> This document is the architectural source of truth. It describes the current repository accurately and separates implemented behavior from planned behavior. Implementation agents should inspect the current source before changing code; `docs/PROGRESS.md` and Git history are maintained by the project owner unless explicitly delegated.
-
-## Mandatory Development & Progress Tracking Workflow
-
-`docs/PROGRESS.md` is the authoritative live project tracker.
-
-For every future implementation task:
-
-1. Inspect the current implementation and tests before editing.
-2. Implement only the requested, explicitly scoped increment.
-3. Add or update focused tests for every changed behavior.
-4. Run the appropriate typecheck, full tests, build, and relevant local/manual verification.
-5. Do not expand into later roadmap phases unless explicitly requested.
-6. The project owner maintains `docs/PROGRESS.md`, architecture updates, commits, and pushes unless those responsibilities are explicitly delegated to the implementation agent.
-7. Update this architecture document only when an actual architectural decision or structural change occurs. Do not rewrite it for every small code change.
-8. Never mark a phase, milestone, or feature complete without corresponding verification.
-
-**Every completed implementation increment MUST leave enough verification evidence for the project owner to update `docs/PROGRESS.md` accurately.**
-
-This workflow keeps coding-agent work focused on implementation quality while keeping project-state documentation and version-control decisions under explicit project-owner control.
+> This document reflects the implementation reached by the project, not the original roadmap. Implemented behavior, verified limitations, and future work are kept separate.
 
 ---
 
-## A. Project overview
+## 1. Project Objective
 
-### Objective
+NexVision is a privacy-first browser-agent prototype for SIH26171. It lets a lightweight browser agent perceive webpages, reason about the current page, and execute browser actions while keeping webpage perception and sensitive-data handling local.
 
-SIH26171 is a privacy-first browser-agent project whose problem statement is:
-
-> **On-device Visual Perception for Lightweight Browser Agents**
-
-The core objective is to give a lightweight browser agent a structured understanding of the current webpage while keeping perception and sensitive-data handling local to the browser whenever possible. The eventual system should be able to perceive a page, identify relevant controls, protect sensitive information, ground a task to page elements, act through the browser, and verify the result.
-
-### Why browser agents need perception
-
-A browser agent cannot reliably act from a user instruction alone. It needs to know what is currently rendered, which controls are interactive, how controls are labelled, where they are located, what state they are in, and how page structure changes after an action. Perception supplies the page state used by task understanding, grounding, planning, execution, and verification.
-
-### Why local/on-device perception matters
-
-A traditional browser-agent design may send raw DOM content, text, screenshots, form metadata, or other page state to a remote model or server. That can expose more information than the task requires. SIH26171 instead intends to perform page perception and privacy processing locally first, establish a privacy boundary, and expose only the minimum sanitized state needed by later reasoning components.
-
-### Privacy-first principle
-
-The system should minimize sensitive-data collection and disclosure by construction:
-
-- Perception should collect only fields needed for grounding and state understanding.
-- Raw user-entered values should not be included in the general page representation.
-- Passwords receive stricter handling than ordinary page text.
-- An agent should not receive raw PII merely because it is present in the DOM or screenshot.
-- Missing personal information must not be guessed; the user explicitly configures or provides profile data.
-- Local execution should resolve protected values at the last responsible moment.
-
-The current repository demonstrates the beginning of this boundary through DOM extraction that excludes input, password, hidden-input, and textarea values. The complete privacy engine and local profile mechanism are planned, not implemented.
-
----
-
-## B. Core differentiator
-
-The intended differentiator is:
-
-> **A browser agent that performs webpage perception locally and establishes a privacy boundary before information is exposed to an AI model or server.**
-
-The intended high-level flow is:
+The central architectural principle is:
 
 ```text
-USER TASK
-    ↓
-TASK UNDERSTANDING
-    ↓
-BROWSER
-    ├── DOM PERCEPTION
-    └── SCREENSHOT / VISUAL PERCEPTION
-            ↓
-    UNIFIED PAGE REPRESENTATION
-            ↓
-    LOCAL PRIVACY ENGINE
-            ↓
-    SANITIZED PAGE STATE
-            ↓
-    TASK ↔ ELEMENT GROUNDING
-            ↓
-    PLANNER
-            ↓
-    EXECUTOR
-            ↓
-    BROWSER
-            ↓
-    VERIFICATION
-       /       \
-   SUCCESS    FAILURE
-                ↓
-          RE-PERCEIVE
+WEBPAGE
+   ↓
+LOCAL PERCEPTION
+   ├── DOM
+   └── SCREENSHOT / VISION
+   ↓
+UNIFIED PAGE REPRESENTATION
+   ↓
+LOCAL PRIVACY / SANITIZATION
+   ↓
+SANITIZED PAGE STATE
+   ↓
+TASK ↔ ELEMENT GROUNDING
+   ↓
+LOCAL QWEN PLANNER / AGENT
+   ↓
+VALIDATED ACTION
+   ↓
+BROWSER EXECUTOR
+   ↓
+PAGE CHANGES
+   ↓
+RE-PERCEPTION / VERIFICATION
+   ↺
 ```
 
-This is the target workflow. Only the extension foundation, PageRepresentation contract, and DOM perception portion currently exist.
-
-### Stage responsibilities
-
-1. **User task** — The user expresses an intended outcome, such as finding information or completing a form.
-2. **Task understanding** — A future task-understanding component will interpret the instruction, constraints, and desired outcome. No agent or task-understanding implementation exists yet.
-3. **Browser** — The browser is the environment being observed and, later, acted upon.
-4. **DOM perception** — The current implementation extracts semantic and structural information from the page DOM. It now includes the Phase 1C-1/1C-2 hardening described below and is intended to provide reliable input for later grounding.
-5. **Screenshot / visual perception** — A planned component will capture and interpret visual information that DOM inspection cannot fully describe, such as visual grouping, layout, canvas content, and rendered appearance.
-6. **Unified page representation** — DOM and visual observations will eventually be combined into one versioned representation. The current `PageRepresentation` is the DOM-side contract and already includes provenance so future sources can be distinguished or combined. Phase 1C hardening improves the quality of this DOM-side evidence without introducing visual perception.
-7. **Local privacy engine** — A planned local component will detect, classify, and protect PII and other sensitive content before it crosses the privacy boundary.
-8. **Sanitized page state** — Only the minimum information needed for reasoning and grounding should leave the local perception/privacy boundary.
-9. **Task ↔ element grounding** — A planned component will map task language to stable page-element identifiers and supported actions.
-10. **Planner** — A future planner/agent will choose the next observation or browser action.
-11. **Executor** — A future local browser executor will perform approved actions against grounded elements. It must be able to resolve protected local values without exposing them unnecessarily to the model.
-12. **Verification** — A future verifier will check whether the requested outcome occurred. Failure should trigger a fresh observation rather than blind repetition.
-13. **Re-perceive** — The loop is event-driven: after a meaningful page change or action, observe again and use the new state.
+The current prototype implements most of this path, but it remains bounded and has known reliability limitations.
 
 ---
 
-## C. Current implemented architecture
+## 2. Current Implementation Snapshot
 
-### Repository structure
+### Implemented and verified
 
-The repository currently contains the following top-level areas:
+- Chrome/Brave Manifest V3 extension.
+- Popup → background service-worker → content-script messaging.
+- Structured `PageRepresentation`.
+- Hardened DOM perception with stable per-representation element IDs.
+- Semantic roles, accessibility names, state, bounds, relationships, and provenance.
+- Screenshot capture infrastructure.
+- Local Qwen2.5-VL inference through `llama-server`.
+- Vision adapter with strict detection validation.
+- Unified DOM + vision perception orchestration.
+- DOM-only fallback when visual inference fails or times out.
+- Screenshot/viewport coordinate normalization.
+- Deterministic visual/DOM grounding.
+- `ActionTarget` / `IntendedAction` contracts.
+- Planner validation boundary.
+- Browser executor for `click`, `type`, and `focus`.
+- Local privacy/sanitization boundary.
+- Output-side protection for sensitive `type` actions.
+- Local Qwen agent/planner.
+- Model-output normalization for common Qwen schema variations.
+- Candidate compaction (`MAX_MODEL_CANDIDATES = 20`) to control context size.
+- MV3 static-import rule and service-worker async-response hardening.
+- Service-worker keepalive during active local inference.
+- Fast vision timeout with DOM fallback.
+- Bounded demo agent loop of at most 3 action iterations.
+- Controlled offline NexMart demo page.
+- ShopSphere as the primary realistic demo target.
+- TaskFlow as a secondary realistic target.
+- CI checks for extension typecheck/tests/build.
 
-| Path | Current status | Source of truth |
-|---|---|---|
-| `extension/` | Implemented Chrome/Brave Manifest V3 extension | `extension/manifest.json`, `extension/src/` |
-| `extension/src/background/` | Implemented service worker | `service-worker.ts` |
-| `extension/src/content/` | Implemented content script and DOM perception | `content-script.ts`, `domPerception.ts` |
-| `extension/src/popup/` | Implemented popup UI and inspection request | `popup.ts`, `popup.html` |
-| `extension/src/shared/` | Implemented messaging utilities and shared contracts | `messaging.ts`, `types.ts` |
-| `extension/dist/` | Generated build output for loading the extension | `scripts/build.mjs` |
-| `privacy-engine/` | Scaffold and README only; no functionality | `privacy-engine/README.md`, empty `src/index.ts` |
-| `vision/` | Directory scaffold only; no visual implementation | `vision/src/` |
-| `agent/` | Directory scaffold only; no agent implementation | `agent/src/` |
-| `backend/` | Directory scaffold only; no backend implementation | `backend/src/` |
-| `evaluation/` | Directory scaffold only; no evaluation implementation | `evaluation/src/` |
-| `docs/` | Architecture and design documentation | This document and related docs |
+### Current blocker
 
-The existing lowercase `docs/architecture.md` path is the same filesystem path as this canonical `docs/ARCHITECTURE.md` on Windows; this document is the maintained architecture document.
-
-### Extension manifest and build
-
-`extension/manifest.json` defines a Manifest V3 extension with:
-
-- An ES-module background service worker at `background/service-worker.js`.
-- A content script at `content/content-script.js`, matched to `<all_urls>` and run at `document_idle`.
-- A popup at `popup/popup.html`.
-- `activeTab` and `scripting` permissions plus `<all_urls>` host permissions.
-- Placeholder icon files generated by the build script.
-
-The root `package.json` delegates typechecking, testing, and building to the extension workspace. The extension uses TypeScript, ES2022 output, `@types/chrome`, esbuild, Vitest, and happy-dom. `extension/scripts/build.mjs` cleans `extension/dist`, compiles TypeScript, bundles the content script, and copies the manifest, popup assets, and icons.
-
-### Current runtime message flow
-
-The implemented runtime path is:
+The latest verified ShopSphere E2E reaches:
 
 ```text
-Popup
-  → chrome.runtime.sendMessage(inspect-page-request)
-Background service worker
-  → chrome.tabs.query({ active: true, currentWindow: true })
-  → chrome.tabs.sendMessage(activeTab.id, inspect-page-request)
-Content script
-  → DOM perception
-  → ExtensionResponse<PageRepresentation>
-Background
-  → Popup
+Perception   ✅
+Privacy      ✅
+Grounding   ✅
+Planning    ❌  Failed to parse model output as valid JSON
+Execution    —
+Verify       —
 ```
 
-`extension/src/shared/messaging.ts` supplies:
+The current diagnosis is that the local Qwen planning response can hit the configured completion limit (`max_tokens: 512`) and return `finish_reason: "length"`, leaving malformed/truncated JSON before `JSON.parse()` can reach `normalizeModelProposal()`.
 
-- `generateMessageId()` for request correlation IDs.
-- `sendToBackground()` for popup-to-background messages.
-- `sendToTab()` for background-to-content-script messages.
-- `MessageRouter` for registering and routing message handlers.
-
-The background service worker currently handles `INSPECT_PAGE_REQUEST`, obtains the active tab, forwards the request, and returns the response. It also registers install and startup listeners.
-
-The content script registers the same request type, calls `extractPageRepresentationFromDom()`, and returns either a successful representation or an error response. The popup displays the page title, formatted URL, heading count, and inspection time; it does not yet expose a general-purpose agent UI.
-
-### Current shared representation contract
-
-`extension/src/shared/types.ts` defines schema version `1.0` and the following structures:
-
-- `PageMetadata`: optional document title and URL.
-- `Viewport`: width and height in CSS pixels.
-- `ElementBounds`: viewport-coordinate x/y/width/height.
-- `ElementRole`: common native and supported ARIA roles.
-- `ElementState`: visibility, enabled/disabled, focus, selected, checked, and expanded state.
-- `PageElement`: ID, tag name, role, normalized visible text, accessible name, placeholder, input type, bounds, state, interactive flag, selected attributes, parent/child IDs, and provenance.
-- `PageRepresentation`: schema version, metadata, viewport, and an ordered array of elements.
-
-A small `PageSnapshot` type also remains in the shared file as an earlier basic title/URL/heading-count contract. The current inspection response is the richer `PageRepresentation`.
-
-### Current DOM perception
-
-`extension/src/content/domPerception.ts` currently:
-
-- Selects native interactive elements, meaningful content elements, headings, images, forms/navigation elements, supported ARIA-role elements, and tabindex candidates while filtering unsupported presentation/layout noise.
-- Uses document order to assign deterministic IDs (`elem-1`, `elem-2`, and so on) for each representation.
-- Normalizes whitespace in text and selected attributes.
-- Extracts native and supported ARIA semantics.
-- Computes accessible names from `aria-label`, `aria-labelledby`, associated labels, image alt text, and appropriate visible text.
-- Uses `getBoundingClientRect()` for bounds and the production visibility check.
-- Handles CSS visibility, hidden ancestors, zero-size elements, hidden inputs, disabled controls, disabled fieldsets, focus, checked state, selected options, `aria-expanded`, and ancestor `inert`.
-- Represents direct parent/child relationships using IDs rather than nested element objects.
-- Sets `provenance` to `dom`.
-- Copies only a curated set of grounding/state attributes and deliberately excludes values, passwords, checked/selected values, and arbitrary HTML attributes.
-- Keeps `aria-hidden` as accessibility semantics rather than treating it as visual invisibility.
-- Normalizes visible text and selected attributes, extracts associated labels, computes lightweight accessible names, and exposes label relationships through `labelIds`.
-- Excludes user-entered input and textarea text even when those controls are descendants of a represented container such as a form.
-
-### Current verification evidence
-
-The current DOM implementation has a Vitest suite using happy-dom and mocked layout measurements. The tests cover metadata, viewport, controls, headings, normalized text, bounds, interactivity, CSS and zero-size visibility, disabled state including fieldsets, select/option state, ARIA names and states, relationships, deterministic IDs, and privacy exclusions.
-
-The latest verified results are:
-
-- `npm run typecheck` — passed.
-- `npm test` — 48 tests passed across 3 test files, including 41 DOM perception tests.
-- `npm run build` — passed and refreshed `extension/dist`.
-- Brave validation — the popup successfully inspected a local page and a synthetic form page; the representation excluded synthetic input/password/textarea values. An external `https://example.com/` check was attempted but DNS was unavailable in the validation environment.
-
-### Explicitly not implemented
-
-The repository does **not** currently implement:
-
-- Screenshot capture or visual perception.
-- OCR or a vision model.
-- A privacy/PII detection or redaction engine.
-- A local profile or vault.
-- An AI/LLM agent, task understanding, planner, or grounding model.
-- Browser action execution or form autofill.
-- Verification/recovery loops.
-- Voice input/output.
-- A backend, cloud service, database, authentication, or continuous model retraining.
-- An evaluation harness or benchmark metrics.
-
-These are planned phases, not current capabilities.
+**Do not claim Planning → Execution is fixed until a fresh Brave + ShopSphere E2E proves it.**
 
 ---
 
-## D. Target architecture
+## 3. Repository Structure
 
-The following components describe the intended final system. Each item is explicitly marked as current or planned so future work does not confuse the roadmap with the repository.
+```text
+NexVision/
+├── .claude/
+├── .github/
+├── agent/
+├── backend/
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── PROGRESS.md
+├── evaluation/
+├── extension/
+│   ├── demo/
+│   │   └── nexvision-demo.html
+│   ├── src/
+│   │   ├── background/
+│   │   │   ├── service-worker.ts
+│   │   │   ├── screenshot.ts
+│   │   │   ├── orchestrator.ts
+│   │   │   ├── localAgent.ts
+│   │   │   ├── llamaVisionAdapter.ts
+│   │   │   ├── executor.ts
+│   │   │   └── demoRunner.ts
+│   │   ├── content/
+│   │   │   ├── content-script.ts
+│   │   │   ├── domPerception.ts
+│   │   │   └── domExecutor.ts
+│   │   ├── popup/
+│   │   │   ├── popup.html
+│   │   │   ├── popup.ts
+│   │   │   └── styles.css
+│   │   └── shared/
+│   │       ├── types.ts
+│   │       ├── messaging.ts
+│   │       ├── coordinates.ts
+│   │       ├── grounding.ts
+│   │       ├── actions.ts
+│   │       └── planner.ts
+│   ├── manifest.json
+│   └── dist/
+├── privacy-engine/
+└── vision/
+    └── src/
+```
 
-1. **Browser Extension — CURRENT foundation / PLANNED expansion**  
-   The current extension is the runtime container. It will eventually coordinate local perception, privacy processing, grounding, execution, and verification.
-2. **DOM Perception — CURRENT**  
-   The extension can extract a DOM-based `PageRepresentation`. Phase 1C-1 and Phase 1C-2 are complete; Phase 1C-3 remains as the next DOM hardening increment.
-3. **Visual Perception — PLANNED / NOT YET FINALIZED**  
-   A future screenshot and visual-analysis component will complement DOM perception.
-4. **Unified Page Representation — CURRENT contract / PLANNED unification**  
-   Schema version `1.0` and DOM provenance exist. DOM quality/unification hardening is in progress; combining DOM and visual observations remains planned.
-5. **Local Privacy Engine — PLANNED / NOT YET IMPLEMENTED**  
-   The privacy-engine directory is scaffolded, but its README explicitly says there is no functionality yet.
-6. **Task ↔ Element Grounding — PLANNED**  
-   Future grounding will map task intent to representation IDs and permitted operations.
-7. **Planner / Agent — PLANNED**  
-   No model, agent loop, task understanding, or planner has been selected or implemented.
-8. **Browser Executor — PLANNED**  
-   Future local execution will apply grounded actions and resolve protected local values.
-9. **Verification / Recovery — PLANNED**  
-   Future verification will determine success and trigger re-perception after failure or meaningful page changes.
-10. **Optional Voice Interface — PLANNED / NOT YET FINALIZED**  
-    No voice technology has been selected.
-11. **Evaluation / Benchmarking — PLANNED**  
-    The evaluation directory is a scaffold; benchmark tasks, metrics, and performance targets are not finalized.
-
----
-
-## E. Page perception
-
-Page perception should combine complementary evidence rather than treat DOM and vision as competing approaches.
-
-### DOM information
-
-DOM perception is best suited to information that is explicit in the document or accessibility tree:
-
-- Structure and hierarchy.
-- Native and ARIA semantic roles.
-- Accessible names and associated labels.
-- Normalized visible text.
-- Element bounds and viewport coordinates.
-- Interaction state such as disabled, checked, selected, focused, and expanded.
-- Parent/child and other grounding relationships.
-- Stable IDs within one representation.
-
-### Visual information
-
-Visual perception is planned for information that is only apparent after rendering:
-
-- Screenshot appearance and layout relationships.
-- Visual grouping, alignment, and spatial context.
-- Canvas or image content not represented by useful DOM semantics.
-- Cases where the DOM is incomplete, misleading, or inaccessible.
-
-The unified representation should preserve provenance (`dom`, `vision`, or `both`) and reconcile observations without allowing visual extraction to bypass the privacy boundary.
+The working prototype currently lives primarily under `extension/` and `vision/`. Scaffold directories must not be treated as proof of missing functionality without checking the actual implementation.
 
 ---
 
-## F. Privacy architecture
+## 4. Runtime Architecture
 
-### Privacy boundary
+### 4.1 Popup
 
-The intended privacy boundary is local to the browser. The AI agent should not need to receive raw user PII in order to select an action.
+The popup provides:
 
-For example, form filling should conceptually use an indirect value source:
+- Agent task input.
+- `Run Agent`.
+- Six-phase status log:
+  - Perception
+  - Privacy
+  - Grounding
+  - Planning
+  - Execution
+  - Verify
+- Page inspection information.
+
+The popup explicitly resolves the active normal tab and forwards its `tabId` and `windowId` with agent requests.
+
+### 4.2 Service Worker
+
+The MV3 service worker:
+
+- Routes extension messages.
+- Resolves active tabs when required.
+- Runs the bounded demo-agent orchestration.
+- Calls perception, planning, and execution components.
+- Uses **static ES imports**. Runtime dynamic `import()` must not be introduced into the service-worker dependency path.
+- Uses a keepalive heartbeat during active agent runs.
+- Rejects concurrent agent runs.
+- Uses hardened message dispatch so asynchronous failures still produce structured responses.
+- Handles the agent-run lifecycle and progress events.
+
+### 4.3 Content Script
+
+The content script:
+
+- Receives perception/inspection requests.
+- Extracts the DOM representation.
+- Executes supported DOM-local browser actions when requested by the executor.
+- Uses the shared hardened messaging path.
+
+---
+
+## 5. PageRepresentation Contract
+
+`PageRepresentation` is the main boundary between perception and later components.
+
+It includes:
+
+- Schema version.
+- Page metadata.
+- Viewport dimensions in CSS pixels.
+- Ordered elements.
+- Stable IDs within a representation.
+- Tag name.
+- Semantic role.
+- Visible text.
+- Accessible name.
+- Placeholder/input type where appropriate.
+- Bounds.
+- Interaction state.
+- Interactive flag.
+- Curated attributes.
+- Parent/child relationships.
+- Label relationships.
+- Provenance: `dom`, `vision`, or `both`.
+
+### Privacy rule
+
+General DOM perception does **not** serialize:
+
+- raw user-entered input values,
+- passwords,
+- hidden-input values,
+- textarea values.
+
+Element IDs such as `elem-1` are deterministic within one representation but are not permanent identifiers across arbitrary page reloads.
+
+---
+
+## 6. DOM Perception
+
+`extension/src/content/domPerception.ts` is implemented and heavily tested.
+
+It handles:
+
+- Native interactive elements.
+- Meaningful content.
+- Headings, images, forms, navigation.
+- Supported ARIA roles.
+- Deterministic document-order IDs.
+- Normalized text.
+- Accessible-name computation.
+- Associated labels and `labelIds`.
+- CSS/ancestor visibility.
+- Zero-size elements.
+- Hidden inputs.
+- Disabled controls and disabled fieldsets.
+- `aria-disabled`.
+- `inert`.
+- Checked/selected/focused/expanded state.
+- Parent/child relationships.
+- Curated attributes.
+- Privacy-safe ancestor text.
+- `aria-hidden` as accessibility semantics rather than visual invisibility.
+
+DOM perception is the reliable fallback when visual inference is unavailable.
+
+---
+
+## 7. Visual Perception
+
+Local visual inference uses `llama.cpp` `llama-server`.
+
+### Current model/runtime
+
+```text
+Model:
+Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf
+
+Multimodal projection:
+mmproj-Qwen2.5-VL-Instruct-Q8_0.gguf
+
+Runtime:
+llama.cpp llama-server
+
+Endpoint:
+http://127.0.0.1:8080
+
+GPU backend:
+Vulkan1
+
+Launch configuration:
+--no-mmproj-offload
+-ngl 99
+--device Vulkan1
+--host 127.0.0.1
+--port 8080
+-c 4096
+-t 8
+```
+
+The exact cached mmproj filename used in the validated runtime is recorded in the project progress/handoff notes; keep the actual local model filename as the source of truth.
+
+The extension does **not** spawn the server. `llama-server.exe` is started separately.
+
+### Visual adapter behavior
+
+The adapter has:
+
+- Local HTTP inference.
+- Abort/timeout handling.
+- HTTP status handling.
+- Response-body timeout coverage.
+- Strict detection/bounding-box validation.
+- Privacy-safe error reporting.
+
+### Hardware limitation
+
+Previously validated hardware:
+
+```text
+CPU: AMD Ryzen 7 6800H
+RAM: 16 GB
+GPU: AMD Radeon RX 6650M ~4 GB dedicated
+iGPU: AMD Radeon 680M
+```
+
+Full multimodal GPU offload previously produced a device-loss failure. The validated configuration uses CPU for the multimodal projection path and Vulkan GPU acceleration for the main model.
+
+Visual inference can also fail because of image-decoding/memory-slot behavior in `llama-server`; the extension therefore times out quickly and falls back to DOM perception.
+
+---
+
+## 8. Unified Perception
+
+The orchestrator combines:
+
+```text
+DOM provider
++
+Screenshot provider
++
+Vision provider
+```
+
+Behavior:
+
+1. Obtain the DOM representation.
+2. Capture/obtain screenshot data.
+3. Attempt local visual perception.
+4. If vision succeeds, combine visual observations with DOM evidence.
+5. If vision fails or times out, continue with DOM-only perception.
+6. Report the failure origin without exposing raw page data in the safe result.
+
+A typical ShopSphere run may therefore report:
+
+```text
+DOM-only (no llama-server)
+```
+
+This is an intentional fallback state, not necessarily a crash.
+
+---
+
+## 9. Coordinate Space
+
+The implementation distinguishes:
+
+- DOM bounds: CSS viewport coordinates.
+- Screenshot detections: screenshot pixel coordinates.
+- Device-pixel-ratio metadata.
+
+Grounding uses measured screenshot-to-viewport scaling rather than blindly assuming DPR is always the scale factor.
+
+Previously measured example:
+
+```text
+Screenshot: 1295 × 877
+Viewport:   1036 × 702
+DPR:        1.25
+
+Scale X: 1.25
+Scale Y: ~1.2493
+```
+
+Invalid coordinates are not silently clamped.
+
+---
+
+## 10. Grounding
+
+`extension/src/shared/grounding.ts` implements deterministic target grounding.
+
+Current score:
+
+```text
+0.45 IoU
+0.20 visual containment
+0.15 element containment
+0.20 center proximity
+```
+
+Semantic labels receive stronger relevance than generic labels. Tie-breaking is deterministic.
+
+The DOM-only path can resolve actionable DOM elements into action targets. Counts vary by page and viewport; recent ShopSphere runs have produced roughly 110–115 interactive targets.
+
+---
+
+## 11. Action Contracts and Planner Boundary
+
+Supported action types are intentionally narrow:
+
+```text
+click
+type
+focus
+```
+
+Pipeline:
+
+```text
+Model proposal
+   ↓
+normalize model proposal
+   ↓
+strict advisory validation
+   ↓
+planner validation
+   ↓
+ActionTarget resolution
+   ↓
+executor
+```
+
+The model must not invent:
+
+- element IDs,
+- coordinates,
+- credentials,
+- unsupported actions.
+
+The model-facing candidate DTO is compact and omits bounds because the executor resolves actions by grounded element ID.
+
+---
+
+## 12. Local Qwen Agent / Planner
+
+`extension/src/background/localAgent.ts` implements the local planning boundary.
+
+The client sends requests to:
+
+```text
+http://127.0.0.1:8080/v1/chat/completions
+```
+
+The model receives:
+
+- user goal,
+- sanitized page context,
+- compact candidate elements,
+- safe state needed for action selection.
+
+It does not receive unnecessary raw private values.
+
+### Candidate compaction
+
+`MAX_MODEL_CANDIDATES = 20`.
+
+Candidates are ranked using role priority and goal-keyword relevance. Bounds are omitted from the model-facing DTO.
+
+This was introduced after a live request of about 6887 tokens exceeded the server's 4096-token context.
+
+### Model-output normalization
+
+`normalizeModelProposal()` handles common Qwen schema variations, including a lower-level action discriminator such as:
 
 ```json
 {
-  "action": "fill",
+  "type": "click",
+  "targetElementId": "elem-42"
+}
+```
+
+which can be normalized to the canonical action wrapper expected by the planner.
+
+It also supports safe target-ID aliases and root-level type text while preserving strict validation.
+
+### Output-side privacy
+
+Sensitive values such as emails, phone numbers, payment-card numbers, bearer tokens, API keys, and similar credential-like text are blocked from `type` actions unless represented through an approved semantic profile reference.
+
+---
+
+## 13. Current Planning Output Blocker
+
+The latest live ShopSphere issue remains:
+
+```text
+Planning
+Failed — Failed to parse model output as valid JSON
+```
+
+Current diagnosis:
+
+- `parseAdvisoryResponse()` can fail at `JSON.parse(cleaned)` before `normalizeModelProposal()`.
+- Markdown-fence stripping is intentionally narrow.
+- Candidate compaction is already active.
+- The local client was using `max_tokens: 512`.
+- Live llama-server evidence showed a planning completion reaching the length limit with `finish_reason: "length"`.
+- A truncated completion can therefore produce malformed JSON.
+
+### Safe next fix
+
+The next implementation should be small and focused:
+
+1. Increase the planning completion budget, initially to about 1024 tokens unless code inspection gives a strong reason otherwise.
+2. Make JSON extraction tolerant of known safe wrappers/fences.
+3. Do not repair truncated JSON by guessing missing fields.
+4. Preserve strict proposal validation and privacy checks.
+5. Add regression tests.
+6. Re-run the real Brave + ShopSphere E2E.
+
+Do not add retries or a generic LLM-output-repair subsystem until the direct fix has been tested.
+
+---
+
+## 14. Privacy Architecture
+
+The intended privacy boundary is:
+
+```text
+WEBPAGE
+   ↓
+LOCAL PERCEPTION
+   ↓
+LOCAL PRIVACY / SANITIZATION
+   ↓
+MINIMAL SANITIZED STATE
+   ↓
+LOCAL QWEN
+```
+
+Sensitive values should not be sent merely because they are present in the DOM.
+
+For future protected profile data, the conceptual contract is:
+
+```json
+{
+  "action": "type",
   "target": "field-01",
   "valueSource": "profile.firstName"
 }
 ```
 
-The intended execution flow is:
+with:
 
 ```text
-LOCAL PROFILE
-      ↓
+LOCAL PROFILE / VAULT
+        ↓
 LOCAL EXECUTOR
-      ↓
+        ↓
 WEBPAGE
 ```
 
-It must **not** become:
+rather than:
 
 ```text
 LOCAL PROFILE
@@ -340,150 +564,225 @@ LLM / SERVER
 WEBPAGE
 ```
 
-### Required privacy behaviors
-
-- **Raw PII protection:** Raw values should be detected and protected locally before page state is exposed to a model or server.
-- **Passwords:** Password fields and password values require stricter handling. They should not be sent to an agent or server and should only be resolved locally when explicitly authorized.
-- **User-provided profile data:** Profile information is explicitly configured by the user. The system must not infer or invent missing personal information.
-- **Missing information:** If a required profile value is unavailable, the system should stop or request user input rather than guess.
-- **Local resolution:** The executor, not the model, should resolve `profile.*` references from a local profile or vault and write the result into the page.
-- **Sanitization:** Page representations should contain only the minimum information needed for the current task and should preserve provenance and redaction decisions where appropriate.
-- **No unnecessary exposure:** Raw DOM, screenshots, values, and credentials should not be forwarded simply because they are available locally.
-
-The current code implements only the first narrow step: DOM extraction excludes user-entered input, password, hidden-input, and textarea values. A local profile, privacy detector, redaction engine, and executor do not yet exist.
+Current implementation includes local sanitization and output-side sensitive-type protection. A production-grade persistent profile vault remains future work.
 
 ---
 
-## G. Development roadmap
+## 15. Demo Agent Loop
 
-### Phase 0 — Architecture / Repository / Extension Foundation
+The current SIH demo integration is intentionally bounded.
 
-Establish repository structure, documentation, build tooling, MV3 extension packaging, popup, background service worker, content script, and shared messaging/types.
+```text
+Popup task
+   ↓
+RUN_AGENT_STEP_REQUEST
+   ↓
+Perceive
+   ↓
+Sanitize
+   ↓
+Ground
+   ↓
+Local Qwen planning
+   ↓
+Execute
+   ↓
+Repeat
+```
 
-### Phase 1 — Browser Perception
+The current demo runner allows **at most 3 actions/iterations**.
 
-- **1A — PageRepresentation schema:** Define the versioned common representation for metadata, viewport, elements, semantics, state, bounds, relationships, and provenance. **Current: complete.**
-- **1B — DOM perception:** Extract the current page into the representation with deterministic IDs, visibility/state, accessible names, bounds, relationships, and privacy exclusions. **Current: complete.**
-- **1C — DOM perception quality/unification:** Improve quality, edge-case coverage, and the unification boundary while preserving privacy and the verified contract. **In progress.**
-  - **1C-1 — Stable element IDs and semantic classification:** deterministic candidate selection, native/ARIA semantics, meaningful-content filtering, and related regression tests. **Complete.**
-  - **1C-2 — Visibility, text normalization, accessibility, and relationship hardening:** visibility semantics, normalized text, labels, accessible names, inert handling, privacy-safe ancestor text, and regression tests. **Complete.**
-  - **1C-3 — Final DOM perception hardening and representation consistency:** narrow remaining high-value DOM edge cases and consistency checks. **Next.**
+This is a deliberate prototype resource/safety guardrail. It limits runaway local inference and bounds worst-case compute/latency.
 
-### Phase 2 — Visual Perception
+Judge-safe explanation:
 
-Add local screenshot/visual perception and integrate visual observations with the representation. Technology and model choices are not finalized.
+> The agent loop is implemented as an observe → plan → act cycle. The current prototype imposes a three-action execution budget to control local compute, latency, and runaway behavior. Production would replace the fixed budget with an adaptive termination policy based on task completion, time, token budget, confidence, and loop detection.
 
-### Phase 3 — Local PII Detection / Privacy Engine
+### Verification limitation
 
-Detect PII and sensitive content locally across DOM and future visual observations. The privacy-engine scaffold currently has no functionality.
+The current `Verify` popup row is **not** a complete independent semantic verifier. It currently reflects executor-reported success/post-action confirmation rather than a full re-perception-based task verifier.
 
-### Phase 4 — Local Redaction / Privacy Boundary
-
-Define and enforce sanitization, redaction, protected-value references, and the local boundary before information is exposed to an AI model or server.
-
-### Phase 5 — AI Agent / Task Understanding / Grounding
-
-Add task understanding, grounding, and planning only after the perception and privacy contracts are sufficiently verified. Model/provider choices are not finalized.
-
-### Phase 6 — Browser Executor
-
-Implement safe, local browser actions against grounded elements, including protected local value resolution. Form autofill is not implemented now.
-
-### Phase 7 — Full SEE → THINK → ACT Agent Loop
-
-Connect event-driven perception, task reasoning, planning, execution, and verification/recovery into a complete loop.
-
-### Phase 8 — Voice Interface
-
-Optionally add voice input/output after the core browser loop is stable. Technology is not finalized.
-
-### Phase 9 — Evaluation / Benchmarking / Performance
-
-Define benchmark tasks, success criteria, privacy checks, latency, resource use, robustness, and reproducible performance measurements. No performance numbers are claimed yet.
-
-### Phase 10 — SIH Demo / Presentation / Q&A
-
-Prepare a reliable demo, explain the privacy boundary and differentiator, document limitations, and prepare presentation/Q&A material.
-
-### Milestone labels
-
-| Milestone | Meaning |
-|---|---|
-| **M0** | Extension works |
-| **M1** | Extension understands DOM |
-| **M2** | Extension understands visuals |
-| **M3** | Extension detects PII |
-| **M4** | Privacy boundary demonstrable |
-| **M5** | Agent reasons |
-| **M6** | Agent acts |
-| **M7** | Agent completes tasks |
-| **M8** | Performance measured |
-| **M9** | Polished demo |
+Do not claim full autonomous verification/recovery until that capability is implemented and tested.
 
 ---
 
-## H. Development principles
+## 16. Demo Targets
 
-1. Work in small increments: **implement → test → verify → commit → next component**.
-2. Do not build the entire system in one shot.
-3. Do not train a model from scratch initially.
-4. Prefer pretrained models first.
-5. Fine-tune only if evaluation demonstrates that it is necessary.
-6. Do not use continuous retraining.
-7. Improve datasets periodically and retrain or fine-tune only when justified by evaluation.
-8. Use event-driven perception: **observe → think → act → observe again**.
-9. Do not continuously capture screenshots unnecessarily.
-10. Do not expose raw PII to the agent unnecessarily.
-11. Never guess missing personal information.
-12. Require the user to explicitly provide or configure profile information.
-13. Give passwords stricter handling than ordinary form data.
-14. Preserve meaningful tests and production privacy behavior; do not weaken implementation merely to satisfy a test environment.
-15. Keep current, planned, and blocked work visibly distinct in documentation.
+### Primary
 
----
+ShopSphere:
 
-## I. Technology and component decisions
+```text
+https://shopsphere-nu-one.vercel.app/
+```
 
-### Known technologies in the repository
+Example:
 
-- **Runtime:** Chrome/Brave-compatible Manifest V3 extension.
-- **Language:** TypeScript.
-- **Compiler target/module:** ES2022 with bundler module resolution.
-- **Extension APIs:** Chrome extension APIs, typed through `@types/chrome`.
-- **Build:** TypeScript compilation plus esbuild bundling for the content script.
-- **Testing:** Vitest with the happy-dom environment.
-- **Package structure:** npm workspace with the extension as the active workspace.
-- **Current DOM layout testing:** Production uses browser `getBoundingClientRect()`; happy-dom tests mock layout measurements.
+```text
+Search for laptops under ₹50,000
+```
 
-### Planned / not yet finalized
+### Secondary
 
-The repository has not finalized technologies or models for:
+TaskFlow can be used to demonstrate that the architecture is not inherently ecommerce-specific.
 
-- Screenshot capture and visual perception.
-- OCR or visual-language analysis.
-- PII detection and redaction.
-- Local profile/vault storage.
-- Agent model/provider, task planning, or grounding model.
-- Browser execution mechanism beyond the current message path.
-- Voice interface.
-- Evaluation datasets and benchmark harness.
-- Any backend or cloud service.
+### Emergency fallback
 
-No future technology should be documented as selected until it is actually decided and implemented or recorded as an explicit architectural decision.
+```text
+extension/demo/nexvision-demo.html
+```
+
+The controlled NexMart page is deterministic and offline-friendly.
 
 ---
 
-## J. Architecture status
+## 17. Service-Worker Reliability Rules
 
-### CURRENT
+Do not reintroduce runtime dynamic imports such as:
 
-- **Phase 0 complete:** Repository, extension foundation, messaging, build/test tooling, and documentation foundation exist.
-- **Phase 1A complete:** Versioned `PageRepresentation` schema exists in shared types.
-- **Phase 1B complete:** DOM perception is integrated, tested, built, and manually validated on a local form page with privacy exclusions.
-- **Phase 1C in progress:** 1C-1 and 1C-2 are complete and verified; 1C-3 is the immediate next implementation target.
+```typescript
+await import('./executor.js');
+```
 
-### PLANNED
+Use static imports in the MV3 service-worker dependency path.
 
-- Phase 1C-3 onward, including visual perception, privacy detection/redaction, grounding, agent reasoning, execution, verification/recovery, voice, evaluation, and demo preparation.
+The messaging layer now:
 
-No Phase 1C or later functionality should be implemented as part of documentation-only work.
+- validates message shape,
+- catches synchronous failures,
+- catches rejected routing promises,
+- returns structured errors where possible,
+- prevents duplicate `sendResponse()` calls,
+- preserves the asynchronous response contract.
+
+The service worker also has:
+
+- active-run concurrency protection,
+- keepalive during active agent execution.
+
+---
+
+## 18. Performance Facts
+
+Previously validated local multimodal benchmark:
+
+```text
+~44 seconds total
+~14.2 tokens/sec
+~2.1 GB VRAM
+```
+
+CPU-only benchmark:
+
+```text
+~77.6 seconds
+```
+
+These are measurements on the specific local hardware, not universal NexVision latency.
+
+Total task latency can include:
+
+- DOM extraction,
+- screenshot capture,
+- visual inference attempt,
+- local Qwen planning,
+- execution,
+- repeated iterations,
+- GPU/CPU contention,
+- llama-server memory behavior.
+
+Therefore, a 2–3 minute end-to-end task should **not** be attributed solely to Qwen.
+
+---
+
+## 19. What NexVision Is and Is Not
+
+NexVision is:
+
+- a privacy-first browser-agent prototype,
+- locally perceived,
+- locally sanitized,
+- locally planned with Qwen,
+- grounded to real webpage elements,
+- capable of executing a narrow set of browser actions,
+- bounded to prevent runaway execution.
+
+NexVision is not currently:
+
+- a production-ready general browser agent,
+- an unrestricted autonomous agent,
+- a system supporting arbitrary browser actions,
+- a full semantic verification/recovery system,
+- an RAG system,
+- a proprietary fine-tuned model,
+- a continuously retrained system,
+- dependent on a cloud LLM for the current local inference path,
+- guaranteed to complete arbitrary webpages autonomously.
+
+---
+
+## 20. Phase Mapping
+
+The original roadmap used phases for planning. The implementation has progressed beyond the original Phase 1C/Phase 4 documentation.
+
+Current practical mapping:
+
+```text
+Phase 0  Foundation                         ✅
+Phase 1A PageRepresentation                 ✅
+Phase 1B DOM perception                     ✅
+Phase 1C DOM hardening                      ✅
+Phase 2  Visual perception                  ✅
+Phase 3  Local privacy / PII boundary      ✅* 
+Phase 4  Sanitization / privacy boundary   ✅
+Phase 5  AI agent / planning / grounding   ✅*
+Phase 6  Browser executor                   ✅
+Phase 7  Bounded SEE → THINK → ACT demo     🟡
+Phase 8  Voice                               ⏳
+Phase 9  Evaluation / benchmarking          🟡/partial
+Phase 10 SIH demo / presentation            🟡
+```
+
+`*` The project uses a pragmatic implementation of these phases inside the extension rather than a separately completed standalone package under the scaffold directories.
+
+Phase 7 is **not** marked fully complete because the current planning-output blocker prevents reliable Planning → Execution, and Verify is not yet an independent semantic verifier.
+
+---
+
+## 21. Development Workflow
+
+Every implementation increment should follow:
+
+```text
+INSPECT CURRENT CODE
+        ↓
+SMALL SCOPED CHANGE
+        ↓
+FOCUSED TESTS
+        ↓
+TYPECHECK
+        ↓
+FULL TEST SUITE
+        ↓
+BUILD
+        ↓
+REAL MANUAL / E2E TEST
+        ↓
+REVIEW
+        ↓
+COMMIT / PUSH BY PROJECT OWNER
+```
+
+Do not rewrite the project in one step.
+
+Do not modify unrelated architecture.
+
+Do not weaken privacy or validation just to make a test pass.
+
+Do not mark a milestone complete without evidence.
+
+---
+
+## 22. Judge-Safe One-Sentence Architecture
+
+> **NexVision is a browser extension that locally perceives the webpage, sanitizes sensitive information before reasoning, grounds the user's task to real webpage elements, uses a locally hosted Qwen2.5-VL model to select a safe action, executes that action in the browser, and iteratively re-observes the page within a bounded execution budget.**

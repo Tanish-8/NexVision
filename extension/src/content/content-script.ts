@@ -4,7 +4,7 @@
  */
 
 import { MessageType } from '../shared/types.js';
-import { sendToTab, MessageRouter } from '../shared/messaging.js';
+import { sendToTab, MessageRouter, dispatchMessageToRouter } from '../shared/messaging.js';
 import type { ExtensionMessage, PageSnapshot, ExtensionResponse } from '../shared/types.js';
 import { extractPageRepresentationFromDom } from './domPerception.js';
 import { executeDomAction } from './domExecutor.js';
@@ -56,13 +56,10 @@ router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async 
 if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
   chrome.runtime.onMessage.addListener(
     <T = any>(message: ExtensionMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: ExtensionResponse) => void) => {
-      router.route(message, sender).then((response) => {
-        if (sendResponse) {
-          sendResponse(response);
-        }
-      });
-      // Return true to indicate we'll respond asynchronously
-      return true;
+      if (!message || typeof message !== 'object' || !router.hasHandler(message.type)) {
+        return false;
+      }
+      return dispatchMessageToRouter(router, message, sender, sendResponse);
     }
   );
 }

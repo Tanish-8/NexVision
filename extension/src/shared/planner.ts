@@ -76,6 +76,7 @@ export interface PlannerContext {
   readonly currentTime: number;
   readonly stepIndex: number;
   readonly completion?: PlannerCompletionState;
+  readonly goalSatisfied?: boolean;
 }
 
 export interface PlannerOptions {

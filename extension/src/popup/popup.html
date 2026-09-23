@@ -3,17 +3,136 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SIH26171</title>
+  <title>NexVision</title>
   <link rel="stylesheet" href="styles.css">
+  <style>
+    /* ── Demo panel additions ── */
+    .section-title {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #888;
+      margin-bottom: 8px;
+    }
+    #task-input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-family: inherit;
+      resize: none;
+      color: #1a1a2e;
+      background: #fafafa;
+      outline: none;
+      transition: border-color .2s;
+      box-sizing: border-box;
+    }
+    #task-input:focus { border-color: #e94560; background: #fff; }
+
+    #run-agent-btn {
+      width: 100%;
+      padding: 9px 0;
+      margin-top: 8px;
+      background: linear-gradient(135deg, #e94560, #c73652);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      letter-spacing: .03em;
+      transition: opacity .2s;
+    }
+    #run-agent-btn:hover:not(:disabled) { opacity: .88; }
+    #run-agent-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    .step-log {
+      margin-top: 12px;
+      background: #f7f8fc;
+      border: 1px solid #e8e8f0;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 0.78rem;
+      color: #333;
+      display: none;
+    }
+    .step-log.visible { display: block; }
+
+    .step-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      padding: 5px 0;
+      border-bottom: 1px solid #eee;
+    }
+    .step-row:last-child { border-bottom: none; }
+
+    .step-icon { flex-shrink: 0; font-size: 1rem; line-height: 1.2; }
+    .step-label {
+      font-weight: 700;
+      color: #555;
+      min-width: 72px;
+      flex-shrink: 0;
+    }
+    .step-detail { color: #333; word-break: break-word; }
+    .step-row.pending .step-icon::before { content: '⏳'; }
+    .step-row.ok .step-icon::before { content: '✅'; }
+    .step-row.err .step-icon::before { content: '❌'; }
+
+    .agent-status {
+      margin-top: 8px;
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      display: none;
+    }
+    .agent-status.visible { display: block; }
+    .agent-status.success { background: #e8f5e9; color: #2e7d32; }
+    .agent-status.error   { background: #fce4ec; color: #c62828; }
+    .agent-status.info    { background: #e3f2fd; color: #1565c0; }
+
+    .divider { height: 1px; background: #eee; margin: 12px 0; }
+  </style>
 </head>
 <body>
   <div class="popup">
     <header class="popup-header">
-      <h1>SIH26171</h1>
-      <span class="status-badge">M0</span>
+      <h1>NexVision</h1>
+      <span class="status-badge">SIH26171</span>
     </header>
 
     <main class="popup-content">
+
+      <!-- ── Agent Demo Panel ── -->
+      <div class="section-title">Agent Task</div>
+      <textarea
+        id="task-input"
+        rows="2"
+        placeholder="Describe the task…"
+        aria-label="Agent task description"
+      >Search for laptops under &#x20B9;50,000</textarea>
+      <button id="run-agent-btn" type="button">&#x25B6; Run Agent</button>
+
+      <!-- Status badge -->
+      <div id="agent-status" class="agent-status" role="status" aria-live="polite"></div>
+
+      <!-- Step-by-step log -->
+      <div id="step-log" class="step-log" aria-label="Agent step log">
+        <div id="log-perception"  class="step-row pending"><span class="step-icon"></span><span class="step-label">Perception</span><span class="step-detail" id="detail-perception">—</span></div>
+        <div id="log-privacy"     class="step-row pending"><span class="step-icon"></span><span class="step-label">Privacy</span><span class="step-detail" id="detail-privacy">—</span></div>
+        <div id="log-grounding"   class="step-row pending"><span class="step-icon"></span><span class="step-label">Grounding</span><span class="step-detail" id="detail-grounding">—</span></div>
+        <div id="log-planning"    class="step-row pending"><span class="step-icon"></span><span class="step-label">Planning</span><span class="step-detail" id="detail-planning">—</span></div>
+        <div id="log-execution"   class="step-row pending"><span class="step-icon"></span><span class="step-label">Execution</span><span class="step-detail" id="detail-execution">—</span></div>
+        <div id="log-verification"class="step-row pending"><span class="step-icon"></span><span class="step-label">Verify</span><span class="step-detail" id="detail-verification">—</span></div>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- ── Original Inspect Panel ── -->
+      <div class="section-title">Page Inspector</div>
       <div class="info-section">
         <div class="info-row">
           <span class="info-label">Page:</span>
@@ -38,7 +157,7 @@
     </main>
 
     <footer class="popup-footer">
-      <p>Privacy-first perception</p>
+      <p>Privacy-first on-device agent</p>
     </footer>
   </div>
   <script type="module" src="popup.js"></script>

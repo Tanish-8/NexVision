@@ -1,100 +1,287 @@
-# SIH26171 — On-device Visual Perception for Lightweight Browser Agents
+# SIH26171 — NexVision
 
-A privacy-first browser agent whose core differentiator is that webpage perception and
-sensitive-data protection happen **locally** before any information can be exposed to an
-AI/server.
+**On-device Visual Perception for Lightweight Browser Agents**
 
-> **Status:** M0 — Foundation only. No LLM, no backend, no cloud AI, no auth, no DB.
+NexVision is a privacy-first browser-agent prototype for SIH26171. Its key architectural idea is that webpage perception and sensitive-data handling happen locally before the information is provided to the local reasoning model.
 
-## Project purpose
+## Current Status
 
-Traditional browser agents ship raw page content (DOM, text, screenshots) to a remote
-server. This project inverts that: perception and privacy processing run inside the
-browser extension itself. Only a *sanitized* representation is ever sent anywhere.
+**Prototype status: Perception → Privacy → Grounding are verified in real browser testing. Planning → Execution currently has a local-model JSON-output blocker being fixed.**
 
-## M0 goal
+The project has progressed substantially beyond the original foundation-only README.
 
-Establish the project foundation:
+Current implemented areas include:
 
-- Chrome extension (Manifest V3)
-- Content script that can inspect the current webpage
-- Message-passing path: `popup → background → content-script`
-- TypeScript types/interfaces for the future page representation
-- Build + test tooling
+- Manifest V3 browser extension.
+- DOM page perception.
+- Structured `PageRepresentation`.
+- Screenshot capture.
+- Local Qwen2.5-VL visual perception.
+- DOM fallback when vision fails.
+- Local privacy/sanitization.
+- Deterministic grounding.
+- Local Qwen planning.
+- Browser execution for `click`, `type`, and `focus`.
+- Bounded three-action agent loop.
+- Service-worker reliability hardening.
+- ShopSphere and TaskFlow demo targets.
+- Controlled offline NexMart fallback.
 
-## Architecture
+## Core Architecture
 
+```text
+USER TASK
+    ↓
+TASK / GOAL
+    ↓
+BROWSER PAGE
+   ├── DOM PERCEPTION
+   └── SCREENSHOT / VISUAL PERCEPTION
+            ↓
+    UNIFIED PAGE REPRESENTATION
+            ↓
+    LOCAL PRIVACY / SANITIZATION
+            ↓
+    SANITIZED PAGE STATE
+            ↓
+    TASK ↔ ELEMENT GROUNDING
+            ↓
+    LOCAL QWEN PLANNER
+            ↓
+    VALIDATED ACTION
+            ↓
+    BROWSER EXECUTOR
+            ↓
+    PAGE CHANGES
+            ↓
+    RE-PERCEPTION / VERIFICATION
+            ↺
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Chrome Extension                         │
-│                                                              │
-│  ┌──────────┐   ┌──────────────┐   ┌──────────────────────┐  │
-│  │  Popup   │──▶│  Background  │──▶│  Content Script      │  │
-│  │ (UI)     │   │ (SW)         │   │ (page inspection)    │  │
-│  └──────────┘   └──────────────┘   └──────────────────────┘  │
-│                          │                        │           │
-│                          ▼                        ▼           │
-│                   ┌──────────────┐   ┌──────────────────┐  │
-│                   │ Shared types │   │ Sanitized output │  │
-│                   │ & utilities  │   │ (future)         │  │
-│                   └──────────────┘   └──────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+
+## Privacy Principle
+
+The intended boundary is:
+
+```text
+WEBPAGE
+  ↓
+LOCAL PERCEPTION
+  ↓
+LOCAL SANITIZATION
+  ↓
+SANITIZED STATE
+  ↓
+LOCAL QWEN
 ```
 
-Modules (each a separate package, stubbed for now):
+General DOM perception does not serialize raw input values, passwords, hidden-input values, or textarea values.
 
-| Module           | Purpose (future)                                  |
-|------------------|---------------------------------------------------|
-| `extension/`     | Chrome MV3 extension — the runtime container      |
-| `privacy-engine/`| Local PII detection & redaction                   |
-| `vision/`        | Screenshot capture & on-device visual perception  |
-| `agent/`         | Agent planning & tool-use loop                    |
-| `backend/`       | Server-side API (NOT yet implemented)             |
-| `evaluation/`    | Test harness & metrics                            |
-| `docs/`          | Design docs                                       |
+Sensitive values should be resolved locally at execution time rather than passed to the reasoning model.
 
-## How to install / build the extension
+## Local AI
+
+Current local model:
+
+```text
+Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf
+```
+
+Runtime:
+
+```text
+llama.cpp llama-server
+http://127.0.0.1:8080
+```
+
+Validated runtime uses Vulkan acceleration on the AMD GPU with the multimodal projection path kept on CPU because full multimodal GPU offload previously caused device-loss on the tested system.
+
+The extension does not spawn `llama-server`; start it separately.
+
+Example validated command:
+
+```powershell
+C:\Users\madis\.cache\nexvision-runtime\bin\llama-server.exe `
+  --model C:\Users\madis\.cache\nexvision-runtime\models\Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf `
+  --mmproj C:\Users\madis\.cache\nexvision-runtime\models\mmproj-Qwen2.5-VL-Instruct-Q8_0.gguf `
+  --no-mmproj-offload `
+  -ngl 99 `
+  --device Vulkan1 `
+  --host 127.0.0.1 `
+  --port 8080 `
+  -c 4096 `
+  -t 8 `
+  -fa off
+```
+
+Use the actual filenames present in the local model cache if they differ.
+
+## Supported Actions
+
+The current planner/executor intentionally supports only:
+
+```text
+click
+type
+focus
+```
+
+The model does not directly control arbitrary coordinates. It selects grounded element IDs, which are validated before execution.
+
+## Demo
+
+### Primary: ShopSphere
+
+Example task:
+
+```text
+Search for laptops under ₹50,000
+```
+
+### Secondary: TaskFlow
+
+TaskFlow can be used to demonstrate that the architecture is not ecommerce-specific.
+
+### Offline fallback
+
+```text
+extension/demo/nexvision-demo.html
+```
+
+The NexMart page provides a deterministic local fallback if an external demo becomes unreliable.
+
+## Three-Action Demo Constraint
+
+The current demo loop is bounded to at most three actions/iterations.
+
+This is deliberate. It controls local inference cost, bounds worst-case latency, and prevents runaway execution.
+
+It is not intended as the final production termination policy.
+
+A production version could use adaptive limits based on task completion, time, token budget, confidence, and loop detection.
+
+## Current E2E State
+
+The latest ShopSphere run reaches:
+
+```text
+Perception   ✅
+Privacy      ✅
+Grounding   ✅
+Planning    ❌
+Execution    —
+Verify       —
+```
+
+The current planning issue is local-model output parsing. The model can reach the `max_tokens: 512` limit with `finish_reason: "length"`, producing incomplete JSON before the strict parser can validate it.
+
+The next fix is intentionally small:
+
+1. increase planning output headroom,
+2. safely handle known JSON wrappers/fences,
+3. preserve strict validation,
+4. test,
+5. prove Planning → Execution in Brave.
+
+## Repository Layout
+
+```text
+NexVision/
+├── agent/
+├── backend/
+├── docs/
+├── evaluation/
+├── extension/
+│   ├── demo/
+│   └── src/
+│       ├── background/
+│       ├── content/
+│       ├── popup/
+│       └── shared/
+├── privacy-engine/
+└── vision/
+```
+
+The working prototype is primarily implemented under `extension/` and `vision/`. The original scaffold directories should not be interpreted as the current runtime architecture without checking the code.
+
+## Development
+
+Install:
 
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Build the extension
-npm run build
-
-# 3. Load into Chrome
-#    - Open chrome://extensions
-#    - Enable "Developer mode" (top-right toggle)
-#    - Click "Load unpacked" and select the `extension/dist` directory
 ```
 
-## How to manually test
+Extension:
 
-1. Build: `npm run build`
-2. Load the unpacked extension from `extension/dist` in Chrome
-3. Open any webpage
-4. Open the extension popup — it shows the current page title and URL
-5. Open DevTools on the page → Console. You should see the content-script log:
-   `"[SIH26171] content script injected"`
-6. Click the popup's "Inspect page" button — it sends a message to the background
-   service worker, which forwards it to the content script, which returns a minimal
-   page snapshot (`title`, `url`, `heading count`). The popup displays the result.
+```bash
+npm --prefix extension run test
+npm --prefix extension run typecheck
+npm --prefix extension run build
+```
 
-## Development scripts
+Load the generated extension:
 
-| Script        | Command                       |
-|---------------|-------------------------------|
-| Type-check    | `npm run typecheck`           |
-| Build         | `npm run build`               |
-| Lint          | `npm run lint`                |
-| Test          | `npm test`                    |
+1. Open `brave://extensions`.
+2. Enable Developer mode.
+3. Load unpacked.
+4. Select `extension/dist`.
+5. Reload the extension after a build.
+6. Refresh the target webpage so the new content script is injected.
 
-## Roadmap (beyond M0)
+## Development Rules
 
-1. DOM perception → structured page representation
-2. Screenshot / vision pipeline
-3. Local PII detection → redaction
-4. Sanitized representation emission
-5. Agent planning loop
-6. Browser execution (automation)
-7. Evaluation harness
+Use incremental implementation:
+
+```text
+INSPECT
+  ↓
+SMALL CHANGE
+  ↓
+FOCUSED TEST
+  ↓
+TYPECHECK
+  ↓
+FULL TEST
+  ↓
+BUILD
+  ↓
+REAL E2E
+  ↓
+REVIEW
+```
+
+Do not rewrite unrelated parts of the project.
+
+Do not weaken privacy or action validation to make a test pass.
+
+Do not claim an E2E capability is complete based only on unit tests.
+
+## Current Limitations
+
+NexVision is not currently:
+
+- a production-ready general browser agent,
+- an unrestricted autonomous agent,
+- a system supporting arbitrary browser actions,
+- a complete semantic verification/recovery system,
+- an RAG system,
+- a continuously retrained system,
+- a proprietary fine-tuned model.
+
+The current Verify UI is executor-success/post-action confirmation, not a full independent semantic re-perception verifier.
+
+## Documentation
+
+The detailed current architecture is in:
+
+```text
+docs/ARCHITECTURE.md
+```
+
+The authoritative implementation tracker is:
+
+```text
+docs/PROGRESS.md
+```
+
+These files should be kept synchronized with actual verified implementation state.

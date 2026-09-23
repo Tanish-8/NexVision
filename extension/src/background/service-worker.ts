@@ -4,15 +4,23 @@
  */
 
 import { MessageType } from '../shared/types.js';
-import { sendToTab, MessageRouter } from '../shared/messaging.js';
-import type { ExtensionMessage, ExtensionResponse } from '../shared/types.js';
+import { sendToTab, MessageRouter, dispatchMessageToRouter } from '../shared/messaging.js';
 import type {
+  ExtensionMessage,
+  ExtensionResponse,
   PageRepresentation,
   ScreenshotCaptureOptions,
   ScreenshotCaptureResult,
   UnifiedPerceptionRequest,
   ExecuteActionRequest,
-  ExecutionResult
+  ExecutionResult,
+  RunAgentStepRequest,
+  StartAgentRequest,
+  StartAgentResponseData,
+  AgentProgressEvent,
+  AgentCompletedEvent,
+  AgentFailedEvent,
+  GetAgentStatusResponseData
 } from '../shared/types.js';
 import { captureVisibleTab } from './screenshot.js';
 import { perceivePage } from './orchestrator.js';
@@ -24,9 +32,12 @@ import type {
   UnifiedPerceptionResult
 } from './orchestrator.js';
 import { createLlamaVisionAdapter } from './llamaVisionAdapter.js';
+import { runDemoAgentWithProvider } from './demoRunner.js';
+import type { DemoRunResult, DemoStep } from './demoRunner.js';
+import { executeAction } from './executor.js';
 
 
-const router = new MessageRouter();
+export const router = new MessageRouter();
 
 /**
  * Log when service worker starts
@@ -71,9 +82,9 @@ router.register(MessageType.INSPECT_PAGE_REQUEST, async (
 /**
  * Resolves the active browser tab, even when an extension DevTools window is focused.
  */
-async function getActiveTab(): Promise<chrome.tabs.Tab | undefined> {
-  // 1. Query active tab in the last focused window
-  let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+export async function getActiveTab(): Promise<chrome.tabs.Tab | undefined> {
+  // 1. Query active tab in the last focused normal browser window
+  let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true, windowType: 'normal' });
   if (tabs[0]) return tabs[0];
 
   // 2. Query active tab in the current window
@@ -243,7 +254,8 @@ router.register(MessageType.UNIFIED_PERCEPTION_REQUEST, async (
       return {
         format: result.format,
         timestamp: result.timestamp,
-        dataUrl: result.dataUrl  // passed to vision adapter; NOT forwarded in final result
+        dataUrl: result.dataUrl,  // passed to vision adapter; NOT forwarded in final result
+        dimensions: result.dimensions
       };
     };
 
@@ -270,7 +282,6 @@ router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async 
   _sender: chrome.runtime.MessageSender
 ): Promise<ExtensionResponse<ExecutionResult>> => {
   try {
-    const { executeAction } = await import('./executor.js');
     const result = await executeAction(payload);
     return {
       success: true,
@@ -280,6 +291,285 @@ router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async 
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Action execution failed'
+    };
+  }
+});
+
+/**
+ * Broadcast an event to extension listeners (popup, sidepanel, options).
+ * Safely catches any rejections if no receiver is currently open.
+ */
+function broadcastEvent<T>(type: string, payload: T): void {
+  try {
+    if (typeof chrome !== 'undefined' && chrome?.runtime?.sendMessage) {
+      chrome.runtime.sendMessage({ type, payload }).catch(() => {
+        // Safe: popup or listener might not be open right now
+      });
+    }
+  } catch {
+    // Ignore runtime unavailable errors
+  }
+}
+
+interface AgentRunState {
+  runId: string;
+  active: boolean;
+  status: string;
+  steps: DemoStep[];
+  result?: DemoRunResult;
+  lastError?: string;
+  startedAt: number;
+}
+
+let currentAgentRun: AgentRunState | null = null;
+
+/**
+ * Heartbeat interval in milliseconds to keep the MV3 Service Worker alive
+ * during long-running background local inference.
+ *
+ * Chromium MV3 service workers terminate after ~30 seconds of inactivity.
+ * Periodic calls to chrome.* APIs reset the idle timer.
+ */
+export const KEEPALIVE_INTERVAL_MS = 15000;
+
+let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Returns true if the agent keepalive heartbeat is currently active.
+ */
+export function isAgentKeepaliveActive(): boolean {
+  return keepaliveTimer !== null;
+}
+
+/**
+ * Starts the keepalive heartbeat timer if not already active.
+ * Periodically calls chrome.runtime.getPlatformInfo() while an agent run is active.
+ */
+export function startAgentKeepalive(intervalMs: number = KEEPALIVE_INTERVAL_MS): void {
+  if (keepaliveTimer !== null) {
+    return; // Prevent duplicate keepalive intervals
+  }
+
+  keepaliveTimer = setInterval(() => {
+    if (!currentAgentRun || !currentAgentRun.active) {
+      stopAgentKeepalive();
+      return;
+    }
+
+    try {
+      if (typeof chrome !== 'undefined' && chrome.runtime?.getPlatformInfo) {
+        const promise = chrome.runtime.getPlatformInfo();
+        if (promise && typeof (promise as any).catch === 'function') {
+          (promise as Promise<any>).catch(() => {});
+        }
+      }
+    } catch {
+      // Ignore heartbeat errors
+    }
+  }, intervalMs);
+}
+
+/**
+ * Stops and clears the keepalive heartbeat timer.
+ */
+export function stopAgentKeepalive(): void {
+  if (keepaliveTimer !== null) {
+    clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+  }
+}
+
+/**
+ * Test helper to reset current agent run state and keepalive.
+ */
+export function _resetAgentRunStateForTesting(): void {
+  stopAgentKeepalive();
+  currentAgentRun = null;
+}
+
+/**
+ * Handle asynchronous, job-based agent run requests (START_AGENT_REQUEST).
+ *
+ * Responds IMMEDIATELY with an acknowledgment and runId (<2ms) so the
+ * original sendResponse channel is never kept pending across long-running LLM inference.
+ *
+ * Bounded execution (runDemoAgentWithProvider) continues independently in the background,
+ * broadcasting AGENT_PROGRESS_EVENT, AGENT_COMPLETED_EVENT, or AGENT_FAILED_EVENT.
+ */
+router.register<StartAgentRequest>(MessageType.START_AGENT_REQUEST, async (
+  payload: StartAgentRequest,
+  _sender: chrome.runtime.MessageSender
+): Promise<ExtensionResponse<StartAgentResponseData>> => {
+  try {
+    // Prevent multiple concurrent agent runs
+    if (currentAgentRun && currentAgentRun.active) {
+      return {
+        success: false,
+        error: 'An agent run is already in progress',
+        data: {
+          runId: currentAgentRun.runId,
+          startedAt: currentAgentRun.startedAt
+        }
+      };
+    }
+
+    let tabId = payload?.tabId;
+    let windowId = payload?.windowId;
+
+    if (tabId === undefined) {
+      const activeTab = await getActiveTab();
+      tabId = activeTab?.id;
+      windowId = activeTab?.windowId;
+    }
+
+    if (typeof tabId !== 'number' || isNaN(tabId)) {
+      return { success: false, error: 'No active tab found for demo agent' };
+    }
+
+    const runId = `agent-run-${Date.now()}`;
+    const startedAt = Date.now();
+    const goalDescription = (payload?.goalDescription ?? '').trim() ||
+      'Search for laptops under ₹50,000';
+
+    currentAgentRun = {
+      runId,
+      active: true,
+      status: 'STARTING',
+      steps: [],
+      startedAt
+    };
+
+    // Start keepalive heartbeat while agent run is active
+    startAgentKeepalive();
+
+    // Run agent asynchronously in background without awaiting in the response handler
+    (async () => {
+      try {
+        const domProvider: DomPerceptionProvider = createDomProvider(tabId);
+        const result = await runDemoAgentWithProvider(
+          tabId,
+          windowId,
+          goalDescription,
+          domProvider,
+          (progress: AgentProgressEvent) => {
+            if (currentAgentRun && currentAgentRun.runId === runId) {
+              currentAgentRun.status = `${progress.phase}:${progress.status}`;
+            }
+            broadcastEvent(MessageType.AGENT_PROGRESS_EVENT, progress);
+          },
+          runId
+        );
+
+        if (currentAgentRun && currentAgentRun.runId === runId) {
+          currentAgentRun.active = false;
+          currentAgentRun.status = result.status;
+          currentAgentRun.steps = [...result.steps];
+          currentAgentRun.result = result;
+        }
+
+        broadcastEvent<AgentCompletedEvent>(MessageType.AGENT_COMPLETED_EVENT, {
+          runId,
+          result,
+          timestamp: Date.now()
+        });
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : 'Agent run failed unexpectedly';
+        if (currentAgentRun && currentAgentRun.runId === runId) {
+          currentAgentRun.active = false;
+          currentAgentRun.status = 'FAILED';
+          currentAgentRun.lastError = errorMsg;
+        }
+
+        broadcastEvent<AgentFailedEvent>(MessageType.AGENT_FAILED_EVENT, {
+          runId,
+          error: errorMsg,
+          steps: currentAgentRun?.steps ?? [],
+          timestamp: Date.now()
+        });
+      } finally {
+        stopAgentKeepalive();
+      }
+    })();
+
+    // Immediate acknowledgment
+    return {
+      success: true,
+      data: {
+        runId,
+        startedAt
+      }
+    };
+  } catch (error) {
+    if (currentAgentRun && currentAgentRun.active) {
+      currentAgentRun.active = false;
+    }
+    stopAgentKeepalive();
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to start demo agent'
+    };
+  }
+});
+
+/**
+ * Handle agent status query requests (GET_AGENT_STATUS_REQUEST).
+ * Allows popup to immediately inspect the current or latest agent run upon reopening.
+ */
+router.register(MessageType.GET_AGENT_STATUS_REQUEST, async (): Promise<ExtensionResponse<GetAgentStatusResponseData>> => {
+  if (!currentAgentRun) {
+    return {
+      success: true,
+      data: { active: false }
+    };
+  }
+  return {
+    success: true,
+    data: {
+      active: currentAgentRun.active,
+      runId: currentAgentRun.runId,
+      status: currentAgentRun.status,
+      steps: currentAgentRun.steps,
+      lastError: currentAgentRun.lastError
+    }
+  };
+});
+
+/**
+ * Handle bounded demo agent run requests (RUN_AGENT_STEP_REQUEST).
+ *
+ * Chains: perceivePage → sanitize → ground → planNextStep(LocalAgentDriver)
+ *         → executeAction → (repeat ≤ MAX_STEPS).
+ *
+ * Privacy invariants: sanitizePageRepresentation() is called inside
+ * runDemoAgentWithProvider() before any data reaches the model.
+ */
+router.register<RunAgentStepRequest>(MessageType.RUN_AGENT_STEP_REQUEST, async (
+  payload: RunAgentStepRequest,
+  _sender: chrome.runtime.MessageSender
+): Promise<ExtensionResponse> => {
+  try {
+    const activeTab = await getActiveTab();
+
+    if (!activeTab?.id) {
+      return { success: false, error: 'No active tab found for demo agent' };
+    }
+
+    const domProvider: DomPerceptionProvider = createDomProvider(activeTab.id);
+    const goalDescription = (payload?.goalDescription ?? '').trim() ||
+      'Search for laptops under ₹50,000';
+
+    const result = await runDemoAgentWithProvider(
+      activeTab.id,
+      activeTab.windowId,
+      goalDescription,
+      domProvider
+    );
+
+    return { success: true, data: result };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Demo agent failed'
     };
   }
 });
@@ -297,13 +587,10 @@ if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
    */
   chrome.runtime.onMessage.addListener(
     <T = any>(message: ExtensionMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: ExtensionResponse) => void) => {
-      router.route(message, sender).then((response) => {
-        if (sendResponse) {
-          sendResponse(response);
-        }
-      });
-      // Return true to indicate we'll respond asynchronously
-      return true;
+      if (!message || typeof message !== 'object' || !router.hasHandler(message.type)) {
+        return false;
+      }
+      return dispatchMessageToRouter(router, message, sender, sendResponse);
     }
   );
 

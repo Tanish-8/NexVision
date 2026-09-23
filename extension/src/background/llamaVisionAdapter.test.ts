@@ -466,5 +466,56 @@ describe('Phase 2E-2B — LlamaVisionAdapter (Extension)', () => {
         globalThis.fetch = originalFetch;
       }
     });
+
+    it('16. should abort and return PERCEPTION_FAILURE when response body hangs past timeoutMs', async () => {
+      const mockFetch = vi.fn().mockImplementation((_url, init) => {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            new Promise((_, reject) => {
+              init.signal.addEventListener('abort', () => {
+                reject(new Error('AbortError'));
+              });
+            })
+        });
+      });
+
+      const adapter = new LlamaVisionAdapter({
+        fetchFn: mockFetch as any,
+        timeoutMs: 50
+      });
+
+      const res = await adapter.perceive(MOCK_INPUT);
+
+      expect(res.success).toBe(false);
+      if (res.success) throw new Error('Expected failure');
+      expect(res.error.code).toBe('PERCEPTION_FAILURE');
+      expect(res.error.message).toContain('timed out after 50ms');
+    });
+
+    it('17. should return PERCEPTION_FAILURE cleanly on HTTP 500 image decode failure', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        statusText: 'Internal Server Error'
+      });
+
+      const adapter = createLlamaVisionAdapter({
+        fetchFn: mockFetch as any,
+        timeoutMs: 5000
+      });
+
+      const res = await adapter.perceive(MOCK_INPUT);
+
+      expect(res.success).toBe(false);
+      if (res.success) throw new Error('Expected failure');
+      expect(res.error.code).toBe('PERCEPTION_FAILURE');
+      expect(res.error.message).toContain('HTTP 500 Internal Server Error');
+    });
+
+    it('18. should support 5000ms timeout configuration', () => {
+      const adapter = createLlamaVisionAdapter({ timeoutMs: 5000 });
+      expect((adapter as any).timeoutMs).toBe(5000);
+    });
   });
 });

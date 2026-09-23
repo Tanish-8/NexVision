@@ -174,6 +174,8 @@ export interface ScreenshotCaptureResult {
   format: 'png' | 'jpeg';
   /** Epoch timestamp (ms) when the screenshot was captured. */
   timestamp: number;
+  /** Optional physical dimensions of the captured screenshot in pixels. */
+  dimensions?: { width: number; height: number };
 }
 
 /**
@@ -187,7 +189,16 @@ export const MessageType = {
   CAPTURE_SCREENSHOT_REQUEST: 'capture-screenshot-request',
   UNIFIED_PERCEPTION_REQUEST: 'unified-perception-request',
   EXECUTE_ACTION_REQUEST: 'execute-action-request',
-  EXECUTE_ACTION_RESPONSE: 'execute-action-response'
+  EXECUTE_ACTION_RESPONSE: 'execute-action-response',
+  RUN_AGENT_STEP_REQUEST: 'run-agent-step-request',
+  RUN_AGENT_STEP_RESPONSE: 'run-agent-step-response',
+  START_AGENT_REQUEST: 'start-agent-request',
+  START_AGENT_RESPONSE: 'start-agent-response',
+  AGENT_PROGRESS_EVENT: 'agent-progress-event',
+  AGENT_COMPLETED_EVENT: 'agent-completed-event',
+  AGENT_FAILED_EVENT: 'agent-failed-event',
+  GET_AGENT_STATUS_REQUEST: 'get-agent-status-request',
+  GET_AGENT_STATUS_RESPONSE: 'get-agent-status-response'
 } as const;
 
 export type MessageType = typeof MessageType[keyof typeof MessageType];
@@ -198,6 +209,87 @@ export type MessageType = typeof MessageType[keyof typeof MessageType];
  */
 export interface UnifiedPerceptionRequest {
   // reserved for future caller-supplied options (Phase 3+)
+}
+
+/** Request payload for running a bounded demo agent step. */
+export interface RunAgentStepRequest {
+  /** Natural-language goal description. */
+  readonly goalDescription: string;
+}
+
+/** Request payload for starting a background agent run. */
+export interface StartAgentRequest {
+  /** Natural-language goal description. */
+  readonly goalDescription: string;
+  /** Optional target tab ID. Preferred over getActiveTab() when provided. */
+  readonly tabId?: number;
+  /** Optional target window ID for screenshot capture. */
+  readonly windowId?: number;
+}
+
+/** Acknowledgment payload returned immediately when starting an agent run. */
+export interface StartAgentResponseData {
+  readonly runId: string;
+  readonly startedAt: number;
+}
+
+/** Phases reported during agent step execution. */
+export type AgentProgressPhase =
+  | 'perception'
+  | 'privacy'
+  | 'grounding'
+  | 'planning'
+  | 'execution'
+  | 'verification';
+
+/** Safe structured metadata carried in progress events. */
+export interface AgentProgressData {
+  readonly elementCount?: number;
+  readonly interactiveCount?: number;
+  readonly visualObservationCount?: number;
+  readonly privacyFindingCount?: number;
+  readonly visionAdapterName?: string;
+  readonly planStatus?: string;
+  readonly actionType?: string;
+  readonly targetElementId?: string;
+  readonly rationale?: string;
+  readonly executionSuccess?: boolean;
+  readonly executionReason?: string;
+}
+
+/** Progress event emitted during background agent execution. */
+export interface AgentProgressEvent {
+  readonly runId: string;
+  readonly stepIndex: number;
+  readonly phase: AgentProgressPhase;
+  readonly status: 'running' | 'completed' | 'failed';
+  readonly message: string;
+  readonly timestamp: number;
+  readonly data?: AgentProgressData;
+}
+
+/** Final completion event emitted when an agent run finishes. */
+export interface AgentCompletedEvent {
+  readonly runId: string;
+  readonly result: import('../background/demoRunner.js').DemoRunResult;
+  readonly timestamp: number;
+}
+
+/** Failure event emitted when an agent run terminates on an error. */
+export interface AgentFailedEvent {
+  readonly runId: string;
+  readonly error: string;
+  readonly steps?: readonly import('../background/demoRunner.js').DemoStep[];
+  readonly timestamp: number;
+}
+
+/** Current agent run state returned on status queries. */
+export interface GetAgentStatusResponseData {
+  readonly active: boolean;
+  readonly runId?: string;
+  readonly status?: string;
+  readonly steps?: readonly import('../background/demoRunner.js').DemoStep[];
+  readonly lastError?: string;
 }
 
 

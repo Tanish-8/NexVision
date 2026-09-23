@@ -496,7 +496,6 @@ describe('Phase 2C — Unified Perception Orchestrator', () => {
 
     expect(result.success).toBe(true);
     if (!result.success) throw new Error('Expected success');
-
     // ScreenshotRef must not contain dataUrl
     expect(result.screenshotRef).not.toHaveProperty('dataUrl');
     expect(result.screenshotRef.format).toBe('png');
@@ -506,5 +505,68 @@ describe('Phase 2C — Unified Perception Orchestrator', () => {
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain('SECRET_CANVAS_PIXELS_NEVER_LEAK');
     expect(Object.keys(result)).not.toContain('dataUrl');
+  });
+
+  // 17. Passes physical screenshot dimensions to vision adapter and preserves in safeScreenshotRef without dataUrl
+  it('17. should pass physical screenshot dimensions to vision adapter when provided', async () => {
+    let capturedInputDimensions: { width: number; height: number } | undefined;
+    const recordingVisionAdapter: VisualPerceptionAdapter = {
+      name: 'RecordingAdapter',
+      perceive: async (input) => {
+        capturedInputDimensions = input.dimensions;
+        return { success: true, observations: [] };
+      }
+    };
+
+    const result = await perceivePage(
+      makeDomProvider(MOCK_DOM), // viewport: 1280x720
+      makeScreenshotProvider({
+        format: 'png',
+        timestamp: 123456,
+        dataUrl: 'data:image/png;base64,RAW_BYTES',
+        dimensions: { width: 1920, height: 1080 }
+      }),
+      recordingVisionAdapter
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error('Expected success');
+
+    // Vision adapter received physical screenshot dimensions (1920x1080)
+    expect(capturedInputDimensions).toEqual({ width: 1920, height: 1080 });
+
+    // safeScreenshotRef has safe dimensions, no dataUrl
+    expect(result.screenshotRef.dimensions).toEqual({ width: 1920, height: 1080 });
+    expect(result.screenshotRef).not.toHaveProperty('dataUrl');
+    expect(JSON.stringify(result)).not.toContain('RAW_BYTES');
+  });
+
+  // 18. Falls back to DOM viewport dimensions when screenshotRef.dimensions is omitted
+  it('18. should fall back to DOM viewport dimensions when screenshot dimensions are omitted', async () => {
+    let capturedInputDimensions: { width: number; height: number } | undefined;
+    const recordingVisionAdapter: VisualPerceptionAdapter = {
+      name: 'RecordingAdapter',
+      perceive: async (input) => {
+        capturedInputDimensions = input.dimensions;
+        return { success: true, observations: [] };
+      }
+    };
+
+    const result = await perceivePage(
+      makeDomProvider(MOCK_DOM), // viewport: 1280x720
+      makeScreenshotProvider({
+        format: 'png',
+        timestamp: 123456,
+        dataUrl: 'data:image/png;base64,RAW_BYTES'
+        // dimensions omitted
+      }),
+      recordingVisionAdapter
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error('Expected success');
+    expect(capturedInputDimensions).toEqual({ width: 1280, height: 720 });
+    expect(result.screenshotRef.dimensions).toBeUndefined();
+    expect(result.screenshotRef).not.toHaveProperty('dataUrl');
   });
 });

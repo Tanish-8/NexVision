@@ -54,12 +54,27 @@ export interface ModelCandidateTarget {
   readonly accessibleName?: string;
   readonly visibleText?: string;
   readonly confidence: number;
+  /** Whether the element currently has focus (propagated from PageElement.state.focused). */
+  readonly focused?: boolean;
   readonly bounds?: {
     readonly x: number;
     readonly y: number;
     readonly width: number;
     readonly height: number;
   };
+}
+
+/**
+ * Safe, allowlisted history step for LLM consumption.
+ * Contains NO typed text or PII — structural summary only.
+ * The typed text from a previous TypeAction is intentionally omitted to preserve the privacy boundary.
+ */
+export interface ModelHistoryStep {
+  readonly stepIndex: number;
+  readonly actionType: 'click' | 'type' | 'focus';
+  readonly targetElementId: string;
+  readonly targetRole?: string;
+  readonly perceivedOutcome?: 'success' | 'no_change' | 'error';
 }
 
 /**
@@ -85,10 +100,125 @@ export interface ModelPromptPayload {
   readonly page: ModelPageContext;
   readonly availableTargets: readonly ModelCandidateTarget[];
   readonly stepIndex?: number;
+  /** Structural action history for the current goal. No typed text is included. */
+  readonly history?: readonly ModelHistoryStep[];
 }
 
 // ---------------------------------------------------------------------------
-// 2. System Instruction & Prompt Construction
+// 2. Prompt Compaction
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum number of candidate targets sent to the model per prompt.
+ *
+ * Keeps the user-prompt within the default llama-server context window
+ * (-c 4096) even for large pages with 100+ interactive elements.
+ * Interactive elements are ranked by search-relevance before the cap is applied,
+ * so high-priority targets (textboxes, searchboxes, buttons) are always included.
+ */
+export const MAX_MODEL_CANDIDATES = 20;
+
+/**
+ * Roles that are most likely to be the primary target for common tasks.
+ * Listed in descending priority order.
+ */
+const SEARCH_ROLE_PRIORITY: ReadonlyMap<string, number> = new Map([
+  ['searchbox', 10],
+  ['textbox', 9],
+  ['combobox', 8],
+  ['button', 7],
+  ['link', 6],
+  ['checkbox', 5],
+  ['radio', 4],
+  ['select', 3],
+  ['option', 2]
+]);
+
+/**
+ * Returns a relevance score for a candidate in the context of a goal description.
+ * Higher is more relevant. Pure function: no side-effects, no privacy data emitted.
+ *
+ * Scoring:
+ * - Role priority bonus  (0–10)
+ * - Goal-keyword match in label (+5 per match, capped)
+ * - accessibleName presence bonus (+2)
+ */
+function scoreCandidateRelevance(
+  role: string | undefined,
+  accessibleName: string | undefined,
+  visibleText: string | undefined,
+  goalKeywords: readonly string[]
+): number {
+  let score = SEARCH_ROLE_PRIORITY.get(role ?? '') ?? 0;
+
+  if (accessibleName !== undefined) score += 2;
+
+  const labelText = ((accessibleName ?? '') + ' ' + (visibleText ?? '')).toLowerCase();
+  let keywordHits = 0;
+  for (const kw of goalKeywords) {
+    if (kw.length > 2 && labelText.includes(kw)) {
+      keywordHits++;
+    }
+  }
+  score += Math.min(keywordHits * 5, 15);
+
+  return score;
+}
+
+/**
+ * Compacts and ranks candidate targets before model serialization.
+ *
+ * 1. Ranks by `scoreCandidateRelevance` (role priority + goal-keyword hits).
+ * 2. Caps the list at `MAX_MODEL_CANDIDATES`.
+ * 3. Omits `bounds` from the model-facing DTO (the model needs elementId, not pixels).
+ *
+ * Privacy: this function operates AFTER sanitization — it never receives or
+ * forwards raw/unsanitized text. It only reorders and truncates the already-sanitized list.
+ *
+ * @param candidates  Already-sanitized ModelCandidateTarget[] (may include bounds).
+ * @param goalDescription  Sanitized goal description used for keyword scoring.
+ * @param limit  Maximum number of candidates to return. Default: MAX_MODEL_CANDIDATES.
+ */
+export function compactCandidatesForModel(
+  candidates: readonly ModelCandidateTarget[],
+  goalDescription: string,
+  limit: number = MAX_MODEL_CANDIDATES
+): ModelCandidateTarget[] {
+  if (candidates.length === 0) return [];
+
+  // Tokenize the sanitized goal description into keywords
+  const goalKeywords = goalDescription
+    .toLowerCase()
+    .split(/[\s,;.!?]+/)
+    .filter(w => w.length > 2);
+
+  // Score each candidate (bounds intentionally excluded from output).
+  // Focused elements receive a +8 bonus so the model sees them near the top
+  // when it is already on a step that requires typing.
+  const scored = candidates.map(c => ({
+    candidate: c,
+    score: scoreCandidateRelevance(c.role, c.accessibleName, c.visibleText, goalKeywords)
+          + (c.focused === true ? 8 : 0)
+  }));
+
+  // Stable descending sort (preserve original order among equal-scored candidates)
+  scored.sort((a, b) => b.score - a.score);
+
+  // Cap and strip bounds from model-facing DTO; preserve focused flag.
+  return scored.slice(0, limit).map(({ candidate: c }) => ({
+    elementId: c.elementId,
+    ...(c.role !== undefined ? { role: c.role } : {}),
+    ...(c.accessibleName !== undefined ? { accessibleName: c.accessibleName } : {}),
+    ...(c.visibleText !== undefined ? { visibleText: c.visibleText } : {}),
+    ...(c.focused === true ? { focused: true } : {}),
+    confidence: c.confidence
+    // bounds intentionally omitted — the executor resolves the element by id,
+    // not by pixel coordinates. Omitting bounds saves ~40 chars/candidate.
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// 3. System Instruction & Prompt Construction
 // ---------------------------------------------------------------------------
 
 export const LOCAL_AGENT_SYSTEM_PROMPT =
@@ -101,8 +231,16 @@ export const LOCAL_AGENT_SYSTEM_PROMPT =
   '5. If the goal is already satisfied, return a COMPLETED response.\n' +
   '6. Exactly ONE action per response.\n' +
   '7. Return strictly valid JSON only. Do NOT output markdown code blocks or prose outside JSON.\n\n' +
+  'Action selection guidance:\n' +
+  '8. Use "click" for buttons, links, and initial element activation.\n' +
+  '9. Use "type" for entering text into textbox, searchbox, and input elements. Typed text must come directly from the user task, not from private profile data or guessed information.\n' +
+  '10. If a relevant input element is already focused (focused:true) or was successfully activated in a previous step (see history), do NOT repeat "click" — use "type" immediately when text entry is the next task requirement.\n' +
+  '11. Set pressEnter:true in payload when submitting a search query is appropriate.\n' +
+  '12. Do not repeat an action that already succeeded in history unless current page state provides clear evidence that repeating it is necessary.\n' +
+  '13. When typing a COMPLETE search query or replacement value into an input, ALWAYS type the ENTIRE intended text as a single "type" action — do NOT split the text across multiple steps. For example, to search for "laptops under 50000", type the full string in one action, not in parts.\n' +
+  '14. When typing into an input that may already contain text (e.g. after a previous "type" action on the same element, or when the input is focused), set clearFirst:true in the payload to replace the existing content rather than append to it.\n\n' +
   'Schema for action:\n' +
-  '{"type": "ACTION", "targetElementId": "<id>", "actionType": "click"|"type"|"focus", "payload": {"text": "..."}, "rationale": "<brief reason>", "estimatedProgress": 0.5}\n\n' +
+  '{"type": "ACTION", "targetElementId": "<id>", "actionType": "click"|"type"|"focus", "payload": {"text": "...", "clearFirst": true, "pressEnter": true}, "rationale": "<brief reason>", "estimatedProgress": 0.5}\n\n' +
   'Schema for completion:\n' +
   '{"type": "COMPLETED", "rationale": "<brief reason>"}';
 
@@ -358,6 +496,8 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
       ...(accessibleName !== undefined ? { accessibleName } : {}),
       ...(visibleText !== undefined ? { visibleText } : {}),
       confidence: target.confidence,
+      // Propagate focus state so the model can skip redundant click→focus steps
+      ...(matchedElement?.state?.focused === true ? { focused: true } : {}),
       bounds: {
         x: target.viewportBounds.x,
         y: target.viewportBounds.y,
@@ -368,6 +508,23 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
   }
 
   const safeParameters = filterSafeGoalParameters(input.goal.parameters);
+
+  // Build safe history: structural summary only, typed text is never included.
+  // This respects the privacy boundary while giving the model enough context
+  // to avoid repeating the same click on a textbox it has already interacted with.
+  const safeHistory: ModelHistoryStep[] = [];
+  if (Array.isArray(input.history)) {
+    for (const h of input.history) {
+      if (!h || typeof h.stepIndex !== 'number') continue;
+      safeHistory.push({
+        stepIndex: h.stepIndex,
+        actionType: h.action.type,
+        targetElementId: h.action.target.elementId,
+        ...(h.action.target.role !== undefined ? { targetRole: h.action.target.role } : {}),
+        ...(h.perceivedOutcome !== undefined ? { perceivedOutcome: h.perceivedOutcome } : {})
+      });
+    }
+  }
 
   // Sanitize goal description and targetHint
   const sanitizedDescription = sanitizeFreeFormText(input.goal.description) || '';
@@ -400,16 +557,29 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
       ...(sanitizedUrlValue !== undefined ? { url: sanitizedUrlValue } : {})
     },
     availableTargets: candidateTargets,
-    ...(input.context.stepIndex !== undefined ? { stepIndex: input.context.stepIndex } : {})
+    ...(input.context.stepIndex !== undefined ? { stepIndex: input.context.stepIndex } : {}),
+    ...(safeHistory.length > 0 ? { history: safeHistory } : {})
   };
 }
 
 /**
  * Serializes the user prompt deterministically into JSON format.
+ *
+ * The candidates list is compacted (ranked + capped at MAX_MODEL_CANDIDATES,
+ * bounds omitted) before serialization so that the prompt always fits within
+ * the default llama-server context window (-c 4096).
  */
 export function buildAgentUserPrompt(input: PlannerInput): string {
   const payload = buildModelPromptPayload(input);
-  return JSON.stringify(payload);
+  // Compact the already-sanitized candidate list before serialization
+  const compacted: ModelPromptPayload = {
+    ...payload,
+    availableTargets: compactCandidatesForModel(
+      payload.availableTargets,
+      payload.goal.description
+    )
+  };
+  return JSON.stringify(compacted);
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +589,283 @@ export function buildAgentUserPrompt(input: PlannerInput): string {
 const SUPPORTED_ACTION_TYPES: readonly ActionType[] = ['click', 'type', 'focus'];
 
 /**
+ * Normalizes lower-level or slightly divergent model action proposals into the
+ * canonical ACTION / COMPLETED schema before strict validation.
+ *
+ * Supported normalizations:
+ * 1. Lowercase/simple action type as discriminator:
+ *    {"type": "click"|"type"|"focus", ...} -> {"type": "ACTION", "actionType": "click"|"type"|"focus", ...}
+ * 2. Fallback discriminator from "action" or "actionType" if "type" is omitted.
+ * 3. Fallback target element ID from "elementId" or "target" if "targetElementId" is omitted.
+ * 4. Root-level "text" normalized into "payload.text" for type actions.
+ * 5. Case normalization for action types ("CLICK" -> "click").
+ *
+ * Invariants:
+ * - Never invents element IDs, coordinates, or actions.
+ * - Unknown or invalid proposal types are preserved so standard validation rejects them.
+ */
+export function normalizeModelProposal(
+  rawObj: Record<string, unknown>
+): Record<string, unknown> {
+  const normalized: Record<string, unknown> = { ...rawObj };
+
+  // Strict: type discriminator must be present as a string
+  if (typeof normalized['type'] !== 'string') {
+    return normalized;
+  }
+
+  const rawType = normalized['type'].trim();
+  if (rawType === '') {
+    return normalized;
+  }
+
+  const upperType = rawType.toUpperCase();
+  const lowerType = rawType.toLowerCase();
+
+  // Canonical COMPLETED
+  if (upperType === 'COMPLETED') {
+    normalized['type'] = 'COMPLETED';
+    return normalized;
+  }
+
+  // Canonical ACTION or lower-level action ("click" | "type" | "focus")
+  const isDirectActionType = (SUPPORTED_ACTION_TYPES as readonly string[]).includes(lowerType);
+  const isCanonicalAction = upperType === 'ACTION';
+
+  if (isDirectActionType || isCanonicalAction) {
+    normalized['type'] = 'ACTION';
+
+    // Resolve actionType
+    if (isDirectActionType) {
+      normalized['actionType'] = lowerType;
+    } else if (typeof normalized['actionType'] === 'string') {
+      const lowerActionType = normalized['actionType'].trim().toLowerCase();
+      if ((SUPPORTED_ACTION_TYPES as readonly string[]).includes(lowerActionType)) {
+        normalized['actionType'] = lowerActionType;
+      }
+    } else if (typeof normalized['action'] === 'string') {
+      const lowerAction = normalized['action'].trim().toLowerCase();
+      if ((SUPPORTED_ACTION_TYPES as readonly string[]).includes(lowerAction)) {
+        normalized['actionType'] = lowerAction;
+      }
+    }
+
+    // Resolve targetElementId (preserve exact ID without inventing)
+    if (
+      typeof normalized['targetElementId'] !== 'string' ||
+      normalized['targetElementId'].trim() === ''
+    ) {
+      if (
+        typeof normalized['elementId'] === 'string' &&
+        normalized['elementId'].trim() !== ''
+      ) {
+        normalized['targetElementId'] = normalized['elementId'].trim();
+      } else if (
+        typeof normalized['target'] === 'string' &&
+        normalized['target'].trim() !== ''
+      ) {
+        normalized['targetElementId'] = normalized['target'].trim();
+      }
+    }
+
+    // Resolve payload for "type" action
+    if (normalized['actionType'] === 'type') {
+      const normalizeBoolean = (val: unknown): boolean | undefined => {
+        if (typeof val === 'boolean') return val;
+        if (typeof val === 'string') {
+          const lower = val.trim().toLowerCase();
+          if (lower === 'true') return true;
+          if (lower === 'false') return false;
+        }
+        return undefined;
+      };
+
+      if (
+        (typeof normalized['payload'] !== 'object' || normalized['payload'] === null) &&
+        typeof normalized['text'] === 'string'
+      ) {
+        const clearFirst = normalizeBoolean(normalized['clearFirst']);
+        const pressEnter = normalizeBoolean(normalized['pressEnter']);
+        normalized['payload'] = {
+          text: normalized['text'],
+          ...(clearFirst !== undefined ? { clearFirst } : {}),
+          ...(pressEnter !== undefined ? { pressEnter } : {})
+        };
+      } else if (typeof normalized['payload'] === 'object' && normalized['payload'] !== null) {
+        const payloadObj = { ...(normalized['payload'] as Record<string, unknown>) };
+        const pressEnterVal = payloadObj['pressEnter'] !== undefined
+          ? payloadObj['pressEnter']
+          : normalized['pressEnter'];
+        const normalizedPressEnter = normalizeBoolean(pressEnterVal);
+        if (normalizedPressEnter !== undefined) {
+          payloadObj['pressEnter'] = normalizedPressEnter;
+        }
+
+        const clearFirstVal = payloadObj['clearFirst'] !== undefined
+          ? payloadObj['clearFirst']
+          : normalized['clearFirst'];
+        const normalizedClearFirst = normalizeBoolean(clearFirstVal);
+        if (normalizedClearFirst !== undefined) {
+          payloadObj['clearFirst'] = normalizedClearFirst;
+        }
+
+        normalized['payload'] = payloadObj;
+      }
+    }
+
+    // Fallback rationale from summary/reason if rationale is missing
+    if (
+      typeof normalized['rationale'] !== 'string' ||
+      normalized['rationale'].trim() === ''
+    ) {
+      if (
+        typeof normalized['summary'] === 'string' &&
+        normalized['summary'].trim() !== ''
+      ) {
+        normalized['rationale'] = normalized['summary'].trim();
+      } else if (
+        typeof normalized['reason'] === 'string' &&
+        normalized['reason'].trim() !== ''
+      ) {
+        normalized['rationale'] = normalized['reason'].trim();
+      }
+    }
+
+    // Parse numeric estimatedProgress if supplied as valid numeric string
+    if (typeof normalized['estimatedProgress'] === 'string') {
+      const parsedNum = Number(normalized['estimatedProgress']);
+      if (Number.isFinite(parsedNum) && parsedNum >= 0 && parsedNum <= 1) {
+        normalized['estimatedProgress'] = parsedNum;
+      }
+    }
+
+    return normalized;
+  }
+
+  // Preserve raw type so parseAdvisoryResponse produces standard error message
+  normalized['type'] = rawType;
+  return normalized;
+}
+
+/**
+ * Scans a string for balanced top-level curly-brace candidate substrings `{ ... }`.
+ * Tracks string literals (including escaped quotes) so that braces inside strings
+ * do not alter object depth.
+ */
+export function findTopLevelJsonObjectCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+  let startIndex = -1;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false;
+      } else if (char === '\\') {
+        isEscaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      if (depth === 0) {
+        startIndex = i;
+      }
+      depth++;
+    } else if (char === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && startIndex !== -1) {
+          candidates.push(text.slice(startIndex, i + 1));
+          startIndex = -1;
+        }
+      }
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * Safely extracts a single JSON object from raw model output when direct parsing fails.
+ *
+ * Supports:
+ * - Markdown code fences surrounded by conversational preamble or notes
+ * - Raw JSON objects embedded in conversational preamble or wrapper text
+ *
+ * Invariants:
+ * - Deterministic and safe.
+ * - Rejects plain prose.
+ * - Rejects malformed or truncated JSON (never guesses missing fields or closing braces).
+ * - Rejects ambiguous responses containing multiple distinct valid JSON objects.
+ * - Returns null if a single valid JSON object cannot be extracted.
+ */
+export function extractSingleJsonObject(raw: string): Record<string, unknown> | null {
+  // Strategy 1: Check for markdown code fences
+  const fenceRegex = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
+  const fenceMatches = [...raw.matchAll(fenceRegex)];
+
+  if (fenceMatches.length > 0) {
+    const validFenceObjects: Record<string, unknown>[] = [];
+    for (const match of fenceMatches) {
+      const inner = match[1].trim();
+      try {
+        const parsed = JSON.parse(inner);
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          validFenceObjects.push(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // Content within this fence is not valid JSON
+      }
+    }
+
+    if (validFenceObjects.length === 1) {
+      return validFenceObjects[0];
+    }
+    if (validFenceObjects.length > 1) {
+      // Ambiguous multiple fenced JSON objects
+      return null;
+    }
+  }
+
+  // Strategy 2: Scan for top-level balanced curly-brace candidate substrings
+  const candidates = findTopLevelJsonObjectCandidates(raw);
+  const validObjects: Record<string, unknown>[] = [];
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        validObjects.push(parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Candidate substring is not valid JSON
+    }
+  }
+
+  // Exactly one valid JSON object must be found
+  if (validObjects.length === 1) {
+    return validObjects[0];
+  }
+
+  return null;
+}
+
+/**
  * Strictly parses and validates raw model text output into an AdvisoryProposalResult.
  * Rejects prose, missing types, invalid action types, out-of-range numbers, and malformed payloads.
+ * Safely extracts a single JSON object if wrapped in markdown fences or known preamble/wrapper text.
  */
 export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResult {
   if (typeof rawContent !== 'string' || rawContent.trim() === '') {
@@ -434,23 +879,33 @@ export function parseAdvisoryResponse(rawContent: string): AdvisoryProposalResul
   const cleaned = stripMarkdownFences(rawContent);
 
   let parsed: unknown;
+  let directParseSucceeded = false;
   try {
     parsed = JSON.parse(cleaned);
+    directParseSucceeded = true;
   } catch {
-    return {
-      status: 'FAILED',
-      reason: 'Failed to parse model output as valid JSON'
-    };
+    // Direct parse failed; attempt safe single JSON object extraction
   }
 
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return {
-      status: 'FAILED',
-      reason: 'Model output must be a non-null JSON object'
-    };
+  if (directParseSucceeded) {
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return {
+        status: 'FAILED',
+        reason: 'Model output must be a non-null JSON object'
+      };
+    }
+  } else {
+    const extracted = extractSingleJsonObject(rawContent);
+    if (!extracted) {
+      return {
+        status: 'FAILED',
+        reason: 'Failed to parse model output as valid JSON'
+      };
+    }
+    parsed = extracted;
   }
 
-  const obj = parsed as Record<string, unknown>;
+  const obj = normalizeModelProposal(parsed as Record<string, unknown>);
 
   // 1. Validate type discriminator
   if (typeof obj['type'] !== 'string') {
@@ -627,7 +1082,7 @@ export interface LocalLlamaAgentOptions {
   readonly fetchFn?: typeof fetch;
   /** Sampling temperature. Default: 0.1 */
   readonly temperature?: number;
-  /** Max completion tokens. Default: 512 */
+  /** Max completion tokens. Default: 1024 */
   readonly maxTokens?: number;
 }
 
@@ -665,7 +1120,7 @@ export class DefaultLocalLlamaChatClient implements LocalLlamaChatClient {
     this.timeoutMs = options?.timeoutMs ?? 120000;
     this.modelId = options?.modelId?.trim() || 'qwen2.5-vl-3b';
     this.temperature = options?.temperature ?? 0.1;
-    this.maxTokens = options?.maxTokens ?? 512;
+    this.maxTokens = options?.maxTokens ?? 1024;
     this.fetchFn =
       options?.fetchFn ||
       (typeof globalThis.fetch === 'function'
@@ -711,9 +1166,8 @@ export class DefaultLocalLlamaChatClient implements LocalLlamaChatClient {
       }
     };
 
-    let response: Response;
     try {
-      response = await this.fetchFn(endpoint, {
+      const response = await this.fetchFn(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -721,9 +1175,55 @@ export class DefaultLocalLlamaChatClient implements LocalLlamaChatClient {
         body: JSON.stringify(payload),
         signal: controller.signal
       });
-    } catch (fetchError: unknown) {
-      clearTimeout(timeoutId);
 
+      if (!response.ok) {
+        return {
+          success: false,
+          error: {
+            code: 'HTTP_ERROR',
+            message: `Local inference server returned HTTP ${response.status} ${response.statusText}`
+          }
+        };
+      }
+
+      let responseBody: any;
+      try {
+        responseBody = await response.json();
+      } catch (jsonError: unknown) {
+        if (controller.signal.aborted) {
+          return {
+            success: false,
+            error: {
+              code: 'TIMEOUT',
+              message: `Local inference timed out after ${this.timeoutMs}ms`
+            }
+          };
+        }
+        return {
+          success: false,
+          error: {
+            code: 'INVALID_RESPONSE',
+            message: 'Local inference server returned invalid JSON response body'
+          }
+        };
+      }
+
+      const content = responseBody?.choices?.[0]?.message?.content;
+      if (typeof content !== 'string' || content.trim() === '') {
+        return {
+          success: false,
+          error: {
+            code: 'EMPTY_CONTENT',
+            message: 'Local inference server returned response without text content'
+          }
+        };
+      }
+
+      return {
+        success: true,
+        content
+      };
+    } catch (fetchError: unknown) {
       if (controller.signal.aborted) {
         return {
           success: false,
@@ -744,45 +1244,6 @@ export class DefaultLocalLlamaChatClient implements LocalLlamaChatClient {
     } finally {
       clearTimeout(timeoutId);
     }
-
-    if (!response.ok) {
-      return {
-        success: false,
-        error: {
-          code: 'HTTP_ERROR',
-          message: `Local inference server returned HTTP ${response.status} ${response.statusText}`
-        }
-      };
-    }
-
-    let responseBody: any;
-    try {
-      responseBody = await response.json();
-    } catch {
-      return {
-        success: false,
-        error: {
-          code: 'INVALID_RESPONSE',
-          message: 'Local inference server returned invalid JSON response body'
-        }
-      };
-    }
-
-    const content = responseBody?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || content.trim() === '') {
-      return {
-        success: false,
-        error: {
-          code: 'EMPTY_CONTENT',
-          message: 'Local inference server returned response without text content'
-        }
-      };
-    }
-
-    return {
-      success: true,
-      content
-    };
   }
 }
 
@@ -812,12 +1273,24 @@ export class LocalAgentDriver implements PlannerDriver {
   async proposeStep(input: PlannerInput): Promise<AdvisoryProposalResult> {
     // 1. Safe allowlisted prompt construction
     const userPrompt = buildAgentUserPrompt(input);
+    const parsedPayload = JSON.parse(userPrompt);
+    console.log(
+      `[NexVision LocalAgent] Step ${input.context.stepIndex}: ` +
+      `targets=${parsedPayload.availableTargets?.length ?? 0}, ` +
+      `historySteps=${parsedPayload.history?.length ?? 0}`
+    );
 
     // 2. Asynchronous local inference call
     const chatResult = await this.client.chat({
       systemPrompt: LOCAL_AGENT_SYSTEM_PROMPT,
       userPrompt
     });
+
+    if (chatResult.success) {
+      console.log(
+        `[NexVision LocalAgent] Step ${input.context.stepIndex}: raw model response = ${chatResult.content}`
+      );
+    }
 
     if (!chatResult.success) {
       return {

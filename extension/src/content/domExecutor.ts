@@ -211,6 +211,24 @@ function isFocusableElement(element: Element): boolean {
 }
 
 /**
+ * Sets the value of an HTMLInputElement or HTMLTextAreaElement using the
+ * native prototype setter to ensure compatibility with reactive frameworks
+ * (such as React's synthetic event value tracking).
+ */
+function setNativeInputValue(element: HTMLInputElement | HTMLTextAreaElement, value: string): void {
+  const win = element.ownerDocument?.defaultView || window;
+  const proto = element instanceof HTMLInputElement
+    ? win.HTMLInputElement?.prototype
+    : win.HTMLTextAreaElement?.prototype;
+  const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : undefined;
+  if (descriptor?.set) {
+    descriptor.set.call(element, value);
+  } else {
+    element.value = value;
+  }
+}
+
+/**
  * Helper to construct a structured failure result.
  */
 function makeFailureResult(
@@ -402,7 +420,7 @@ export function executeDomAction(
         // Clear existing value if requested
         if (payload.clearFirst) {
           if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-            element.value = '';
+            setNativeInputValue(element, '');
             element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
             element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
           } else if (isContentEditableElement(element)) {
@@ -415,7 +433,7 @@ export function executeDomAction(
         // Insert typed text (NOTE: Strictly local execution, NEVER logged or returned)
         if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
           const currentVal = element.value || '';
-          element.value = currentVal + payload.text;
+          setNativeInputValue(element, currentVal + payload.text);
 
           try {
             element.dispatchEvent(
@@ -472,6 +490,18 @@ export function executeDomAction(
           element.dispatchEvent(new KeyboardEvent('keydown', enterInit));
           element.dispatchEvent(new KeyboardEvent('keypress', enterInit));
           element.dispatchEvent(new KeyboardEvent('keyup', enterInit));
+
+          // If the element is within a form, trigger implicit form submission
+          if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+            const form = element.form || element.closest('form');
+            if (form) {
+              if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+              } else {
+                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+              }
+            }
+          }
         }
 
         const successResult: ExecutionSuccessResult = {
