@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NexMart — Laptops &amp; Electronics</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f6f8; color: #1a1a2e; }
+    header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #fff; padding: 0 32px;
+      display: flex; align-items: center; gap: 24px;
+      height: 64px; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+    }
+    .logo { font-size: 1.5rem; font-weight: 800; letter-spacing: -.5px; color: #e94560; flex-shrink: 0; }
+    .logo span { color: #fff; }
+    .search-bar { flex: 1; display: flex; max-width: 640px; }
+    #search-input {
+      flex: 1; height: 40px; padding: 0 16px;
+      border: none; border-radius: 6px 0 0 6px;
+      font-size: 0.95rem; outline: none; background: #fff; color: #1a1a2e;
+    }
+    #search-input::placeholder { color: #aaa; }
+    #search-btn {
+      height: 40px; padding: 0 20px;
+      background: #e94560; color: #fff; border: none;
+      border-radius: 0 6px 6px 0; font-size: 0.95rem;
+      font-weight: 600; cursor: pointer;
+    }
+    #search-btn:hover { background: #c73652; }
+    .header-nav { display: flex; gap: 18px; margin-left: auto; }
+    .header-nav a { color: #ccc; text-decoration: none; font-size: 0.9rem; }
+    .header-nav a:hover { color: #fff; }
+    .container { display: flex; max-width: 1200px; margin: 24px auto; gap: 24px; padding: 0 16px; }
+    aside {
+      width: 220px; flex-shrink: 0; background: #fff;
+      border-radius: 10px; padding: 20px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.1); height: fit-content;
+    }
+    aside h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 12px; }
+    .filter-group { margin-bottom: 20px; }
+    .filter-group label { display: block; font-size: 0.9rem; margin-bottom: 6px; cursor: pointer; }
+    .filter-group input[type=checkbox] { margin-right: 8px; }
+    .price-range { display: flex; gap: 8px; align-items: center; }
+    .price-range input[type=number] { width: 80px; padding: 4px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.85rem; }
+    .apply-filter {
+      width: 100%; padding: 8px; background: #1a1a2e; color: #fff;
+      border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; margin-top: 8px;
+    }
+    .apply-filter:hover { background: #16213e; }
+    main { flex: 1; }
+    .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .results-count { font-size: 0.95rem; color: #555; }
+    #sort-select { padding: 6px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9rem; background: #fff; }
+    #results-area { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 20px; }
+    .product-card {
+      background: #fff; border-radius: 12px; overflow: hidden;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08); transition: box-shadow .2s, transform .15s; cursor: pointer;
+    }
+    .product-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.14); transform: translateY(-2px); }
+    .product-img {
+      height: 160px; background: linear-gradient(135deg, #e8eaf6 0%, #c5cae9 100%);
+      display: flex; align-items: center; justify-content: center; font-size: 3rem;
+    }
+    .product-info { padding: 14px; }
+    .product-brand { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: .5px; }
+    .product-name { font-size: 0.95rem; font-weight: 600; margin: 4px 0; color: #1a1a2e; }
+    .product-spec { font-size: 0.82rem; color: #666; margin-bottom: 10px; }
+    .product-price { font-size: 1.2rem; font-weight: 700; color: #e94560; }
+    .product-price-original { font-size: 0.82rem; color: #aaa; text-decoration: line-through; margin-left: 6px; }
+    .product-discount { font-size: 0.8rem; color: #27ae60; font-weight: 600; margin-left: 6px; }
+    .product-actions { display: flex; gap: 8px; margin-top: 12px; }
+    .btn-cart, .btn-buy {
+      flex: 1; padding: 8px 0; border: none; border-radius: 6px;
+      font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    }
+    .btn-cart { background: #f0f0f0; color: #1a1a2e; }
+    .btn-buy { background: #e94560; color: #fff; }
+    .btn-cart:hover, .btn-buy:hover { opacity: .85; }
+    #search-status { margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; font-size: 0.9rem; display: none; }
+    #search-status.visible { display: block; }
+    #search-status.info { background: #e3f2fd; color: #1565c0; }
+    #search-status.success { background: #e8f5e9; color: #2e7d32; }
+    footer { background: #1a1a2e; color: #ccc; padding: 28px 32px; font-size: 0.85rem; margin-top: 32px; }
+    footer .footer-inner { max-width: 1200px; margin: 0 auto; display: flex; gap: 40px; flex-wrap: wrap; }
+    footer h4 { color: #fff; margin-bottom: 10px; font-size: 0.95rem; }
+    footer a { color: #aaa; text-decoration: none; display: block; margin-bottom: 6px; }
+    footer a:hover { color: #fff; }
+    .support-info { font-size: 0.8rem; color: #888; margin-top: 8px; }
+  </style>
+</head>
+<body>
+
+  <header role="banner">
+    <div class="logo">Nex<span>Mart</span></div>
+    <form class="search-bar" id="search-form" role="search" aria-label="Product search">
+      <input
+        id="search-input"
+        type="text"
+        name="q"
+        placeholder="Search for laptops, mobiles, tablets…"
+        aria-label="Search products"
+        autocomplete="off"
+        value=""
+      />
+      <button id="search-btn" type="submit" aria-label="Search">Search</button>
+    </form>
+    <nav class="header-nav" aria-label="Site navigation">
+      <a href="#" id="nav-home">Home</a>
+      <a href="#" id="nav-deals">Deals</a>
+      <a href="#" id="nav-cart">Cart (0)</a>
+      <a href="#" id="nav-login">Sign In</a>
+    </nav>
+  </header>
+
+  <div class="container">
+    <aside aria-label="Product filters">
+      <div class="filter-group">
+        <h3>Brand</h3>
+        <label><input type="checkbox" id="filter-hp" /> HP</label>
+        <label><input type="checkbox" id="filter-dell" /> Dell</label>
+        <label><input type="checkbox" id="filter-lenovo" /> Lenovo</label>
+        <label><input type="checkbox" id="filter-asus" /> Asus</label>
+        <label><input type="checkbox" id="filter-acer" /> Acer</label>
+      </div>
+      <div class="filter-group">
+        <h3>Price Range (&#x20B9;)</h3>
+        <div class="price-range">
+          <input type="number" id="price-min" placeholder="Min" value="20000" aria-label="Minimum price" />
+          <span>&#x2013;</span>
+          <input type="number" id="price-max" placeholder="Max" value="80000" aria-label="Maximum price" />
+        </div>
+        <button class="apply-filter" id="apply-filter-btn" type="button">Apply Filter</button>
+      </div>
+      <div class="filter-group">
+        <h3>RAM</h3>
+        <label><input type="checkbox" id="filter-8gb" /> 8 GB</label>
+        <label><input type="checkbox" id="filter-16gb" /> 16 GB</label>
+        <label><input type="checkbox" id="filter-32gb" /> 32 GB</label>
+      </div>
+    </aside>
+
+    <main aria-label="Product listings">
+      <div class="results-header">
+        <span class="results-count" id="results-count">Showing 6 laptops</span>
+        <select id="sort-select" aria-label="Sort products by">
+          <option value="relevance">Sort: Relevance</option>
+          <option value="price-asc">Price: Low to High</option>
+          <option value="price-desc">Price: High to Low</option>
+          <option value="rating">Customer Rating</option>
+        </select>
+      </div>
+
+      <div id="search-status" role="status" aria-live="polite"></div>
+
+      <div id="results-area" aria-label="Search results">
+
+        <article class="product-card" data-price="44990" data-brand="HP">
+          <div class="product-img">&#x1F4BB;</div>
+          <div class="product-info">
+            <div class="product-brand">HP</div>
+            <div class="product-name">HP Pavilion 15 Core i5</div>
+            <div class="product-spec">Intel i5-1235U &middot; 16 GB &middot; 512 GB SSD &middot; 15.6&Prime; FHD</div>
+            <div>
+              <span class="product-price">&#x20B9;44,990</span>
+              <span class="product-price-original">&#x20B9;59,990</span>
+              <span class="product-discount">25% off</span>
+            </div>
+            <div class="product-actions">
+              <button class="btn-cart" type="button">Add to Cart</button>
+              <button class="btn-buy" type="button">Buy Now</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="product-card" data-price="38490" data-brand="Lenovo">
+          <div class="product-img">&#x1F4BB;</div>
+          <div class="product-info">
+            <div class="product-brand">Lenovo</div>
+            <div class="product-name">Lenovo IdeaPad Slim 3</div>
+            <div class="product-spec">AMD Ryzen 5 &middot; 8 GB &middot; 512 GB SSD &middot; 15.6&Prime; FHD</div>
+            <div>
+              <span class="product-price">&#x20B9;38,490</span>
+              <span class="product-price-original">&#x20B9;49,990</span>
+              <span class="product-discount">23% off</span>
+            </div>
+            <div class="product-actions">
+              <button class="btn-cart" type="button">Add to Cart</button>
+              <button class="btn-buy" type="button">Buy Now</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="product-card" data-price="46999" data-brand="Asus">
+          <div class="product-img">&#x1F4BB;</div>
+          <div class="product-info">
+            <div class="product-brand">Asus</div>
+            <div class="product-name">Asus VivoBook 15 OLED</div>
+            <div class="product-spec">Intel i5-12500H &middot; 16 GB &middot; 512 GB SSD &middot; 15.6&Prime; OLED</div>
+            <div>
+              <span class="product-price">&#x20B9;46,999</span>
+              <span class="product-price-original">&#x20B9;64,990</span>
+              <span class="product-discount">28% off</span>
+            </div>
+            <div class="product-actions">
+              <button class="btn-cart" type="button">Add to Cart</button>
+              <button class="btn-buy" type="button">Buy Now</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="product-card" data-price="74990" data-brand="Dell">
+          <div class="product-img">&#x1F4BB;</div>
+          <div class="product-info">
+            <div class="product-brand">Dell</div>
+            <div class="product-name">Dell Inspiron 15 Plus</div>
+            <div class="product-spec">Intel i7-12700H &middot; 16 GB &middot; 1 TB SSD &middot; 15.6&Prime; QHD</div>
+            <div>
+              <span class="product-price">&#x20B9;74,990</span>
+              <span class="product-price-original">&#x20B9;89,990</span>
+              <span class="product-discount">17% off</span>
+            </div>
+            <div class="product-actions">
+              <button class="btn-cart" type="button">Add to Cart</button>
+              <button class="btn-buy" type="button">Buy Now</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="product-card" data-price="29990" data-brand="Acer">
+          <div class="product-img">&#x1F4BB;</div>
+          <div class="product-info">
+            <div class="product-brand">Acer</div>
+            <div class="product-name">Acer Aspire Lite</div>
+            <div class="product-spec">AMD Ryzen 3 &middot; 8 GB &middot; 256 GB SSD &middot; 14&Prime; FHD</div>
+            <div>
+              <span class="product-price">&#x20B9;29,990</span>
+              <span class="product-price-original">&#x20B9;39,990</span>
+              <span class="product-discount">25% off</span>
+            </div>
+            <div class="product-actions">
+              <button class="btn-cart" type="button">Add to Cart</button>
+              <button class="btn-buy" type="button">Buy Now</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="product-card" data-price="89999" data-brand="HP">
+          <div class="product-img">&#x1F4BB;</div>
+          <div class="product-info">
+            <div class="product-brand">HP</div>
+            <div class="product-name">HP Spectre x360 13</div>
+            <div class="product-spec">Intel i7-1255U &middot; 16 GB &middot; 1 TB SSD &middot; 13.5&Prime; OLED Touch</div>
+            <div>
+              <span class="product-price">&#x20B9;89,999</span>
+              <span class="product-price-original">&#x20B9;1,09,990</span>
+              <span class="product-discount">18% off</span>
+            </div>
+            <div class="product-actions">
+              <button class="btn-cart" type="button">Add to Cart</button>
+              <button class="btn-buy" type="button">Buy Now</button>
+            </div>
+          </div>
+        </article>
+
+      </div>
+    </main>
+  </div>
+
+  <!-- Footer: synthetic support contact demonstrates privacy boundary -->
+  <footer role="contentinfo">
+    <div class="footer-inner">
+      <div>
+        <h4>NexMart</h4>
+        <a href="#">About Us</a>
+        <a href="#">Careers</a>
+        <!-- Harmless synthetic values for privacy engine demo: -->
+        <div class="support-info">Support: support@nexmart-demo.local</div>
+        <div class="support-info">Helpline: +91-98765-43210 (synthetic)</div>
+      </div>
+      <div>
+        <h4>Help</h4>
+        <a href="#">Track Order</a>
+        <a href="#">Returns &amp; Refunds</a>
+        <a href="#">FAQs</a>
+      </div>
+      <div>
+        <h4>Categories</h4>
+        <a href="#" id="cat-laptops">Laptops</a>
+        <a href="#" id="cat-mobiles">Mobiles</a>
+        <a href="#" id="cat-tablets">Tablets</a>
+        <a href="#" id="cat-accessories">Accessories</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    const form = document.getElementById('search-form');
+    const input = document.getElementById('search-input');
+    const statusEl = document.getElementById('search-status');
+    const countEl = document.getElementById('results-count');
+    const cards = Array.from(document.querySelectorAll('.product-card'));
+
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      const query = input.value.trim().toLowerCase();
+      if (!query) return;
+
+      var visible = 0;
+      var wantUnder50k = query.includes('50000') || query.includes('50,000') || query.includes('50 000');
+
+      cards.forEach(function(card) {
+        const text = card.textContent.toLowerCase();
+        const matchesQuery = text.includes(query.split(' ')[0]) || query.includes('laptop');
+        const price = parseInt(card.getAttribute('data-price') || '0', 10);
+        const passesPrice = !wantUnder50k || price <= 50000;
+        const show = matchesQuery && passesPrice;
+        card.style.display = show ? '' : 'none';
+        if (show) visible++;
+      });
+
+      statusEl.textContent = 'Showing ' + visible + ' results for "' + input.value.trim() + '"';
+      statusEl.className = 'visible success';
+      countEl.textContent = 'Showing ' + visible + ' laptops';
+    });
+
+    document.getElementById('apply-filter-btn').addEventListener('click', function() {
+      var maxPrice = parseInt(document.getElementById('price-max').value || '999999', 10);
+      var minPrice = parseInt(document.getElementById('price-min').value || '0', 10);
+      var visible = 0;
+      cards.forEach(function(card) {
+        var price = parseInt(card.getAttribute('data-price') || '0', 10);
+        var inRange = price >= minPrice && price <= maxPrice;
+        card.style.display = inRange ? '' : 'none';
+        if (inRange) visible++;
+      });
+      countEl.textContent = 'Showing ' + visible + ' laptops';
+    });
+  </script>
+</body>
+</html>
