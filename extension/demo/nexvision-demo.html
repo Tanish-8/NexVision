@@ -3,339 +3,922 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NexMart — Laptops &amp; Electronics</title>
+  <meta name="description" content="NexBank — Personal Banking Dashboard. Fictional demo for NexVision SIH 2026." />
+  <title>NexBank — Personal Banking</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
+    /* ===== Reset & Base ===== */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f6f8; color: #1a1a2e; }
+    body {
+      font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+      background: #f0f2f5;
+      color: #1a1d23;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ===== Header ===== */
     header {
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-      color: #fff; padding: 0 32px;
-      display: flex; align-items: center; gap: 24px;
-      height: 64px; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+      color: #fff;
+      padding: 0 28px;
+      display: flex;
+      align-items: center;
+      height: 60px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.25);
+      position: sticky;
+      top: 0;
+      z-index: 100;
     }
-    .logo { font-size: 1.5rem; font-weight: 800; letter-spacing: -.5px; color: #e94560; flex-shrink: 0; }
-    .logo span { color: #fff; }
-    .search-bar { flex: 1; display: flex; max-width: 640px; }
-    #search-input {
-      flex: 1; height: 40px; padding: 0 16px;
-      border: none; border-radius: 6px 0 0 6px;
-      font-size: 0.95rem; outline: none; background: #fff; color: #1a1a2e;
+    .logo {
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: -.3px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
-    #search-input::placeholder { color: #aaa; }
-    #search-btn {
-      height: 40px; padding: 0 20px;
-      background: #e94560; color: #fff; border: none;
-      border-radius: 0 6px 6px 0; font-size: 0.95rem;
-      font-weight: 600; cursor: pointer;
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, #3b82f6, #06b6d4);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1rem; font-weight: 800; color: #fff;
     }
-    #search-btn:hover { background: #c73652; }
-    .header-nav { display: flex; gap: 18px; margin-left: auto; }
-    .header-nav a { color: #ccc; text-decoration: none; font-size: 0.9rem; }
-    .header-nav a:hover { color: #fff; }
-    .container { display: flex; max-width: 1200px; margin: 24px auto; gap: 24px; padding: 0 16px; }
-    aside {
-      width: 220px; flex-shrink: 0; background: #fff;
-      border-radius: 10px; padding: 20px;
-      box-shadow: 0 1px 4px rgba(0,0,0,.1); height: fit-content;
+    .logo-text { color: #e2e8f0; }
+    .logo-text span { color: #38bdf8; }
+
+    .header-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 20px;
     }
-    aside h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 12px; }
-    .filter-group { margin-bottom: 20px; }
-    .filter-group label { display: block; font-size: 0.9rem; margin-bottom: 6px; cursor: pointer; }
-    .filter-group input[type=checkbox] { margin-right: 8px; }
-    .price-range { display: flex; gap: 8px; align-items: center; }
-    .price-range input[type=number] { width: 80px; padding: 4px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.85rem; }
-    .apply-filter {
-      width: 100%; padding: 8px; background: #1a1a2e; color: #fff;
-      border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; margin-top: 8px;
+    .header-greeting {
+      font-size: 0.875rem;
+      color: #94a3b8;
+      font-weight: 500;
     }
-    .apply-filter:hover { background: #16213e; }
-    main { flex: 1; }
-    .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    .results-count { font-size: 0.95rem; color: #555; }
-    #sort-select { padding: 6px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9rem; background: #fff; }
-    #results-area { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 20px; }
-    .product-card {
-      background: #fff; border-radius: 12px; overflow: hidden;
-      box-shadow: 0 1px 4px rgba(0,0,0,.08); transition: box-shadow .2s, transform .15s; cursor: pointer;
+    .header-greeting strong { color: #e2e8f0; font-weight: 600; }
+    .header-btn {
+      background: none; border: none; color: #94a3b8; cursor: pointer;
+      font-size: 1.15rem; padding: 6px; border-radius: 6px;
+      transition: background .15s, color .15s;
     }
-    .product-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.14); transform: translateY(-2px); }
-    .product-img {
-      height: 160px; background: linear-gradient(135deg, #e8eaf6 0%, #c5cae9 100%);
-      display: flex; align-items: center; justify-content: center; font-size: 3rem;
+    .header-btn:hover { background: rgba(255,255,255,.08); color: #fff; }
+    .profile-btn {
+      width: 34px; height: 34px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border-radius: 50%; border: 2px solid #475569;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.8rem; font-weight: 700; color: #fff; cursor: pointer;
     }
-    .product-info { padding: 14px; }
-    .product-brand { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: .5px; }
-    .product-name { font-size: 0.95rem; font-weight: 600; margin: 4px 0; color: #1a1a2e; }
-    .product-spec { font-size: 0.82rem; color: #666; margin-bottom: 10px; }
-    .product-price { font-size: 1.2rem; font-weight: 700; color: #e94560; }
-    .product-price-original { font-size: 0.82rem; color: #aaa; text-decoration: line-through; margin-left: 6px; }
-    .product-discount { font-size: 0.8rem; color: #27ae60; font-weight: 600; margin-left: 6px; }
-    .product-actions { display: flex; gap: 8px; margin-top: 12px; }
-    .btn-cart, .btn-buy {
-      flex: 1; padding: 8px 0; border: none; border-radius: 6px;
-      font-size: 0.85rem; font-weight: 600; cursor: pointer;
+
+    /* ===== Layout ===== */
+    .app-layout {
+      display: flex;
+      flex: 1;
+      max-width: 1400px;
+      width: 100%;
+      margin: 0 auto;
     }
-    .btn-cart { background: #f0f0f0; color: #1a1a2e; }
-    .btn-buy { background: #e94560; color: #fff; }
-    .btn-cart:hover, .btn-buy:hover { opacity: .85; }
-    #search-status { margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; font-size: 0.9rem; display: none; }
-    #search-status.visible { display: block; }
-    #search-status.info { background: #e3f2fd; color: #1565c0; }
-    #search-status.success { background: #e8f5e9; color: #2e7d32; }
-    footer { background: #1a1a2e; color: #ccc; padding: 28px 32px; font-size: 0.85rem; margin-top: 32px; }
-    footer .footer-inner { max-width: 1200px; margin: 0 auto; display: flex; gap: 40px; flex-wrap: wrap; }
-    footer h4 { color: #fff; margin-bottom: 10px; font-size: 0.95rem; }
-    footer a { color: #aaa; text-decoration: none; display: block; margin-bottom: 6px; }
-    footer a:hover { color: #fff; }
-    .support-info { font-size: 0.8rem; color: #888; margin-top: 8px; }
+
+    /* ===== Sidebar ===== */
+    .sidebar {
+      width: 220px;
+      background: #fff;
+      border-right: 1px solid #e2e8f0;
+      padding: 20px 0;
+      flex-shrink: 0;
+    }
+    .sidebar nav { display: flex; flex-direction: column; gap: 2px; }
+    .sidebar a {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 24px;
+      text-decoration: none;
+      color: #475569;
+      font-size: 0.875rem;
+      font-weight: 500;
+      border-left: 3px solid transparent;
+      transition: all .15s;
+    }
+    .sidebar a:hover { background: #f1f5f9; color: #1e293b; }
+    .sidebar a.active {
+      background: #eff6ff;
+      color: #2563eb;
+      border-left-color: #2563eb;
+      font-weight: 600;
+    }
+    .sidebar-icon { font-size: 1.1rem; width: 20px; text-align: center; }
+
+    /* ===== Main Content ===== */
+    .main-content {
+      flex: 1;
+      padding: 24px 28px;
+      overflow-y: auto;
+    }
+
+    .page-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #0f172a;
+      margin-bottom: 20px;
+    }
+
+    /* ===== Account Summary Cards ===== */
+    .account-cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    .account-card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.06);
+      border: 1px solid #e2e8f0;
+      transition: box-shadow .2s;
+    }
+    .account-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,.08); }
+    .account-card-type {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      color: #64748b;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .account-card-balance {
+      font-size: 1.75rem;
+      font-weight: 800;
+      color: #0f172a;
+      line-height: 1.2;
+    }
+    .account-card-label {
+      font-size: 0.78rem;
+      color: #94a3b8;
+      margin-top: 4px;
+    }
+    .account-card.savings .account-card-balance { color: #059669; }
+    .account-card.current .account-card-balance { color: #2563eb; }
+    .account-card.credit .account-card-balance { color: #dc2626; }
+
+    /* ===== Content Grid ===== */
+    .content-grid {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 20px;
+    }
+
+    /* ===== Panel ===== */
+    .panel {
+      background: #fff;
+      border-radius: 12px;
+      padding: 20px 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.06);
+      border: 1px solid #e2e8f0;
+    }
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    .panel-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #0f172a;
+    }
+
+    /* ===== Transaction Search ===== */
+    .txn-search-row {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .txn-search-input {
+      flex: 1;
+      min-width: 180px;
+      height: 38px;
+      padding: 0 14px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-family: inherit;
+      outline: none;
+      background: #f8fafc;
+      color: #1a1d23;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .txn-search-input:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59,130,246,.12);
+    }
+    .txn-search-input::placeholder { color: #94a3b8; }
+    .txn-filter-select {
+      height: 38px;
+      padding: 0 12px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-family: inherit;
+      background: #f8fafc;
+      color: #1a1d23;
+      cursor: pointer;
+    }
+    .txn-search-btn {
+      height: 38px;
+      padding: 0 18px;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .txn-search-btn:hover { background: #1d4ed8; }
+
+    /* ===== Transaction Table ===== */
+    .txn-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+    .txn-table thead th {
+      text-align: left;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      padding: 8px 12px;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    .txn-table tbody tr {
+      cursor: pointer;
+      transition: background .1s;
+    }
+    .txn-table tbody tr:hover { background: #f1f5f9; }
+    .txn-table tbody td {
+      padding: 12px 12px;
+      font-size: 0.875rem;
+      color: #334155;
+      border-bottom: 1px solid #f1f5f9;
+      vertical-align: middle;
+    }
+    .txn-merchant {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .txn-icon {
+      width: 34px; height: 34px;
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.9rem;
+      flex-shrink: 0;
+    }
+    .txn-icon.debit { background: #fef2f2; color: #dc2626; }
+    .txn-icon.credit { background: #f0fdf4; color: #16a34a; }
+    .txn-merchant-name { font-weight: 600; color: #1e293b; }
+    .txn-merchant-cat { font-size: 0.75rem; color: #94a3b8; }
+    .txn-amount { font-weight: 600; white-space: nowrap; }
+    .txn-amount.debit { color: #dc2626; }
+    .txn-amount.credit { color: #16a34a; }
+    .txn-status {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    .txn-status.completed { background: #f0fdf4; color: #16a34a; }
+    .txn-status.pending { background: #fffbeb; color: #d97706; }
+
+    /* ===== Account Info ===== */
+    .info-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      padding: 8px 0;
+      border-bottom: 1px solid #f1f5f9;
+    }
+    .info-row:last-child { border-bottom: none; }
+    .info-label {
+      font-size: 0.78rem;
+      color: #64748b;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    .info-value {
+      font-size: 0.875rem;
+      color: #0f172a;
+      font-weight: 600;
+      text-align: right;
+    }
+
+    /* ===== Transaction Detail Modal ===== */
+    .txn-detail-overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(15,23,42,.5);
+      z-index: 200;
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none;
+      transition: opacity .2s;
+    }
+    .txn-detail-overlay.visible { opacity: 1; pointer-events: all; }
+    .txn-detail-panel {
+      background: #fff;
+      border-radius: 16px;
+      padding: 28px 32px;
+      width: 440px;
+      max-width: 92vw;
+      box-shadow: 0 20px 60px rgba(0,0,0,.2);
+    }
+    .txn-detail-panel h2 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #0f172a;
+      margin-bottom: 20px;
+    }
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #f1f5f9;
+      font-size: 0.875rem;
+    }
+    .detail-row:last-of-type { border-bottom: none; }
+    .detail-label { color: #64748b; font-weight: 500; }
+    .detail-value { color: #0f172a; font-weight: 600; text-align: right; }
+    .detail-close-btn {
+      margin-top: 20px;
+      width: 100%;
+      padding: 10px;
+      background: #f1f5f9;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      font-family: inherit;
+      color: #334155;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .detail-close-btn:hover { background: #e2e8f0; }
+
+    /* ===== Privacy Demo Panel ===== */
+    .privacy-panel {
+      margin-top: 20px;
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+      border-radius: 12px;
+      padding: 24px 28px;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+    }
+    .privacy-panel-title {
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: #38bdf8;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .privacy-panel-title::before {
+      content: '🔒';
+      font-size: 1rem;
+    }
+    .privacy-detected {
+      margin-bottom: 16px;
+    }
+    .privacy-detected-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      margin-bottom: 8px;
+    }
+    .privacy-tag {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      margin: 2px 3px 2px 0;
+      background: rgba(56,189,248,.12);
+      color: #38bdf8;
+      border: 1px solid rgba(56,189,248,.2);
+    }
+    .privacy-comparison {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .privacy-box {
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 0.78rem;
+      line-height: 1.7;
+      font-family: 'Courier New', monospace;
+    }
+    .privacy-box-label {
+      font-family: 'Inter', sans-serif;
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 8px;
+      display: block;
+    }
+    .privacy-box.raw {
+      background: rgba(220,38,38,.08);
+      border: 1px solid rgba(220,38,38,.2);
+    }
+    .privacy-box.raw .privacy-box-label { color: #f87171; }
+    .privacy-box.raw .pii-highlight { color: #fca5a5; background: rgba(220,38,38,.15); padding: 1px 4px; border-radius: 3px; }
+    .privacy-box.sanitized {
+      background: rgba(34,197,94,.08);
+      border: 1px solid rgba(34,197,94,.2);
+    }
+    .privacy-box.sanitized .privacy-box-label { color: #4ade80; }
+    .privacy-box.sanitized .redacted { color: #4ade80; font-weight: 700; }
+    .privacy-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.5rem;
+      color: #475569;
+      padding-top: 30px;
+    }
+
+    /* ===== Search Status ===== */
+    .search-status {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      margin-bottom: 12px;
+      display: none;
+    }
+    .search-status.visible { display: block; }
+    .search-status.info { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+    .search-status.success { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
+
+    /* ===== Footer ===== */
+    footer {
+      background: #0f172a;
+      color: #64748b;
+      padding: 20px 28px;
+      font-size: 0.78rem;
+      text-align: center;
+      margin-top: auto;
+    }
+    footer strong { color: #94a3b8; }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 1024px) {
+      .content-grid { grid-template-columns: 1fr; }
+      .account-cards { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .account-cards { grid-template-columns: 1fr; }
+      .privacy-comparison { grid-template-columns: 1fr; }
+      .privacy-arrow { transform: rotate(90deg); padding: 0; }
+    }
   </style>
 </head>
 <body>
 
+  <!-- ===== Header ===== -->
   <header role="banner">
-    <div class="logo">Nex<span>Mart</span></div>
-    <form class="search-bar" id="search-form" role="search" aria-label="Product search">
-      <input
-        id="search-input"
-        type="text"
-        name="q"
-        placeholder="Search for laptops, mobiles, tablets…"
-        aria-label="Search products"
-        autocomplete="off"
-        value=""
-      />
-      <button id="search-btn" type="submit" aria-label="Search">Search</button>
-    </form>
-    <nav class="header-nav" aria-label="Site navigation">
-      <a href="#" id="nav-home">Home</a>
-      <a href="#" id="nav-deals">Deals</a>
-      <a href="#" id="nav-cart">Cart (0)</a>
-      <a href="#" id="nav-login">Sign In</a>
-    </nav>
+    <div class="logo">
+      <div class="logo-icon" aria-hidden="true">N</div>
+      <div class="logo-text">Nex<span>Bank</span></div>
+    </div>
+    <div class="header-right">
+      <span class="header-greeting">Welcome back, <strong>Arjun</strong></span>
+      <button class="header-btn" type="button" aria-label="Notifications" title="Notifications">🔔</button>
+      <button class="profile-btn" type="button" aria-label="Profile menu" title="Arjun Reddy">AR</button>
+    </div>
   </header>
 
-  <div class="container">
-    <aside aria-label="Product filters">
-      <div class="filter-group">
-        <h3>Brand</h3>
-        <label><input type="checkbox" id="filter-hp" /> HP</label>
-        <label><input type="checkbox" id="filter-dell" /> Dell</label>
-        <label><input type="checkbox" id="filter-lenovo" /> Lenovo</label>
-        <label><input type="checkbox" id="filter-asus" /> Asus</label>
-        <label><input type="checkbox" id="filter-acer" /> Acer</label>
-      </div>
-      <div class="filter-group">
-        <h3>Price Range (&#x20B9;)</h3>
-        <div class="price-range">
-          <input type="number" id="price-min" placeholder="Min" value="20000" aria-label="Minimum price" />
-          <span>&#x2013;</span>
-          <input type="number" id="price-max" placeholder="Max" value="80000" aria-label="Maximum price" />
-        </div>
-        <button class="apply-filter" id="apply-filter-btn" type="button">Apply Filter</button>
-      </div>
-      <div class="filter-group">
-        <h3>RAM</h3>
-        <label><input type="checkbox" id="filter-8gb" /> 8 GB</label>
-        <label><input type="checkbox" id="filter-16gb" /> 16 GB</label>
-        <label><input type="checkbox" id="filter-32gb" /> 32 GB</label>
-      </div>
+  <div class="app-layout">
+
+    <!-- ===== Sidebar ===== -->
+    <aside class="sidebar" role="navigation" aria-label="Banking navigation">
+      <nav>
+        <a href="#" class="active" aria-current="page"><span class="sidebar-icon">📊</span> Dashboard</a>
+        <a href="#"><span class="sidebar-icon">🏦</span> Accounts</a>
+        <a href="#"><span class="sidebar-icon">📋</span> Transactions</a>
+        <a href="#"><span class="sidebar-icon">💸</span> Transfers</a>
+        <a href="#"><span class="sidebar-icon">💳</span> Cards</a>
+        <a href="#"><span class="sidebar-icon">📄</span> Statements</a>
+        <a href="#"><span class="sidebar-icon">👤</span> Profile</a>
+      </nav>
     </aside>
 
-    <main aria-label="Product listings">
-      <div class="results-header">
-        <span class="results-count" id="results-count">Showing 6 laptops</span>
-        <select id="sort-select" aria-label="Sort products by">
-          <option value="relevance">Sort: Relevance</option>
-          <option value="price-asc">Price: Low to High</option>
-          <option value="price-desc">Price: High to Low</option>
-          <option value="rating">Customer Rating</option>
-        </select>
-      </div>
+    <!-- ===== Main Content ===== -->
+    <main class="main-content" aria-label="Dashboard">
 
-      <div id="search-status" role="status" aria-live="polite"></div>
+      <h1 class="page-title">Dashboard</h1>
 
-      <div id="results-area" aria-label="Search results">
+      <!-- Account Summary Cards -->
+      <section class="account-cards" aria-label="Account summary">
+        <div class="account-card savings">
+          <div class="account-card-type">Savings Account</div>
+          <div class="account-card-balance">₹84,250.00</div>
+          <div class="account-card-label">XXXX XXXX 4821</div>
+        </div>
+        <div class="account-card current">
+          <div class="account-card-type">Current Account</div>
+          <div class="account-card-balance">₹32,600.00</div>
+          <div class="account-card-label">XXXX XXXX 7392</div>
+        </div>
+        <div class="account-card credit">
+          <div class="account-card-type">Credit Card</div>
+          <div class="account-card-balance">₹18,420.00</div>
+          <div class="account-card-label">Outstanding Balance</div>
+        </div>
+      </section>
 
-        <article class="product-card" data-price="44990" data-brand="HP">
-          <div class="product-img">&#x1F4BB;</div>
-          <div class="product-info">
-            <div class="product-brand">HP</div>
-            <div class="product-name">HP Pavilion 15 Core i5</div>
-            <div class="product-spec">Intel i5-1235U &middot; 16 GB &middot; 512 GB SSD &middot; 15.6&Prime; FHD</div>
-            <div>
-              <span class="product-price">&#x20B9;44,990</span>
-              <span class="product-price-original">&#x20B9;59,990</span>
-              <span class="product-discount">25% off</span>
-            </div>
-            <div class="product-actions">
-              <button class="btn-cart" type="button">Add to Cart</button>
-              <button class="btn-buy" type="button">Buy Now</button>
-            </div>
+      <div class="content-grid">
+
+        <!-- ===== Transactions Panel ===== -->
+        <section class="panel" aria-label="Recent transactions">
+          <div class="panel-header">
+            <h2 class="panel-title">Recent Transactions</h2>
           </div>
-        </article>
 
-        <article class="product-card" data-price="38490" data-brand="Lenovo">
-          <div class="product-img">&#x1F4BB;</div>
-          <div class="product-info">
-            <div class="product-brand">Lenovo</div>
-            <div class="product-name">Lenovo IdeaPad Slim 3</div>
-            <div class="product-spec">AMD Ryzen 5 &middot; 8 GB &middot; 512 GB SSD &middot; 15.6&Prime; FHD</div>
-            <div>
-              <span class="product-price">&#x20B9;38,490</span>
-              <span class="product-price-original">&#x20B9;49,990</span>
-              <span class="product-discount">23% off</span>
-            </div>
-            <div class="product-actions">
-              <button class="btn-cart" type="button">Add to Cart</button>
-              <button class="btn-buy" type="button">Buy Now</button>
-            </div>
-          </div>
-        </article>
+          <!-- Transaction Search/Filter Controls -->
+          <form class="txn-search-row" role="search" aria-label="Transaction search">
+            <input
+              type="text"
+              class="txn-search-input"
+              name="transaction_search"
+              placeholder="Search transactions…"
+              aria-label="Search transactions"
+              autocomplete="off"
+            />
+            <select class="txn-filter-select" aria-label="Filter by category">
+              <option value="all">All Categories</option>
+              <option value="shopping">Shopping</option>
+              <option value="food">Food & Dining</option>
+              <option value="salary">Salary</option>
+              <option value="entertainment">Entertainment</option>
+              <option value="utilities">Utilities</option>
+            </select>
+            <select class="txn-filter-select" aria-label="Filter by date range">
+              <option value="7d">Last 7 Days</option>
+              <option value="30d" selected>Last 30 Days</option>
+              <option value="90d">Last 90 Days</option>
+              <option value="all">All Time</option>
+            </select>
+            <button type="submit" class="txn-search-btn" aria-label="Search transactions">Search</button>
+          </form>
 
-        <article class="product-card" data-price="46999" data-brand="Asus">
-          <div class="product-img">&#x1F4BB;</div>
-          <div class="product-info">
-            <div class="product-brand">Asus</div>
-            <div class="product-name">Asus VivoBook 15 OLED</div>
-            <div class="product-spec">Intel i5-12500H &middot; 16 GB &middot; 512 GB SSD &middot; 15.6&Prime; OLED</div>
-            <div>
-              <span class="product-price">&#x20B9;46,999</span>
-              <span class="product-price-original">&#x20B9;64,990</span>
-              <span class="product-discount">28% off</span>
-            </div>
-            <div class="product-actions">
-              <button class="btn-cart" type="button">Add to Cart</button>
-              <button class="btn-buy" type="button">Buy Now</button>
-            </div>
-          </div>
-        </article>
+          <div class="search-status" role="status" aria-live="polite"></div>
 
-        <article class="product-card" data-price="74990" data-brand="Dell">
-          <div class="product-img">&#x1F4BB;</div>
-          <div class="product-info">
-            <div class="product-brand">Dell</div>
-            <div class="product-name">Dell Inspiron 15 Plus</div>
-            <div class="product-spec">Intel i7-12700H &middot; 16 GB &middot; 1 TB SSD &middot; 15.6&Prime; QHD</div>
-            <div>
-              <span class="product-price">&#x20B9;74,990</span>
-              <span class="product-price-original">&#x20B9;89,990</span>
-              <span class="product-discount">17% off</span>
-            </div>
-            <div class="product-actions">
-              <button class="btn-cart" type="button">Add to Cart</button>
-              <button class="btn-buy" type="button">Buy Now</button>
-            </div>
-          </div>
-        </article>
+          <!-- Transaction Table -->
+          <table class="txn-table" aria-label="Transaction list">
+            <thead>
+              <tr>
+                <th scope="col">Merchant</th>
+                <th scope="col">Amount</th>
+                <th scope="col">Date</th>
+                <th scope="col">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr data-txn="txn-001" data-merchant="Amazon" data-category="shopping" data-amount="-4299" data-date="2026-09-30" tabindex="0" role="row" aria-label="Amazon, minus 4,299 rupees, 30 September 2026">
+                <td>
+                  <div class="txn-merchant">
+                    <div class="txn-icon debit">🛒</div>
+                    <div>
+                      <div class="txn-merchant-name">Amazon</div>
+                      <div class="txn-merchant-cat">Shopping</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="txn-amount debit">−₹4,299</span></td>
+                <td>30 Sep 2026</td>
+                <td><span class="txn-status completed">Completed</span></td>
+              </tr>
+              <tr data-txn="txn-002" data-merchant="Swiggy" data-category="food" data-amount="-642" data-date="2026-09-29" tabindex="0" role="row" aria-label="Swiggy, minus 642 rupees, 29 September 2026">
+                <td>
+                  <div class="txn-merchant">
+                    <div class="txn-icon debit">🍔</div>
+                    <div>
+                      <div class="txn-merchant-name">Swiggy</div>
+                      <div class="txn-merchant-cat">Food &amp; Dining</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="txn-amount debit">−₹642</span></td>
+                <td>29 Sep 2026</td>
+                <td><span class="txn-status completed">Completed</span></td>
+              </tr>
+              <tr data-txn="txn-003" data-merchant="Salary Credit" data-category="salary" data-amount="75000" data-date="2026-09-28" tabindex="0" role="row" aria-label="Salary Credit, plus 75,000 rupees, 28 September 2026">
+                <td>
+                  <div class="txn-merchant">
+                    <div class="txn-icon credit">💰</div>
+                    <div>
+                      <div class="txn-merchant-name">Salary Credit</div>
+                      <div class="txn-merchant-cat">Income</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="txn-amount credit">+₹75,000</span></td>
+                <td>28 Sep 2026</td>
+                <td><span class="txn-status completed">Completed</span></td>
+              </tr>
+              <tr data-txn="txn-004" data-merchant="Netflix" data-category="entertainment" data-amount="-649" data-date="2026-09-27" tabindex="0" role="row" aria-label="Netflix, minus 649 rupees, 27 September 2026">
+                <td>
+                  <div class="txn-merchant">
+                    <div class="txn-icon debit">🎬</div>
+                    <div>
+                      <div class="txn-merchant-name">Netflix</div>
+                      <div class="txn-merchant-cat">Entertainment</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="txn-amount debit">−₹649</span></td>
+                <td>27 Sep 2026</td>
+                <td><span class="txn-status completed">Completed</span></td>
+              </tr>
+              <tr data-txn="txn-005" data-merchant="Electricity Bill" data-category="utilities" data-amount="-2180" data-date="2026-09-26" tabindex="0" role="row" aria-label="Electricity Bill, minus 2,180 rupees, 26 September 2026">
+                <td>
+                  <div class="txn-merchant">
+                    <div class="txn-icon debit">⚡</div>
+                    <div>
+                      <div class="txn-merchant-name">Electricity Bill</div>
+                      <div class="txn-merchant-cat">Utilities</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="txn-amount debit">−₹2,180</span></td>
+                <td>26 Sep 2026</td>
+                <td><span class="txn-status completed">Completed</span></td>
+              </tr>
+              <tr data-txn="txn-006" data-merchant="Flipkart" data-category="shopping" data-amount="-1599" data-date="2026-09-25" tabindex="0" role="row" aria-label="Flipkart, minus 1,599 rupees, 25 September 2026">
+                <td>
+                  <div class="txn-merchant">
+                    <div class="txn-icon debit">🛍️</div>
+                    <div>
+                      <div class="txn-merchant-name">Flipkart</div>
+                      <div class="txn-merchant-cat">Shopping</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="txn-amount debit">−₹1,599</span></td>
+                <td>25 Sep 2026</td>
+                <td><span class="txn-status completed">Completed</span></td>
+              </tr>
+              <tr data-txn="txn-007" data-merchant="Uber" data-category="transport" data-amount="-385" data-date="2026-09-24" tabindex="0" role="row" aria-label="Uber, minus 385 rupees, 24 September 2026">
+                <td>
+                  <div class="txn-merchant">
+                    <div class="txn-icon debit">🚗</div>
+                    <div>
+                      <div class="txn-merchant-name">Uber</div>
+                      <div class="txn-merchant-cat">Transport</div>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="txn-amount debit">−₹385</span></td>
+                <td>24 Sep 2026</td>
+                <td><span class="txn-status completed">Completed</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
 
-        <article class="product-card" data-price="29990" data-brand="Acer">
-          <div class="product-img">&#x1F4BB;</div>
-          <div class="product-info">
-            <div class="product-brand">Acer</div>
-            <div class="product-name">Acer Aspire Lite</div>
-            <div class="product-spec">AMD Ryzen 3 &middot; 8 GB &middot; 256 GB SSD &middot; 14&Prime; FHD</div>
-            <div>
-              <span class="product-price">&#x20B9;29,990</span>
-              <span class="product-price-original">&#x20B9;39,990</span>
-              <span class="product-discount">25% off</span>
+        <!-- ===== Account Info Sidebar ===== -->
+        <aside aria-label="Account details">
+          <section class="panel" aria-label="Account information">
+            <h2 class="panel-title" style="margin-bottom:16px;">Account Information</h2>
+            <div class="info-grid">
+              <div class="info-row">
+                <span class="info-label">Customer Name</span>
+                <span class="info-value">Arjun Reddy</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Phone</span>
+                <span class="info-value">+91 98765 43210</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Email</span>
+                <span class="info-value">arjun.reddy@example.com</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Account Number</span>
+                <span class="info-value">XXXX XXXX 4821</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">IFSC</span>
+                <span class="info-value">NEXB0001234</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Customer ID</span>
+                <span class="info-value">NB-CUST-847291</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Address</span>
+                <span class="info-value">12 Example Residency,<br/>Hyderabad, Telangana</span>
+              </div>
             </div>
-            <div class="product-actions">
-              <button class="btn-cart" type="button">Add to Cart</button>
-              <button class="btn-buy" type="button">Buy Now</button>
-            </div>
-          </div>
-        </article>
+          </section>
 
-        <article class="product-card" data-price="89999" data-brand="HP">
-          <div class="product-img">&#x1F4BB;</div>
-          <div class="product-info">
-            <div class="product-brand">HP</div>
-            <div class="product-name">HP Spectre x360 13</div>
-            <div class="product-spec">Intel i7-1255U &middot; 16 GB &middot; 1 TB SSD &middot; 13.5&Prime; OLED Touch</div>
-            <div>
-              <span class="product-price">&#x20B9;89,999</span>
-              <span class="product-price-original">&#x20B9;1,09,990</span>
-              <span class="product-discount">18% off</span>
+          <!-- ===== Privacy Demo Visualization ===== -->
+          <section class="privacy-panel" aria-label="NexVision local privacy boundary demonstration">
+            <div class="privacy-panel-title">Local Privacy Boundary</div>
+
+            <div class="privacy-detected">
+              <div class="privacy-detected-title">Detected Sensitive Information (Demo Visualization)</div>
+              <span class="privacy-tag">✓ Phone Number</span>
+              <span class="privacy-tag">✓ Email Address</span>
+              <span class="privacy-tag">✓ Account Number</span>
+              <span class="privacy-tag">✓ IFSC Code</span>
+              <span class="privacy-tag">✓ Customer ID</span>
+              <span class="privacy-tag">✓ Address</span>
             </div>
-            <div class="product-actions">
-              <button class="btn-cart" type="button">Add to Cart</button>
-              <button class="btn-buy" type="button">Buy Now</button>
+
+            <div class="privacy-comparison">
+              <div class="privacy-box raw">
+                <span class="privacy-box-label">Raw Page</span>
+                Arjun Reddy<br/>
+                <span class="pii-highlight">+91 98765 43210</span><br/>
+                <span class="pii-highlight">arjun.reddy@example.com</span><br/>
+                <span class="pii-highlight">XXXX XXXX 4821</span><br/>
+                <span class="pii-highlight">NEXB0001234</span><br/>
+                <span class="pii-highlight">Hyderabad, Telangana</span>
+              </div>
+              <div class="privacy-arrow" aria-hidden="true">→</div>
+              <div class="privacy-box sanitized">
+                <span class="privacy-box-label">Sanitized AI Input</span>
+                Arjun Reddy<br/>
+                <span class="redacted">[REDACTED_PHONE]</span><br/>
+                <span class="redacted">[REDACTED_EMAIL]</span><br/>
+                <span class="redacted">[REDACTED]</span><br/>
+                <span class="redacted">[REDACTED]</span><br/>
+                <span class="redacted">[REDACTED_ADDRESS]</span>
+              </div>
             </div>
-          </div>
-        </article>
+          </section>
+        </aside>
 
       </div>
     </main>
   </div>
 
-  <!-- Footer: synthetic support contact demonstrates privacy boundary -->
-  <footer role="contentinfo">
-    <div class="footer-inner">
-      <div>
-        <h4>NexMart</h4>
-        <a href="#">About Us</a>
-        <a href="#">Careers</a>
-        <!-- Harmless synthetic values for privacy engine demo: -->
-        <div class="support-info">Support: support@nexmart-demo.local</div>
-        <div class="support-info">Helpline: +91-98765-43210 (synthetic)</div>
+  <!-- ===== Transaction Detail Modal ===== -->
+  <div class="txn-detail-overlay" role="dialog" aria-modal="true" aria-label="Transaction details">
+    <div class="txn-detail-panel">
+      <h2>Transaction Details</h2>
+      <div class="detail-row">
+        <span class="detail-label">Merchant</span>
+        <span class="detail-value" data-detail="merchant">—</span>
       </div>
-      <div>
-        <h4>Help</h4>
-        <a href="#">Track Order</a>
-        <a href="#">Returns &amp; Refunds</a>
-        <a href="#">FAQs</a>
+      <div class="detail-row">
+        <span class="detail-label">Amount</span>
+        <span class="detail-value" data-detail="amount">—</span>
       </div>
-      <div>
-        <h4>Categories</h4>
-        <a href="#" id="cat-laptops">Laptops</a>
-        <a href="#" id="cat-mobiles">Mobiles</a>
-        <a href="#" id="cat-tablets">Tablets</a>
-        <a href="#" id="cat-accessories">Accessories</a>
+      <div class="detail-row">
+        <span class="detail-label">Date</span>
+        <span class="detail-value" data-detail="date">—</span>
       </div>
+      <div class="detail-row">
+        <span class="detail-label">Transaction ID</span>
+        <span class="detail-value" data-detail="txnId">—</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Account</span>
+        <span class="detail-value" data-detail="account">—</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Status</span>
+        <span class="detail-value" data-detail="status">—</span>
+      </div>
+      <button class="detail-close-btn" type="button" aria-label="Close transaction details">Close</button>
     </div>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer role="contentinfo">
+    <strong>NexBank</strong> — Fictional demonstration surface for NexVision (SIH 2026). All data is synthetic. No real financial services are connected.
   </footer>
 
   <script>
-    const form = document.getElementById('search-form');
-    const input = document.getElementById('search-input');
-    const statusEl = document.getElementById('search-status');
-    const countEl = document.getElementById('results-count');
-    const cards = Array.from(document.querySelectorAll('.product-card'));
+    // ===== Transaction Data (Synthetic) =====
+    const TRANSACTIONS = {
+      'txn-001': { merchant: 'Amazon', amount: '−₹4,299', date: '30 Sep 2026', txnId: 'TXN-928374', account: 'XXXX XXXX 4821', status: 'Completed', category: 'shopping' },
+      'txn-002': { merchant: 'Swiggy', amount: '−₹642', date: '29 Sep 2026', txnId: 'TXN-837261', account: 'XXXX XXXX 4821', status: 'Completed', category: 'food' },
+      'txn-003': { merchant: 'Salary Credit', amount: '+₹75,000', date: '28 Sep 2026', txnId: 'TXN-746150', account: 'XXXX XXXX 4821', status: 'Completed', category: 'salary' },
+      'txn-004': { merchant: 'Netflix', amount: '−₹649', date: '27 Sep 2026', txnId: 'TXN-655039', account: 'XXXX XXXX 4821', status: 'Completed', category: 'entertainment' },
+      'txn-005': { merchant: 'Electricity Bill', amount: '−₹2,180', date: '26 Sep 2026', txnId: 'TXN-563928', account: 'XXXX XXXX 4821', status: 'Completed', category: 'utilities' },
+      'txn-006': { merchant: 'Flipkart', amount: '−₹1,599', date: '25 Sep 2026', txnId: 'TXN-472817', account: 'XXXX XXXX 4821', status: 'Completed', category: 'shopping' },
+      'txn-007': { merchant: 'Uber', amount: '−₹385', date: '24 Sep 2026', txnId: 'TXN-381706', account: 'XXXX XXXX 4821', status: 'Completed', category: 'transport' }
+    };
 
-    form.addEventListener('submit', function(e) {
+    // ===== Transaction Search =====
+    const searchForm = document.querySelector('[aria-label="Transaction search"]');
+    const searchInput = document.querySelector('[name="transaction_search"]');
+    const categoryFilter = document.querySelector('[aria-label="Filter by category"]');
+    const statusEl = document.querySelector('.search-status');
+    const txnRows = document.querySelectorAll('.txn-table tbody tr');
+
+    searchForm.addEventListener('submit', function(e) {
       e.preventDefault();
-      const query = input.value.trim().toLowerCase();
-      if (!query) return;
+      filterTransactions();
+    });
 
-      var visible = 0;
-      var wantUnder50k = query.includes('50000') || query.includes('50,000') || query.includes('50 000');
+    categoryFilter.addEventListener('change', function() {
+      filterTransactions();
+    });
 
-      cards.forEach(function(card) {
-        const text = card.textContent.toLowerCase();
-        const matchesQuery = text.includes(query.split(' ')[0]) || query.includes('laptop');
-        const price = parseInt(card.getAttribute('data-price') || '0', 10);
-        const passesPrice = !wantUnder50k || price <= 50000;
-        const show = matchesQuery && passesPrice;
-        card.style.display = show ? '' : 'none';
+    function filterTransactions() {
+      const query = searchInput.value.trim().toLowerCase();
+      const category = categoryFilter.value;
+      let visible = 0;
+
+      txnRows.forEach(function(row) {
+        const merchant = (row.getAttribute('data-merchant') || '').toLowerCase();
+        const rowCategory = row.getAttribute('data-category') || '';
+        const matchesQuery = !query || merchant.includes(query);
+        const matchesCategory = category === 'all' || rowCategory === category;
+        const show = matchesQuery && matchesCategory;
+        row.style.display = show ? '' : 'none';
         if (show) visible++;
       });
 
-      statusEl.textContent = 'Showing ' + visible + ' results for "' + input.value.trim() + '"';
-      statusEl.className = 'visible success';
-      countEl.textContent = 'Showing ' + visible + ' laptops';
+      if (query || category !== 'all') {
+        var label = 'Showing ' + visible + ' transaction' + (visible !== 1 ? 's' : '');
+        if (query) label += ' for "' + searchInput.value.trim() + '"';
+        statusEl.textContent = label;
+        statusEl.className = 'search-status visible success';
+      } else {
+        statusEl.className = 'search-status';
+      }
+    }
+
+    // ===== Transaction Detail Modal =====
+    const overlay = document.querySelector('.txn-detail-overlay');
+    const closeBtn = document.querySelector('.detail-close-btn');
+
+    txnRows.forEach(function(row) {
+      row.addEventListener('click', function() {
+        openTransactionDetail(row.getAttribute('data-txn'));
+      });
+      row.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          openTransactionDetail(row.getAttribute('data-txn'));
+        }
+      });
     });
 
-    document.getElementById('apply-filter-btn').addEventListener('click', function() {
-      var maxPrice = parseInt(document.getElementById('price-max').value || '999999', 10);
-      var minPrice = parseInt(document.getElementById('price-min').value || '0', 10);
-      var visible = 0;
-      cards.forEach(function(card) {
-        var price = parseInt(card.getAttribute('data-price') || '0', 10);
-        var inRange = price >= minPrice && price <= maxPrice;
-        card.style.display = inRange ? '' : 'none';
-        if (inRange) visible++;
-      });
-      countEl.textContent = 'Showing ' + visible + ' laptops';
+    function openTransactionDetail(txnKey) {
+      const txn = TRANSACTIONS[txnKey];
+      if (!txn) return;
+
+      overlay.querySelector('[data-detail="merchant"]').textContent = txn.merchant;
+      overlay.querySelector('[data-detail="amount"]').textContent = txn.amount;
+      overlay.querySelector('[data-detail="date"]').textContent = txn.date;
+      overlay.querySelector('[data-detail="txnId"]').textContent = txn.txnId;
+      overlay.querySelector('[data-detail="account"]').textContent = txn.account;
+      overlay.querySelector('[data-detail="status"]').textContent = txn.status;
+      overlay.classList.add('visible');
+    }
+
+    closeBtn.addEventListener('click', function() {
+      overlay.classList.remove('visible');
+    });
+
+    overlay.addEventListener('click', function(e) {
+      if (e.target === overlay) {
+        overlay.classList.remove('visible');
+      }
+    });
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && overlay.classList.contains('visible')) {
+        overlay.classList.remove('visible');
+      }
     });
   </script>
 </body>

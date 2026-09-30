@@ -21,24 +21,44 @@ import type { PageElement } from '../shared/types.js';
 import {
   type AdvisoryProposalResult,
   type AdvisoryStepProposal,
+  type PhaseExecutionState,
+  type PhaseIntent,
   type PlannerDriver,
   type PlannerInput,
   type PlannerResult,
-  planNextStep
+  type SafeModelHistoryStep,
+  type TaskArchetype,
+  type TaskFieldParameter,
+  type TaskPhase,
+  type TaskPlan,
+  validateTaskPlan,
+  resolveActivePhase,
+  planNextStep,
+  isMediaContentGoal,
+  isProfileOrChannelCandidate,
+  isMediaContentCandidate
 } from '../shared/planner.js';
 
 import { stripMarkdownFences } from './llamaVisionAdapter.js';
 import { redactText, sanitizeUrl, REDACTION_TOKENS } from '../privacy/index.js';
+import { resolveRelativeDate } from '../shared/temporal.js';
 
 // Re-export authoritative planner contracts for consumers
 export type {
   AdvisoryProposalResult,
   AdvisoryStepProposal,
+  PhaseExecutionState,
+  PhaseIntent,
   PlannerDriver,
   PlannerInput,
-  PlannerResult
+  PlannerResult,
+  SafeModelHistoryStep,
+  TaskArchetype,
+  TaskFieldParameter,
+  TaskPhase,
+  TaskPlan
 };
-export { planNextStep };
+export { planNextStep, resolveActivePhase };
 
 // ---------------------------------------------------------------------------
 // 1. Allowlisted Model-Facing DTO (Privacy Boundary)
@@ -53,9 +73,14 @@ export interface ModelCandidateTarget {
   readonly role?: string;
   readonly accessibleName?: string;
   readonly visibleText?: string;
+  readonly placeholder?: string;
+  readonly attributes?: Record<string, string>;
+  readonly interactive?: boolean;
   readonly confidence: number;
   /** Whether the element currently has focus (propagated from PageElement.state.focused). */
   readonly focused?: boolean;
+  /** Whether the element has an href or is an anchor tag representing a navigation destination. */
+  readonly hasHref?: boolean;
   readonly bounds?: {
     readonly x: number;
     readonly y: number;
@@ -96,12 +121,41 @@ export interface ModelPromptPayload {
     readonly intent?: string;
     readonly targetHint?: string;
     readonly parameters?: Record<string, string>;
+    readonly taskPlan?: TaskPlan;
   };
+  /** Conceptual overall user goal when taskPlan is present */
+  readonly overallGoal?: string;
+  /** Structured active-phase context instructing the model on the current objective */
+  readonly currentPhase?: {
+    readonly index: number;
+    readonly intent: PhaseIntent;
+    readonly objective: string;
+    readonly targetHint?: string;
+    readonly allowedActions?: readonly ActionType[];
+    readonly field?: {
+      readonly fieldName: string;
+      readonly targetValue?: string;
+      readonly rawTargetValue?: string;
+    };
+  };
+  /** High-level progress: summary of previously completed phases */
+  readonly completedPhases?: readonly {
+    readonly index: number;
+    readonly intent: PhaseIntent;
+    readonly description: string;
+  }[];
+  /** High-level progress: summary of upcoming phases */
+  readonly remainingPhases?: readonly {
+    readonly index: number;
+    readonly intent: PhaseIntent;
+    readonly description: string;
+  }[];
   readonly page: ModelPageContext;
   readonly availableTargets: readonly ModelCandidateTarget[];
   readonly stepIndex?: number;
   /** Structural action history for the current goal. No typed text is included. */
-  readonly history?: readonly ModelHistoryStep[];
+  readonly history?: readonly (ModelHistoryStep | SafeModelHistoryStep)[];
+  readonly phaseState?: PhaseExecutionState;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,9 +174,9 @@ export const MAX_MODEL_CANDIDATES = 20;
 
 /**
  * Roles that are most likely to be the primary target for common tasks.
- * Listed in descending priority order.
+ * Listed in descending priority order. Preserved as the backward-compatible baseline.
  */
-const SEARCH_ROLE_PRIORITY: ReadonlyMap<string, number> = new Map([
+export const SEARCH_ROLE_PRIORITY: ReadonlyMap<string, number> = new Map([
   ['searchbox', 10],
   ['textbox', 9],
   ['combobox', 8],
@@ -135,32 +189,366 @@ const SEARCH_ROLE_PRIORITY: ReadonlyMap<string, number> = new Map([
 ]);
 
 /**
- * Returns a relevance score for a candidate in the context of a goal description.
+ * Returns role priority conditioned on the active PhaseIntent.
+ * When intent is undefined or 'custom', falls back to SEARCH_ROLE_PRIORITY for 100% backward compatibility.
+ */
+export function getPhaseRolePriority(
+  intent: PhaseIntent | undefined,
+  role: string | undefined
+): number {
+  const normalizedRole = (role ?? '').toLowerCase();
+  if (!intent || intent === 'custom') {
+    return SEARCH_ROLE_PRIORITY.get(normalizedRole) ?? 0;
+  }
+
+  switch (intent) {
+    case 'open_surface':
+      // Open a creation interface, modal, drawer, menu, dialog
+      // Prefer buttons, button-like controls, and links
+      // Suppress searchboxes and generic text inputs
+      switch (normalizedRole) {
+        case 'button': return 10;
+        case 'link': return 6;
+        case 'menuitem': return 8;
+        case 'tab': return 7;
+        case 'combobox': return 2;
+        case 'searchbox': return 1;
+        case 'textbox': return 1;
+        default: return 2;
+      }
+
+    case 'fill_field':
+      // Fill a specific field
+      // Prefer textboxes, textareas, comboboxes
+      // Strongly suppress global searchbox unless field itself is search
+      switch (normalizedRole) {
+        case 'textbox': return 10;
+        case 'combobox': return 8;
+        case 'searchbox': return 2; // Strongly suppressed
+        case 'button': return 3;
+        case 'checkbox': return 4;
+        case 'radio': return 4;
+        case 'link': return 2;
+        default: return 2;
+      }
+
+    case 'select_option':
+      // Select an option from dropdown, picker, or radio group
+      // Prefer select, combobox, radio, checkbox, option
+      switch (normalizedRole) {
+        case 'select': return 10;
+        case 'combobox': return 10;
+        case 'option': return 9;
+        case 'radio': return 9;
+        case 'checkbox': return 8;
+        case 'button': return 5;
+        case 'textbox': return 2;
+        case 'searchbox': return 1;
+        default: return 2;
+      }
+
+    case 'submit':
+      // Primary form action controls
+      // Prefer buttons
+      switch (normalizedRole) {
+        case 'button': return 10;
+        case 'link': return 4;
+        case 'textbox': return 1;
+        case 'searchbox': return 1;
+        default: return 2;
+      }
+
+    case 'select_result':
+      // Pick a search result or destination item
+      // Prefer links and destination-bearing controls
+      switch (normalizedRole) {
+        case 'link': return 10;
+        case 'button': return 5;
+        case 'searchbox': return 1;
+        case 'textbox': return 1;
+        case 'combobox': return 1;
+        case 'listbox': return 1;
+        case 'option': return 1;
+        default: return 2;
+      }
+
+    case 'search':
+      // The ONLY phase where searchbox remains strongly preferred
+      switch (normalizedRole) {
+        case 'searchbox': return 10;
+        case 'textbox': return 8;
+        case 'combobox': return 7;
+        case 'button': return 6;
+        case 'link': return 3;
+        case 'option': return 1;
+        case 'menuitem': return 1;
+        case 'listbox': return 1;
+        default: return 2;
+      }
+
+    case 'navigate':
+      // Navigation controls
+      switch (normalizedRole) {
+        case 'link': return 10;
+        case 'button': return 7;
+        case 'tab': return 7;
+        case 'menuitem': return 7;
+        case 'searchbox': return 1;
+        case 'textbox': return 1;
+        default: return 2;
+      }
+
+    case 'verify_outcome':
+      // Neutral baseline
+      return 5;
+
+    default:
+      return SEARCH_ROLE_PRIORITY.get(normalizedRole) ?? 0;
+  }
+}
+
+/**
+ * Returns a relevance score for a candidate in the context of a goal description and active phase.
  * Higher is more relevant. Pure function: no side-effects, no privacy data emitted.
  *
  * Scoring:
- * - Role priority bonus  (0–10)
- * - Goal-keyword match in label (+5 per match, capped)
- * - accessibleName presence bonus (+2)
+ * 1. Base role priority: phase-conditioned via `getPhaseRolePriority()` (or `SEARCH_ROLE_PRIORITY` if no phase).
+ * 2. Field name match: when activePhase.fieldParameter exists, substantial bonus (+16) for matching candidate label.
+ * 3. Target hint match: when activePhase.targetHint exists, substantial bonus (+12) for matching candidate label.
+ * 4. Phase semantic adjustments:
+ *    - open_surface: +10 for semantic creation verbs; searchbox and unrelated textboxes suppressed (-15).
+ *    - fill_field: searchbox suppressed (-18) unless field is search; matching fieldName preferred over generic keywords.
+ *    - select_option: +6 for controls matching option roles; textboxes/searchboxes suppressed (-18).
+ *    - submit: +10 for form submission verbs; searchboxes/textboxes suppressed (-18); unrelated navigation suppressed (-10).
+ *    - select_result: +8 for destination-bearing links/anchors; searchbox suppressed (-18); decorative buttons depressed (-4).
+ *    - search: searchbox is strongly preferred (+8 bonus).
+ *    - navigate: +6 for links matching destination; searchbox suppressed (-15).
+ *    - verify_outcome: neutral baseline.
+ * 5. Goal keyword match: (+5 per match, capped at 15).
+ * 6. accessibleName presence bonus (+2).
+ * 7. Post-search click bonus (+8 for links with keyword matches) preserved for backward compatibility.
  */
-function scoreCandidateRelevance(
+export function scoreCandidateRelevance(
   role: string | undefined,
   accessibleName: string | undefined,
   visibleText: string | undefined,
-  goalKeywords: readonly string[]
+  goalKeywords: readonly string[],
+  isPostSearchClick: boolean = false,
+  hasHref: boolean = false,
+  activePhase?: TaskPhase,
+  candidateContext?: { placeholder?: string; attributes?: Record<string, string> }
 ): number {
-  let score = SEARCH_ROLE_PRIORITY.get(role ?? '') ?? 0;
+  const normalizedRole = (role ?? '').toLowerCase();
+  const attrRole = (candidateContext?.attributes?.['role'] ?? '').toLowerCase();
+  const inputType = (candidateContext?.attributes?.['type'] ?? '').toLowerCase();
+  const hasAriaAutocomplete = candidateContext?.attributes?.['aria-autocomplete'] !== undefined;
+  const labelParts = [
+    accessibleName ?? '',
+    visibleText ?? '',
+    candidateContext?.placeholder ?? '',
+    candidateContext?.attributes?.['aria-label'] ?? '',
+    candidateContext?.attributes?.['name'] ?? '',
+    candidateContext?.attributes?.['title'] ?? ''
+  ];
+  const labelText = labelParts.filter(Boolean).join(' ').toLowerCase();
+  const isSearchControl =
+    normalizedRole === 'searchbox' ||
+    inputType === 'search' ||
+    (labelText.includes('search') && (normalizedRole === 'textbox' || normalizedRole === 'combobox' || normalizedRole === 'input')) ||
+    (hasAriaAutocomplete && (normalizedRole === 'combobox' || normalizedRole === 'textbox'));
+
+  const isSuggestionCandidate =
+    normalizedRole === 'option' ||
+    normalizedRole === 'menuitem' ||
+    normalizedRole === 'listbox' ||
+    attrRole === 'option' ||
+    attrRole === 'menuitem' ||
+    attrRole === 'listbox';
+
+  let score = getPhaseRolePriority(activePhase?.intent, role);
+
+  // In post-search click phase (or when intent is select_result), navigation destination candidates
+  // receive higher base priority than generic buttons.
+  const isResultSelection = activePhase?.intent === 'select_result' || isPostSearchClick;
+  if (isResultSelection && (role === 'link' || hasHref)) {
+    score = Math.max(score, 10);
+  }
 
   if (accessibleName !== undefined) score += 2;
 
-  const labelText = ((accessibleName ?? '') + ' ' + (visibleText ?? '')).toLowerCase();
+  // Keyword hits from goal
   let keywordHits = 0;
-  for (const kw of goalKeywords) {
-    if (kw.length > 2 && labelText.includes(kw)) {
-      keywordHits++;
+  // During search phase, suppress keyword bonus for autocomplete suggestions so they do NOT
+  // outrank or compete with the actual search input merely because they contain query keywords.
+  const isSearchPhase = activePhase?.intent === 'search';
+  const shouldScoreKeywords = !(isSearchPhase && isSuggestionCandidate);
+
+  if (shouldScoreKeywords) {
+    for (const kw of goalKeywords) {
+      if (kw.length > 2 && labelText.includes(kw)) {
+        keywordHits++;
+      }
     }
   }
   score += Math.min(keywordHits * 5, 15);
+
+  // Post-search click destination bonus
+  if (isResultSelection && (role === 'link' || hasHref) && keywordHits > 0) {
+    score += 8;
+  }
+
+  // Phase-aware media content vs profile/channel distinction
+  if (isResultSelection) {
+    const candidateElement: PageElement = {
+      id: 'candidate',
+      role: (role as any) ?? undefined,
+      accessibleName,
+      visibleText,
+      attributes: candidateContext?.attributes ?? (hasHref ? { href: '#' } : undefined)
+    };
+    const isMedia =
+      isMediaContentGoal(activePhase?.description, activePhase?.targetHint) ||
+      goalKeywords.some(k => ['play', 'watch', 'video', 'stream', 'listen'].includes(k.toLowerCase()));
+    if (isMedia) {
+      if (isMediaContentCandidate(candidateElement)) {
+        score += 25; // Strongly prefer content items for play/watch goals
+      } else if (isProfileOrChannelCandidate(candidateElement)) {
+        score -= 30; // Strongly penalize profile/channel links when media content requested
+      }
+    }
+  }
+
+  // --- Phase-Conditioned Semantic Adjustments ---
+  if (activePhase) {
+    const intent = activePhase.intent;
+    const targetHint = activePhase.targetHint?.toLowerCase().trim();
+    const fieldParam = activePhase.fieldParameter;
+    const fieldName = fieldParam?.fieldName?.toLowerCase().trim();
+    const targetValue = fieldParam?.targetValue?.toLowerCase().trim();
+
+    // 1. Target hint matching
+    const matchesTargetHint = Boolean(targetHint && targetHint.length > 1 && labelText.includes(targetHint));
+    if (matchesTargetHint) {
+      score += 12;
+    }
+
+    // 2. Field parameter matching
+    if (fieldName && fieldName.length > 1) {
+      if (labelText.includes(fieldName)) {
+        score += 16;
+      } else {
+        const fieldTokens = fieldName.split(/[\s_-]+/).filter(t => t.length > 1);
+        const matchesToken = fieldTokens.some(t => labelText.includes(t));
+        if (matchesToken) {
+          score += 10;
+        }
+      }
+    }
+
+    // Safe targetValue matching (only if targetValue is non-empty and passes privacy check)
+    if (targetValue && targetValue.length > 2 && isSafeTypeActionText(targetValue)) {
+      if (labelText.includes(targetValue)) {
+        score += 4;
+      }
+    }
+
+    // 3. Intent-specific adjustments
+    switch (intent) {
+      case 'open_surface': {
+        const isOpenSemantic = /\b(?:create|add|new|open|settings|start|compose|launch)\b/.test(labelText);
+        if (isOpenSemantic && (role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab')) {
+          score += 10;
+        }
+        if (isSearchControl) {
+          score -= 15; // Strongly suppress global searchbox
+        } else if (normalizedRole === 'textbox') {
+          score -= 15; // Suppress unrelated textboxes
+        }
+        // Suppress generic content links that don't match targetHint or open semantic terms
+        if ((role === 'link' || hasHref) && !isOpenSemantic && !matchesTargetHint) {
+          score -= 6;
+        }
+        break;
+      }
+
+      case 'fill_field': {
+        const isSearchField = fieldName ? (fieldName.includes('search') || fieldName.includes('query')) : false;
+        if (isSearchControl && !isSearchField) {
+          score -= 18; // Strongly suppress global searchbox when filling non-search fields
+        }
+        if (normalizedRole === 'button' && !matchesTargetHint) {
+          score -= 5; // Suppress buttons when looking to fill a field
+        }
+        break;
+      }
+
+      case 'select_option': {
+        if (isSearchControl || normalizedRole === 'textbox') {
+          score -= 18; // Strongly suppress searchboxes and ordinary textboxes
+        }
+        if (normalizedRole === 'select' || normalizedRole === 'combobox' || normalizedRole === 'radio' || normalizedRole === 'checkbox' || normalizedRole === 'option') {
+          score += 6;
+        }
+        break;
+      }
+
+      case 'submit': {
+        const isSubmitSemantic = /\b(?:submit|save|done|confirm|send|apply|finish|ok|create)\b/.test(labelText);
+        if (isSubmitSemantic && role === 'button') {
+          score += 10;
+        }
+        if (isSearchControl || normalizedRole === 'textbox') {
+          score -= 18; // Suppress searchbox and textboxes
+        }
+        if ((role === 'link' || hasHref) && !matchesTargetHint && !isSubmitSemantic) {
+          score -= 10; // Suppress unrelated navigation links
+        }
+        break;
+      }
+
+      case 'select_result': {
+        if (isSearchControl || normalizedRole === 'textbox') {
+          score -= 18; // Suppress searchbox and textboxes
+        }
+        // Strongly prefer real navigation links/anchors over generic decorative buttons (e.g. play icon)
+        if (hasHref || role === 'link') {
+          score += 8;
+        } else if (role === 'button') {
+          score -= 4; // Generic decorative buttons depressed relative to destination links
+        }
+        break;
+      }
+
+      case 'search': {
+        if (normalizedRole === 'searchbox' || isSearchControl) {
+          score += 20; // Strongly prioritize the search input
+        } else if (isSuggestionCandidate) {
+          score -= 30; // Strongly suppress autocomplete/search suggestions
+        } else if (normalizedRole === 'button' || normalizedRole === 'image') {
+          // Explicit search submit button: valid fallback
+          if (labelText.includes('search') || labelText.includes('find') || labelText.includes('go') || labelText.includes('submit')) {
+            score += 5;
+          }
+        }
+        break;
+      }
+
+      case 'navigate': {
+        if (isSearchControl || normalizedRole === 'textbox') {
+          score -= 15;
+        }
+        if (role === 'link' || hasHref) {
+          score += 6;
+        }
+        break;
+      }
+
+      case 'verify_outcome': {
+        // Neutral baseline. Do not artificially bias towards any element unless targetHint explicitly matches.
+        break;
+      }
+    }
+  }
 
   return score;
 }
@@ -168,7 +556,7 @@ function scoreCandidateRelevance(
 /**
  * Compacts and ranks candidate targets before model serialization.
  *
- * 1. Ranks by `scoreCandidateRelevance` (role priority + goal-keyword hits).
+ * 1. Ranks by `scoreCandidateRelevance` with phase-conditioned priority and keyword hits.
  * 2. Caps the list at `MAX_MODEL_CANDIDATES`.
  * 3. Omits `bounds` from the model-facing DTO (the model needs elementId, not pixels).
  *
@@ -178,13 +566,23 @@ function scoreCandidateRelevance(
  * @param candidates  Already-sanitized ModelCandidateTarget[] (may include bounds).
  * @param goalDescription  Sanitized goal description used for keyword scoring.
  * @param limit  Maximum number of candidates to return. Default: MAX_MODEL_CANDIDATES.
+ * @param optionsOrPostSearch  Optional post-search click phase indicator or options object with activePhase.
  */
 export function compactCandidatesForModel(
   candidates: readonly ModelCandidateTarget[],
   goalDescription: string,
-  limit: number = MAX_MODEL_CANDIDATES
+  limit: number = MAX_MODEL_CANDIDATES,
+  optionsOrPostSearch?: { isPostSearchClick?: boolean; activePhase?: TaskPhase } | boolean
 ): ModelCandidateTarget[] {
   if (candidates.length === 0) return [];
+
+  const isPostSearchClick = typeof optionsOrPostSearch === 'boolean'
+    ? optionsOrPostSearch
+    : optionsOrPostSearch?.isPostSearchClick ?? false;
+
+  const activePhase = typeof optionsOrPostSearch === 'object' && optionsOrPostSearch !== null
+    ? optionsOrPostSearch.activePhase
+    : undefined;
 
   // Tokenize the sanitized goal description into keywords
   const goalKeywords = goalDescription
@@ -197,20 +595,33 @@ export function compactCandidatesForModel(
   // when it is already on a step that requires typing.
   const scored = candidates.map(c => ({
     candidate: c,
-    score: scoreCandidateRelevance(c.role, c.accessibleName, c.visibleText, goalKeywords)
-          + (c.focused === true ? 8 : 0)
+    score: scoreCandidateRelevance(
+      c.role,
+      c.accessibleName,
+      c.visibleText,
+      goalKeywords,
+      isPostSearchClick,
+      c.hasHref === true || Boolean(c.attributes?.['href']),
+      activePhase,
+      {
+        placeholder: c.placeholder,
+        attributes: c.attributes
+      }
+    ) + (c.focused === true ? 8 : 0)
   }));
 
   // Stable descending sort (preserve original order among equal-scored candidates)
   scored.sort((a, b) => b.score - a.score);
 
-  // Cap and strip bounds from model-facing DTO; preserve focused flag.
+  // Cap and strip bounds from model-facing DTO; preserve focused, hasHref, and placeholder flags.
   return scored.slice(0, limit).map(({ candidate: c }) => ({
     elementId: c.elementId,
     ...(c.role !== undefined ? { role: c.role } : {}),
     ...(c.accessibleName !== undefined ? { accessibleName: c.accessibleName } : {}),
     ...(c.visibleText !== undefined ? { visibleText: c.visibleText } : {}),
+    ...(c.placeholder !== undefined ? { placeholder: c.placeholder } : {}),
     ...(c.focused === true ? { focused: true } : {}),
+    ...(c.hasHref === true ? { hasHref: true } : {}),
     confidence: c.confidence
     // bounds intentionally omitted — the executor resolves the element by id,
     // not by pixel coordinates. Omitting bounds saves ~40 chars/candidate.
@@ -238,7 +649,9 @@ export const LOCAL_AGENT_SYSTEM_PROMPT =
   '11. Set pressEnter:true in payload when submitting a search query is appropriate.\n' +
   '12. Do not repeat an action that already succeeded in history unless current page state provides clear evidence that repeating it is necessary.\n' +
   '13. When typing a COMPLETE search query or replacement value into an input, ALWAYS type the ENTIRE intended text as a single "type" action — do NOT split the text across multiple steps. For example, to search for "laptops under 50000", type the full string in one action, not in parts.\n' +
-  '14. When typing into an input that may already contain text (e.g. after a previous "type" action on the same element, or when the input is focused), set clearFirst:true in the payload to replace the existing content rather than append to it.\n\n' +
+  '14. When typing into an input that may already contain text (e.g. after a previous "type" action on the same element, or when the input is focused), set clearFirst:true in the payload to replace the existing content rather than append to it.\n' +
+  '15. When a "currentPhase" is specified in the prompt, focus exclusively on fulfilling that phase\'s objective and targetHint/field. Your actionType MUST be one of currentPhase.allowedActions.\n' +
+  '16. When the current phase is a "search" phase, always target the primary search input using "type" with pressEnter:true and clearFirst:true to submit the search. Do NOT click autocomplete suggestions, search suggestion dropdown options, or search prediction links.\n\n' +
   'Schema for action:\n' +
   '{"type": "ACTION", "targetElementId": "<id>", "actionType": "click"|"type"|"focus", "payload": {"text": "...", "clearFirst": true, "pressEnter": true}, "rationale": "<brief reason>", "estimatedProgress": 0.5}\n\n' +
   'Schema for completion:\n' +
@@ -490,14 +903,22 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
         ? sanitizeFreeFormText(rawVisibleText.trim())
         : undefined;
 
+    const hasHref = Boolean(
+      matchedElement?.attributes?.['href'] ||
+      matchedElement?.tagName?.toLowerCase() === 'a'
+    );
+
     candidateTargets.push({
       elementId: target.elementId,
       ...(role !== undefined ? { role } : {}),
-      ...(accessibleName !== undefined ? { accessibleName } : {}),
+      ...(accessibleName !== undefined ? { accessibleName } : (matchedElement?.placeholder ? { accessibleName: matchedElement.placeholder } : {})),
       ...(visibleText !== undefined ? { visibleText } : {}),
+      ...(matchedElement?.placeholder !== undefined ? { placeholder: matchedElement.placeholder } : {}),
+      ...(matchedElement?.attributes !== undefined ? { attributes: matchedElement.attributes } : {}),
       confidence: target.confidence,
       // Propagate focus state so the model can skip redundant click→focus steps
       ...(matchedElement?.state?.focused === true ? { focused: true } : {}),
+      ...(hasHref ? { hasHref: true } : {}),
       bounds: {
         x: target.viewportBounds.x,
         y: target.viewportBounds.y,
@@ -510,19 +931,69 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
   const safeParameters = filterSafeGoalParameters(input.goal.parameters);
 
   // Build safe history: structural summary only, typed text is never included.
-  // This respects the privacy boundary while giving the model enough context
-  // to avoid repeating the same click on a textbox it has already interacted with.
-  const safeHistory: ModelHistoryStep[] = [];
+  // Preserves privacy while giving the model context on action history and phase progression.
+  const safeHistory: (ModelHistoryStep | SafeModelHistoryStep)[] = [];
   if (Array.isArray(input.history)) {
     for (const h of input.history) {
       if (!h || typeof h.stepIndex !== 'number') continue;
-      safeHistory.push({
+      const historyStep: SafeModelHistoryStep = {
         stepIndex: h.stepIndex,
         actionType: h.action.type,
         targetElementId: h.action.target.elementId,
         ...(h.action.target.role !== undefined ? { targetRole: h.action.target.role } : {}),
-        ...(h.perceivedOutcome !== undefined ? { perceivedOutcome: h.perceivedOutcome } : {})
-      });
+        ...(h.perceivedOutcome !== undefined ? { perceivedOutcome: h.perceivedOutcome } : {}),
+        ...(h.phaseIndex !== undefined ? { phaseIndex: h.phaseIndex } : {}),
+        ...(h.phaseIntent !== undefined ? { phaseIntent: h.phaseIntent } : {}),
+        ...(h.fulfilledParameter !== undefined ? { fulfilledParameter: sanitizeFreeFormText(h.fulfilledParameter) } : {})
+      };
+      safeHistory.push(historyStep);
+    }
+  }
+
+  // Resolve active task phase context
+  const activePhase = resolveActivePhase(input.goal, input.context, input.history);
+  const plan = input.goal.taskPlan;
+
+  let currentPhaseContext: ModelPromptPayload['currentPhase'] | undefined;
+  let completedPhasesContext: ModelPromptPayload['completedPhases'] | undefined;
+  let remainingPhasesContext: ModelPromptPayload['remainingPhases'] | undefined;
+
+  if (activePhase) {
+    currentPhaseContext = {
+      index: activePhase.phaseIndex,
+      intent: activePhase.intent,
+      objective: sanitizeFreeFormText(activePhase.description) || activePhase.description,
+      ...(activePhase.targetHint ? { targetHint: sanitizeFreeFormText(activePhase.targetHint) } : {}),
+      ...(activePhase.allowedActions ? { allowedActions: activePhase.allowedActions } : {}),
+      ...(activePhase.fieldParameter ? {
+        field: {
+          fieldName: sanitizeFreeFormText(activePhase.fieldParameter.fieldName) || activePhase.fieldParameter.fieldName,
+          ...(activePhase.fieldParameter.targetValue ? {
+            targetValue: sanitizeFreeFormText(activePhase.fieldParameter.targetValue)
+          } : {}),
+          ...(activePhase.fieldParameter.rawTargetValue ? {
+            rawTargetValue: sanitizeFreeFormText(activePhase.fieldParameter.rawTargetValue)
+          } : {})
+        }
+      } : {})
+    };
+
+    if (plan && Array.isArray(plan.phases)) {
+      const completedIds = new Set(input.context?.phaseState?.completedPhaseIds ?? []);
+      completedPhasesContext = plan.phases
+        .filter(p => completedIds.has(p.phaseId) || (completedIds.size === 0 && p.phaseIndex < activePhase.phaseIndex))
+        .map(p => ({
+          index: p.phaseIndex,
+          intent: p.intent,
+          description: sanitizeFreeFormText(p.description) || p.description
+        }));
+      remainingPhasesContext = plan.phases
+        .filter(p => p.phaseIndex > activePhase.phaseIndex && !completedIds.has(p.phaseId))
+        .map(p => ({
+          index: p.phaseIndex,
+          intent: p.intent,
+          description: sanitizeFreeFormText(p.description) || p.description
+        }));
     }
   }
 
@@ -545,12 +1016,19 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
       : undefined;
 
   return {
+    ...(currentPhaseContext ? {
+      overallGoal: sanitizedDescription,
+      currentPhase: currentPhaseContext,
+      completedPhases: completedPhasesContext ?? [],
+      remainingPhases: remainingPhasesContext ?? []
+    } : {}),
     goal: {
       id: input.goal.id,
       description: sanitizedDescription,
       ...(input.goal.intent !== undefined ? { intent: input.goal.intent } : {}),
       ...(sanitizedTargetHint !== undefined ? { targetHint: sanitizedTargetHint } : {}),
-      ...(safeParameters !== undefined ? { parameters: safeParameters } : {})
+      ...(safeParameters !== undefined ? { parameters: safeParameters } : {}),
+      ...(!currentPhaseContext && input.goal.taskPlan ? { taskPlan: input.goal.taskPlan } : {})
     },
     page: {
       ...(sanitizedTitle !== undefined ? { title: sanitizedTitle } : {}),
@@ -571,12 +1049,27 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
  */
 export function buildAgentUserPrompt(input: PlannerInput): string {
   const payload = buildModelPromptPayload(input);
-  // Compact the already-sanitized candidate list before serialization
+
+  const desc = (input.goal?.description ?? '').toLowerCase();
+  const isCompound = /\b(?:search|find|look\s+up|query|lookup)\b/i.test(desc) &&
+    /\b(?:play|watch|open|click|navigate|go\s+to|select|view|read|listen|launch|start|stream)\b/i.test(desc);
+
+  const hasSearchHistory = Array.isArray(input.history) && input.history.some(
+    h => (h.action?.type === 'type' || (h as any).actionType === 'type') &&
+      h.perceivedOutcome === 'success'
+  );
+
+  const isPostSearchClick = input.goal?.intent?.toLowerCase() === 'click' && (isCompound || hasSearchHistory);
+  const activePhase = resolveActivePhase(input.goal, input.context, input.history);
+
+  // Compact the already-sanitized candidate list before serialization, conditioned on activePhase
   const compacted: ModelPromptPayload = {
     ...payload,
     availableTargets: compactCandidatesForModel(
       payload.availableTargets,
-      payload.goal.description
+      payload.goal.description,
+      MAX_MODEL_CANDIDATES,
+      { isPostSearchClick, activePhase }
     )
   };
   return JSON.stringify(compacted);
@@ -1160,10 +1653,7 @@ export class DefaultLocalLlamaChatClient implements LocalLlamaChatClient {
         }
       ],
       temperature: request.temperature ?? this.temperature,
-      max_tokens: request.maxTokens ?? this.maxTokens,
-      response_format: {
-        type: 'json_object'
-      }
+      max_tokens: request.maxTokens ?? this.maxTokens
     };
 
     try {
@@ -1304,11 +1794,25 @@ export class LocalAgentDriver implements PlannerDriver {
 
     // 4. Respect explicit completion preconditions
     if (parsed.status === 'COMPLETED') {
-      if (input.context.completion?.satisfied !== true) {
+      const activePhase = resolveActivePhase(input.goal, input.context, input.history);
+      if (input.context.completion?.satisfied !== true && activePhase?.intent !== 'verify_outcome') {
         return {
           status: 'FAILED',
           reason: 'UNSUPPORTED_GOAL'
         };
+      }
+    }
+
+    // 5. Action allowlist enforcement (Phase C)
+    if (parsed.status === 'ACTION') {
+      const activePhase = resolveActivePhase(input.goal, input.context, input.history);
+      if (activePhase?.allowedActions && activePhase.allowedActions.length > 0) {
+        if (!activePhase.allowedActions.includes(parsed.proposal.actionType)) {
+          return {
+            status: 'FAILED',
+            reason: `INCOMPATIBLE_ACTION_FOR_PHASE: Proposed action '${parsed.proposal.actionType}' is not allowed in active phase '${activePhase.intent}' (allowed: ${activePhase.allowedActions.join(', ')})`
+          };
+        }
       }
     }
 
@@ -1356,3 +1860,286 @@ export function createLocalAgent(
 ): LocalAgent {
   return new LocalAgent(clientOrOptions);
 }
+
+// ---------------------------------------------------------------------------
+// 7. Phase B — Upfront Task Understanding & Decomposition
+// ---------------------------------------------------------------------------
+
+export const TASK_DECOMPOSITION_SYSTEM_PROMPT =
+  'You are an expert browser-agent task decomposer for NexVision. ' +
+  'Given a user\'s natural-language goal, decompose it into a structured task plan consisting of a linear sequence of high-level semantic phases.\n' +
+  'Strict rules:\n' +
+  '1. Decompose the goal based on its semantic intent, NOT website-specific selectors or internal IDs.\n' +
+  '2. Allowed archetypes: "search_and_act", "form_submission", "navigation_act", "data_extraction", "generic_workflow".\n' +
+  '3. Allowed phase intents: "open_surface", "search", "select_result", "fill_field", "select_option", "submit", "navigate", "verify_outcome", "custom".\n' +
+  '4. Allowed low-level actions in phases: "click", "type", "focus".\n' +
+  '5. Do NOT invent CSS selectors, element IDs, or coordinate values.\n' +
+  '6. Extract explicit parameters into fieldParameter (fieldName and targetValue) and extractedParameters when present.\n' +
+  '7. The plan must contain at least 1 phase and at most 8 phases.\n' +
+  '8. Phase indices must be 0-indexed and sequential (0, 1, 2, ...).\n' +
+  '9. Return STRICTLY valid JSON only matching the schema below. No conversational prose or markdown outside the JSON.\n\n' +
+  'Schema:\n' +
+  '{\n' +
+  '  "planId": "<unique_id>",\n' +
+  '  "archetype": "search_and_act"|"form_submission"|"navigation_act"|"data_extraction"|"generic_workflow",\n' +
+  '  "summary": "<brief summary of goal>",\n' +
+  '  "phases": [\n' +
+  '    {\n' +
+  '      "phaseId": "phase-0",\n' +
+  '      "phaseIndex": 0,\n' +
+  '      "intent": "open_surface"|"search"|"select_result"|"fill_field"|"select_option"|"submit"|"navigate"|"verify_outcome"|"custom",\n' +
+  '      "description": "<what this phase achieves>",\n' +
+  '      "targetHint": "<optional descriptive label/keyword of element to target>",\n' +
+  '      "fieldParameter": {"fieldName": "<field>", "targetValue": "<value>"},\n' +
+  '      "allowedActions": ["click"|"type"|"focus"],\n' +
+  '      "expectedOutcome": "<expected state after phase>"\n' +
+  '    }\n' +
+  '  ],\n' +
+  '  "currentPhaseIndex": 0,\n' +
+  '  "extractedParameters": {"<key>": "<value>"}\n' +
+  '}';
+
+/**
+ * Builds the text-only user prompt for task decomposition.
+ * Strictly local: receives only the goal description.
+ * NEVER forwards DOM, screenshots, page elements, or browser state.
+ */
+export function buildTaskDecompositionUserPrompt(goalDescription: string): string {
+  return JSON.stringify({
+    goal: goalDescription.trim()
+  });
+}
+
+/**
+ * Produces a privacy-safe summary of a TaskPlan for logging.
+ * Strips raw field values and extractedParameters to ensure no user-provided
+ * sensitive values are ever written to console, logs, or error streams.
+ */
+export function summarizeTaskPlanForLogs(plan: TaskPlan | undefined): string {
+  if (!plan) return 'undefined';
+  const paramKeys = plan.extractedParameters ? Object.keys(plan.extractedParameters) : [];
+  const phaseSummary = plan.phases.map(p => `${p.phaseIndex}:${p.intent}`).join(' -> ');
+  return (
+    `[TaskPlan ${plan.planId}] archetype=${plan.archetype}, ` +
+    `phases=${plan.phases.length} (${phaseSummary}), ` +
+    `extractedParamKeys=[${paramKeys.join(', ')}]`
+  );
+}
+
+/**
+ * Normalizes model-generated task plan objects before strict validation.
+ * Performs gentle defaults (planId, currentPhaseIndex, phaseIndex) without
+ * repairing fundamentally broken or truncated structures.
+ */
+export function normalizeDecomposedTaskPlan(
+  rawObj: Record<string, unknown>,
+  goalDescription?: string,
+  referenceDate?: Date | string | number
+): Record<string, unknown> {
+  const norm: Record<string, unknown> = { ...rawObj };
+
+  // Ensure planId exists
+  if (typeof norm['planId'] !== 'string' || norm['planId'].trim() === '') {
+    norm['planId'] = `plan-decomp-${Date.now()}`;
+  }
+
+  // Ensure userGoal exists if missing
+  if (typeof norm['userGoal'] !== 'string' || norm['userGoal'].trim() === '') {
+    if (typeof goalDescription === 'string' && goalDescription.trim() !== '') {
+      norm['userGoal'] = goalDescription.trim();
+    }
+  }
+
+  // Ensure summary exists if missing (defaults to userGoal or goalDescription)
+  if (typeof norm['summary'] !== 'string' || norm['summary'].trim() === '') {
+    if (typeof norm['userGoal'] === 'string' && norm['userGoal'].trim() !== '') {
+      norm['summary'] = norm['userGoal'].trim();
+    } else if (typeof goalDescription === 'string' && goalDescription.trim() !== '') {
+      norm['summary'] = goalDescription.trim();
+    }
+  }
+
+  // Ensure currentPhaseIndex is an integer defaulting to 0
+  if (typeof norm['currentPhaseIndex'] !== 'number' || !Number.isInteger(norm['currentPhaseIndex'])) {
+    norm['currentPhaseIndex'] = 0;
+  }
+
+  // Normalize phases array
+  if (Array.isArray(norm['phases'])) {
+    norm['phases'] = norm['phases'].map((p: unknown, idx: number) => {
+      if (typeof p !== 'object' || p === null) return p;
+      const phaseObj: Record<string, unknown> = { ...(p as Record<string, unknown>) };
+
+      // Ensure phaseIndex is set
+      if (typeof phaseObj['phaseIndex'] !== 'number' || !Number.isInteger(phaseObj['phaseIndex'])) {
+        phaseObj['phaseIndex'] = idx;
+      }
+
+      // Ensure phaseId is set
+      if (typeof phaseObj['phaseId'] !== 'string' || phaseObj['phaseId'].trim() === '') {
+        phaseObj['phaseId'] = `phase-${idx}`;
+      }
+
+      // Wrap allowedActions in array if model output a single string like "click"
+      if (typeof phaseObj['allowedActions'] === 'string') {
+        phaseObj['allowedActions'] = [phaseObj['allowedActions'].trim().toLowerCase()];
+      }
+
+      // Deterministic select_option capability normalization:
+      // select_option is a semantic intent; the correct low-level primitive depends on
+      // the grounded target control (native <select> → type, radio/checkbox → click).
+      // The LLM cannot know the control type at decomposition time, so we always
+      // ensure both 'click' and 'type' are available and let the planner/driver
+      // deterministically select the appropriate primitive at grounding time.
+      if (phaseObj['intent'] === 'select_option') {
+        const currentActions = Array.isArray(phaseObj['allowedActions'])
+          ? (phaseObj['allowedActions'] as string[]).map(a => typeof a === 'string' ? a.trim().toLowerCase() : '')
+          : [];
+        const hasClick = currentActions.includes('click');
+        const hasType = currentActions.includes('type');
+        if (!hasClick || !hasType) {
+          const normalized = new Set(currentActions.filter(a => a.length > 0));
+          normalized.add('click');
+          normalized.add('type');
+          phaseObj['allowedActions'] = Array.from(normalized);
+        }
+      }
+
+      // Deterministic search phase capability normalization:
+      // A search phase requires text entry (type) with pressEnter submission.
+      // Ensure 'type' is always present in allowedActions for search phases.
+      if (phaseObj['intent'] === 'search') {
+        const currentActions = Array.isArray(phaseObj['allowedActions'])
+          ? (phaseObj['allowedActions'] as string[]).map(a => typeof a === 'string' ? a.trim().toLowerCase() : '')
+          : [];
+        if (!currentActions.includes('type')) {
+          const normalized = new Set(currentActions.filter(a => a.length > 0));
+          normalized.add('type');
+          phaseObj['allowedActions'] = Array.from(normalized);
+        }
+      }
+
+      // Clean up empty placeholder fieldParameter (e.g. {} or { fieldName: "", targetValue: "" })
+      if (typeof phaseObj['fieldParameter'] === 'object' && phaseObj['fieldParameter'] !== null) {
+        const fp = phaseObj['fieldParameter'] as Record<string, unknown>;
+        const fieldName = typeof fp['fieldName'] === 'string' ? fp['fieldName'].trim() : '';
+        const targetValue = typeof fp['targetValue'] === 'string' ? fp['targetValue'].trim() : '';
+        if (fieldName === '' && targetValue === '') {
+          delete phaseObj['fieldParameter'];
+        } else if (targetValue !== '') {
+          // Deterministic temporal grounding: resolve relative date expressions into canonical YYYY-MM-DD
+          const resolved = resolveRelativeDate(targetValue, referenceDate);
+          if (resolved !== targetValue) {
+            fp['rawTargetValue'] = targetValue;
+            fp['targetValue'] = resolved;
+          }
+        }
+      }
+
+      return phaseObj;
+    });
+  }
+
+  // Normalize extractedParameters if present
+  if (typeof norm['extractedParameters'] === 'object' && norm['extractedParameters'] !== null) {
+    const ep = norm['extractedParameters'] as Record<string, unknown>;
+    for (const [key, val] of Object.entries(ep)) {
+      if (typeof val === 'string' && val.trim() !== '') {
+        ep[key] = resolveRelativeDate(val, referenceDate);
+      }
+    }
+  }
+
+  return norm;
+}
+
+export interface TaskDecompositionOptions {
+  readonly client?: LocalLlamaChatClient;
+  readonly timeoutMs?: number;
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly referenceDate?: Date | string | number;
+}
+
+/**
+ * Decomposes a raw natural-language user goal into a validated TaskPlan using a local,
+ * text-only LLM inference call.
+ *
+ * Invariants:
+ * - Text-only: receives only goalDescription. NEVER receives DOM, screenshots, page elements, or browser state.
+ * - Local inference: communicates with local llama-server via LocalLlamaChatClient.
+ * - Strict validation: validates the model response with validateTaskPlan().
+ * - Safe fallback: on any error (inference failure, timeout, malformed JSON, validation failure),
+ *   returns undefined so caller cleanly falls back to existing single-step planning.
+ * - Privacy-safe: logging strips raw parameter values.
+ */
+export async function decomposeTaskGoal(
+  goalDescription: string,
+  optionsOrClient?: LocalLlamaChatClient | TaskDecompositionOptions
+): Promise<TaskPlan | undefined> {
+  if (typeof goalDescription !== 'string' || goalDescription.trim() === '') {
+    return undefined;
+  }
+
+  const client: LocalLlamaChatClient =
+    optionsOrClient && 'chat' in optionsOrClient
+      ? optionsOrClient
+      : (optionsOrClient as TaskDecompositionOptions)?.client ?? new DefaultLocalLlamaChatClient();
+
+  const userPrompt = buildTaskDecompositionUserPrompt(goalDescription);
+
+  try {
+    const chatResult = await client.chat({
+      systemPrompt: TASK_DECOMPOSITION_SYSTEM_PROMPT,
+      userPrompt,
+      temperature: (optionsOrClient as TaskDecompositionOptions)?.temperature ?? 0.1,
+      maxTokens: (optionsOrClient as TaskDecompositionOptions)?.maxTokens ?? 1024
+    });
+
+    if (!chatResult.success) {
+      console.warn(`[NexVision Decomposer] Task decomposition inference failed: ${chatResult.error.message}`);
+      return undefined;
+    }
+
+    const raw = chatResult.content;
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      return undefined;
+    }
+
+    // Parse JSON safely using direct JSON.parse or extractSingleJsonObject
+    let parsedObj: Record<string, unknown> | null = null;
+    const cleaned = stripMarkdownFences(raw).trim();
+    try {
+      const direct = JSON.parse(cleaned);
+      if (typeof direct === 'object' && direct !== null && !Array.isArray(direct)) {
+        parsedObj = direct as Record<string, unknown>;
+      }
+    } catch {
+      parsedObj = extractSingleJsonObject(raw);
+    }
+
+    if (!parsedObj) {
+      console.warn('[NexVision Decomposer] Failed to extract valid JSON from decomposition response');
+      return undefined;
+    }
+
+    const referenceDate = (optionsOrClient as TaskDecompositionOptions)?.referenceDate;
+    // Gentle structural normalization and deterministic temporal grounding
+    const normalized = normalizeDecomposedTaskPlan(parsedObj, goalDescription, referenceDate);
+
+    // Strict validation using Phase A validator
+    const validationError = validateTaskPlan(normalized);
+    if (validationError !== null) {
+      console.warn(`[NexVision Decomposer] Task plan validation rejected: ${validationError}`);
+      return undefined;
+    }
+
+    const validPlan = normalized as unknown as TaskPlan;
+    console.log(`[NexVision Decomposer] ${summarizeTaskPlanForLogs(validPlan)}`);
+    return validPlan;
+  } catch (err: unknown) {
+    console.warn(`[NexVision Decomposer] Unexpected error during task decomposition: ${String(err)}`);
+    return undefined;
+  }
+}
+
