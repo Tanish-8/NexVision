@@ -46,6 +46,12 @@ import {
 } from '../content/domPerception.js';
 import { MessageType, type ExecutionResult, type ExecuteActionRequest } from '../shared/types.js';
 import { createIntendedAction, type ActionTarget, type ClickAction, type TypeAction, type FocusAction } from '../shared/actions.js';
+import {
+  planNextStep,
+  DeterministicRulePlanner,
+  type PlannerInput,
+  type TaskPhase
+} from '../shared/planner.js';
 
 // ---------------------------------------------------------------------------
 // Helpers and Fixtures
@@ -1389,5 +1395,645 @@ describe('domExecutor clearFirst regression — query-text-replace', () => {
     expect(result.success).toBe(true);
     expect(textarea.value).toBe('replacement text');
   });
+
+  // -------------------------------------------------------------------------
+  // Phase E: Generic Native <select> Action Execution Tests
+  // -------------------------------------------------------------------------
+  describe('Phase E — Generic Native <select> Action Execution', () => {
+    it('5. native <select> + valid target value (by value) -> execution succeeds', () => {
+      const select = document.createElement('select');
+      const opt1 = document.createElement('option');
+      opt1.value = 'pending';
+      opt1.textContent = 'Pending';
+      const opt2 = document.createElement('option');
+      opt2.value = 'completed';
+      opt2.textContent = 'Completed';
+      select.appendChild(opt1);
+      select.appendChild(opt2);
+      select.value = 'pending';
+      document.body.appendChild(select);
+      extractPageRepresentationFromDom();
+
+      const eventsFired: string[] = [];
+      select.addEventListener('input', () => eventsFired.push('input'));
+      select.addEventListener('change', () => eventsFired.push('change'));
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'combobox' });
+      const action = makeTypeAction(target, 'completed');
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(select.value).toBe('completed');
+      expect(opt2.selected).toBe(true);
+      expect(eventsFired).toContain('input');
+      expect(eventsFired).toContain('change');
+    });
+
+    it('5b. native <select> + valid target value (by option text/label, case-insensitive) -> execution succeeds', () => {
+      const select = document.createElement('select');
+      const opt1 = document.createElement('option');
+      opt1.value = '1';
+      opt1.textContent = 'High Priority';
+      const opt2 = document.createElement('option');
+      opt2.value = '2';
+      opt2.textContent = 'Medium Priority';
+      select.appendChild(opt1);
+      select.appendChild(opt2);
+      document.body.appendChild(select);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'combobox' });
+      const action = makeTypeAction(target, 'medium priority');
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(select.value).toBe('2');
+      expect(opt2.selected).toBe(true);
+    });
+
+    it('6. native <select> + nonexistent option -> TARGET_NOT_ACTIONABLE', () => {
+      const select = document.createElement('select');
+      const opt1 = document.createElement('option');
+      opt1.value = 'pending';
+      opt1.textContent = 'Pending';
+      select.appendChild(opt1);
+      document.body.appendChild(select);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'combobox' });
+      const action = makeTypeAction(target, 'nonexistent_option_value');
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.reason).toBe('TARGET_NOT_ACTIONABLE');
+        expect(result.message).toContain('No option matching "nonexistent_option_value" found');
+      }
+    });
+
+    it('6b. native <select> with readonly attribute -> TARGET_NOT_ACTIONABLE', () => {
+      const select = document.createElement('select');
+      select.setAttribute('readonly', 'true');
+      const opt1 = document.createElement('option');
+      opt1.value = 'pending';
+      opt1.textContent = 'Pending';
+      select.appendChild(opt1);
+      document.body.appendChild(select);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'combobox' });
+      const action = makeTypeAction(target, 'pending');
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.reason).toBe('TARGET_NOT_ACTIONABLE');
+        expect(result.message).toContain('read-only');
+      }
+    });
+
+    it('native <select> + click action remains valid (opens/activates dropdown)', () => {
+      const select = document.createElement('select');
+      const opt1 = document.createElement('option');
+      opt1.value = 'opt1';
+      select.appendChild(opt1);
+      document.body.appendChild(select);
+      extractPageRepresentationFromDom();
+
+      let clicked = false;
+      select.addEventListener('click', () => {
+        clicked = true;
+      });
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'combobox' });
+      const action = makeClickAction(target);
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(clicked).toBe(true);
+    });
+
+    it('native <select> + typed text is NOT exposed in ExecutionResult (privacy)', () => {
+      const select = document.createElement('select');
+      const opt = document.createElement('option');
+      opt.value = 'secret_choice';
+      opt.textContent = 'Secret Choice';
+      select.appendChild(opt);
+      document.body.appendChild(select);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'combobox' });
+      const action = makeTypeAction(target, 'secret_choice');
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain('secret_choice');
+    });
+
+    it('Integration: full pipeline phase -> planner -> action -> executor succeeds on real DOM', async () => {
+      // 1. Setup real DOM with a native <select> element
+      const select = document.createElement('select');
+      select.id = 'task-status-select';
+      const optPending = document.createElement('option');
+      optPending.value = 'pending';
+      optPending.textContent = 'Pending';
+      const optCompleted = document.createElement('option');
+      optCompleted.value = 'completed';
+      optCompleted.textContent = 'Completed';
+      select.appendChild(optPending);
+      select.appendChild(optCompleted);
+      select.value = 'pending';
+      select.setAttribute('name', 'status');
+      select.setAttribute('aria-label', 'status');
+      select.getBoundingClientRect = () => ({
+        x: 10,
+        y: 10,
+        left: 10,
+        top: 10,
+        right: 110,
+        bottom: 40,
+        width: 100,
+        height: 30,
+        toJSON: () => ({})
+      }) as DOMRect;
+      document.body.appendChild(select);
+
+      // 2. Perception: extract real page representation
+      const pageRep = extractPageRepresentationFromDom();
+      const statusElement = pageRep.elements.find(e => e.tagName === 'select');
+      expect(statusElement).toBeDefined();
+      const targetElementId = statusElement!.id;
+
+      // 3. Grounding: define grounded action target from perceived element
+      const selectTarget = makeTarget({
+        elementId: targetElementId,
+        role: 'combobox'
+      });
+
+      // 4. Active Phase: select_option phase for task status
+      const selectPhase: TaskPhase = {
+        phaseId: 'phase-status',
+        phaseIndex: 1,
+        intent: 'select_option',
+        description: 'Select status as completed',
+        targetHint: 'status',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'status', targetValue: 'completed' }
+      };
+
+      const plannerInput: PlannerInput = {
+        goal: {
+          id: 'goal-taskflow',
+          description: 'Create task with status completed',
+          intent: 'custom',
+          targetHint: 'status',
+          taskPlan: {
+            planId: 'plan-tf-1',
+            archetype: 'form_submission',
+            summary: 'Task creation form flow',
+            phases: [
+              { phaseId: 'phase-title', phaseIndex: 0, intent: 'fill_field', description: 'Enter title', allowedActions: ['type'] },
+              selectPhase
+            ],
+            currentPhaseIndex: 1
+          }
+        },
+        context: {
+          page: pageRep,
+          availableTargets: [selectTarget],
+          capturedAt: Date.now(),
+          currentTime: Date.now(),
+          stepIndex: 1,
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: ['phase-title'],
+            remainingPhaseIds: [],
+            totalPhases: 2,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        },
+        options: {
+          strictRoleMatching: false
+        }
+      };
+
+      // 5. Planner: propose next step via DeterministicRulePlanner
+      const rulePlanner = new DeterministicRulePlanner();
+      const planResult = await planNextStep(plannerInput, rulePlanner);
+
+      expect(planResult.status).toBe('ACTION');
+      if (planResult.status !== 'ACTION') {
+        throw new Error('Expected planner to produce an ACTION result');
+      }
+
+      // Verify planner inspected target capability and produced type action
+      expect(planResult.action.type).toBe('type');
+      expect(planResult.action.target.elementId).toBe(targetElementId);
+      if (planResult.action.type === 'type') {
+        expect(planResult.action.payload?.text).toBe('completed');
+      }
+
+      // 6. Executor: execute the planned action directly on the real DOM
+      const execResult = executeDomAction(planResult.action);
+
+      // 7. Verify executor succeeded and DOM mutated as expected
+      expect(execResult.success).toBe(true);
+      expect(select.value).toBe('completed');
+      expect(optCompleted.selected).toBe(true);
+      expect(optPending.selected).toBe(false);
+    });
+
+    it('Integration: full pipeline phase -> planner -> action -> executor succeeds for radio button on real DOM', async () => {
+      // 1. Setup real DOM with radio inputs
+      const form = document.createElement('form');
+      const radioLow = document.createElement('input');
+      radioLow.type = 'radio';
+      radioLow.name = 'priority';
+      radioLow.value = 'low';
+      radioLow.id = 'priority-low';
+      radioLow.setAttribute('aria-label', 'Low priority');
+      radioLow.getBoundingClientRect = () => ({
+        x: 10, y: 10, left: 10, top: 10, right: 30, bottom: 30, width: 20, height: 20, toJSON: () => ({})
+      }) as DOMRect;
+
+      const radioHigh = document.createElement('input');
+      radioHigh.type = 'radio';
+      radioHigh.name = 'priority';
+      radioHigh.value = 'high';
+      radioHigh.id = 'priority-high';
+      radioHigh.setAttribute('aria-label', 'High priority');
+      radioHigh.getBoundingClientRect = () => ({
+        x: 40, y: 10, left: 40, top: 10, right: 60, bottom: 30, width: 20, height: 20, toJSON: () => ({})
+      }) as DOMRect;
+
+      form.appendChild(radioLow);
+      form.appendChild(radioHigh);
+      document.body.appendChild(form);
+
+      // 2. Perception: extract real page representation
+      const pageRep = extractPageRepresentationFromDom();
+      const highEl = pageRep.elements.find(e => e.role === 'radio' && (e.accessibleName?.toLowerCase().includes('high') || e.attributes?.['id'] === 'priority-high'));
+      expect(highEl).toBeDefined();
+      const targetElementId = highEl!.id;
+
+      // 3. Grounding: define grounded action target from perceived element
+      const highTarget = makeTarget({
+        elementId: targetElementId,
+        role: 'radio'
+      });
+
+      // 4. Active Phase: select_option phase for radio selection
+      const selectPhase: TaskPhase = {
+        phaseId: 'phase-priority',
+        phaseIndex: 0,
+        intent: 'select_option',
+        description: 'Choose high priority',
+        targetHint: 'high',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'priority', targetValue: 'high' }
+      };
+
+      const plannerInput: PlannerInput = {
+        goal: {
+          id: 'goal-priority',
+          description: 'Set priority to high',
+          intent: 'custom',
+          taskPlan: {
+            planId: 'plan-radio-1',
+            archetype: 'form_submission',
+            summary: 'Priority selection flow',
+            phases: [selectPhase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          page: pageRep,
+          availableTargets: [highTarget],
+          capturedAt: Date.now(),
+          currentTime: Date.now(),
+          stepIndex: 0,
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      };
+
+      // 5. Planner: propose next step via DeterministicRulePlanner
+      const rulePlanner = new DeterministicRulePlanner();
+      const planResult = await planNextStep(plannerInput, rulePlanner);
+
+      expect(planResult.status).toBe('ACTION');
+      if (planResult.status !== 'ACTION') {
+        throw new Error('Expected planner to produce an ACTION result');
+      }
+
+      // Verify planner inspected target capability and produced click action for radio
+      expect(planResult.action.type).toBe('click');
+      expect(planResult.action.target.elementId).toBe(targetElementId);
+
+      // 6. Executor: execute the planned action directly on the real DOM
+      const execResult = executeDomAction(planResult.action);
+
+      // 7. Verify executor succeeded and radio button is checked
+      expect(execResult.success).toBe(true);
+      expect(radioHigh.checked).toBe(true);
+      expect(radioLow.checked).toBe(false);
+    });
+  });
+
+  // =========================================================================
+  // GENERIC NATIVE HTML5 <input type="date"> EXECUTION TESTS
+  // =========================================================================
+
+  describe('Generic Native HTML5 <input type="date"> Execution Support', () => {
+    beforeEach(() => {
+      document.body.innerHTML = '';
+      clearPerceptionElementRegistry();
+    });
+
+    it('A. sets valid canonical ISO date on native <input type="date"> and dispatches events', () => {
+      const input = document.createElement('input');
+      input.type = 'date';
+      input.id = 'due-date-input';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      let inputDispatched = false;
+      let changeDispatched = false;
+      let beforeInputDispatched = false;
+
+      input.addEventListener('input', () => { inputDispatched = true; });
+      input.addEventListener('change', () => { changeDispatched = true; });
+      input.addEventListener('beforeinput', () => { beforeInputDispatched = true; });
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, '2026-09-29');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(input.value).toBe('2026-09-29');
+      expect(inputDispatched).toBe(true);
+      expect(changeDispatched).toBe(true);
+      expect(beforeInputDispatched).toBe(true);
+    });
+
+    it('B. sets another valid canonical date "2027-01-01"', () => {
+      const input = document.createElement('input');
+      input.type = 'date';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, '2027-01-01');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(input.value).toBe('2027-01-01');
+    });
+
+    it('C. rejects invalid non-ISO date payload "today\'s date" deterministically under error contract', () => {
+      const input = document.createElement('input');
+      input.type = 'date';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, "today's date");
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.reason).toBe('INVALID_ACTION');
+        expect(result.message).toContain('Expected canonical YYYY-MM-DD format');
+        // Privacy check: NEVER leak the typed text
+        expect(result.message).not.toContain("today's date");
+      }
+      // Value must not be modified or silently invented
+      expect(input.value).toBe('');
+    });
+
+    it('D. preserves existing text input behavior for "college"', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'college');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(input.value).toBe('college');
+    });
+
+    it('E. preserves existing search input behavior for "laptops"', () => {
+      const input = document.createElement('input');
+      input.type = 'search';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'searchbox' });
+      const action = makeTypeAction(target, 'laptops');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(input.value).toBe('laptops');
+    });
+
+    it('F. preserves existing clearFirst behavior on text inputs', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = 'old value';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'new value', { clearFirst: true });
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      expect(input.value).toBe('new value');
+    });
+
+    it('G. verifies input and change events occur on date inputs', () => {
+      const input = document.createElement('input');
+      input.type = 'date';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const eventsFired: string[] = [];
+      input.addEventListener('beforeinput', (e) => eventsFired.push(e.type));
+      input.addEventListener('input', (e) => eventsFired.push(e.type));
+      input.addEventListener('change', (e) => eventsFired.push(e.type));
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, '2026-09-29');
+
+      executeDomAction(action);
+
+      expect(eventsFired).toEqual(['beforeinput', 'input', 'change']);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Privacy-Safe Live DOM Value Verification Contract
+  // ---------------------------------------------------------------------------
+  describe('Privacy-Safe Live DOM Value Verification Contract', () => {
+    it('A. Generic text fill succeeds: live "college", requested "college" => verified=true, valueMatch=true', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'college', { clearFirst: true });
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.valueMatch).toBe(true);
+      }
+      expect(input.value).toBe('college');
+    });
+
+    it('B. Generic text fill mismatch: live "school", requested "college" => valueMatch=false', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      // Simulate input event handler or masked control that forces value to 'school'
+      input.addEventListener('input', () => {
+        input.value = 'school';
+      });
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'college', { clearFirst: true });
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.valueMatch).toBe(false);
+      }
+      expect(input.value).toBe('school');
+    });
+
+    it('C. Empty value: live "", requested "college" => valueMatch=false', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      // Simulate control resetting or rejecting value to empty
+      input.addEventListener('input', () => {
+        input.value = '';
+      });
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'college', { clearFirst: true });
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.valueMatch).toBe(false);
+      }
+      expect(input.value).toBe('');
+    });
+
+    it('D. Native date: live "2026-09-29", requested "2026-09-29" => valueMatch=true', () => {
+      const input = document.createElement('input');
+      input.type = 'date';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, '2026-09-29');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.valueMatch).toBe(true);
+      }
+      expect(input.value).toBe('2026-09-29');
+    });
+
+    it('E. Native date mismatch: live "2026-09-28", requested "2026-09-29" => valueMatch=false', () => {
+      const input = document.createElement('input');
+      input.type = 'date';
+      // Simulate date picker component adjusting to a different date
+      input.addEventListener('change', () => {
+        input.value = '2026-09-28';
+      });
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, '2026-09-29');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.valueMatch).toBe(false);
+      }
+      expect(input.value).toBe('2026-09-28');
+    });
+
+    it('F. Privacy contract: execution result contains no raw actual value', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      document.body.appendChild(input);
+      extractPageRepresentationFromDom();
+
+      const target = makeTarget({ elementId: 'elem-1', role: 'textbox' });
+      const action = makeTypeAction(target, 'college');
+
+      const result = executeDomAction(action);
+
+      expect(result.success).toBe(true);
+      const resObj = result as unknown as Record<string, unknown>;
+      expect(resObj['value']).toBeUndefined();
+      expect(resObj['actualValue']).toBeUndefined();
+      expect(resObj['text']).toBeUndefined();
+      expect(resObj['typedText']).toBeUndefined();
+      expect(resObj['payload']).toBeUndefined();
+      expect(resObj['valueMatch']).toBe(true);
+      // Serialized result must not leak raw input value
+      expect(JSON.stringify(result)).not.toContain('college');
+    });
+
+    it('G. PageRepresentation privacy regression: input values remain absent from attributes and visibleText', () => {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = 'college';
+      document.body.appendChild(input);
+
+      const pageRep = extractPageRepresentationFromDom();
+      const inputElem = pageRep.elements.find(e => e.tagName?.toLowerCase() === 'input');
+
+      expect(inputElem).toBeDefined();
+      expect(inputElem?.attributes?.['value']).toBeUndefined();
+      expect(inputElem?.visibleText).toBeUndefined();
+    });
+  });
 });
+
+
 

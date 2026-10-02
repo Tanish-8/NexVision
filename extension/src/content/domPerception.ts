@@ -69,7 +69,9 @@ const NATIVE_CANDIDATE_TAGS = new Set([
   'nav',
   'dialog',
   'progress',
-  'summary'
+  'summary',
+  'video',
+  'audio'
 ]);
 
 /** Text-bearing structural elements worth exposing when they contain content. */
@@ -109,10 +111,12 @@ const PERCEPTION_SELECTOR = [
   'dialog',
   'progress',
   'summary',
+  'video, audio',
   'main, article, section, aside, header, footer',
   'p, blockquote, pre, figure, figcaption, li, dt, dd, table, caption, output',
   '[role]',
-  '[tabindex]'
+  '[tabindex]',
+  '[data-detail]'
 ].join(', ');
 
 /**
@@ -150,7 +154,7 @@ function isNativeCandidate(element: Element): boolean {
  */
 function isNativeInteractiveElement(element: Element): boolean {
   return element.matches(
-    'input:not([type="hidden"]), textarea, select, button, summary, a[href]'
+    'input:not([type="hidden"]), textarea, select, button, summary, a[href], video, audio'
   );
 }
 
@@ -175,6 +179,7 @@ function isRepresentationCandidate(element: Element): boolean {
   const hasTabindex = element.hasAttribute('tabindex');
   const nativeCandidate = isNativeCandidate(element);
   const meaningfulContent = isMeaningfulContentCandidate(element);
+  const hasStructuredDetail = element.hasAttribute('data-detail');
 
   if (explicitRole && PRESENTATION_ROLES.has(explicitRole)) {
     return isNativeInteractiveElement(element) || hasTabindex;
@@ -187,7 +192,7 @@ function isRepresentationCandidate(element: Element): boolean {
     return true;
   }
 
-  return nativeCandidate || hasTabindex || meaningfulContent;
+  return nativeCandidate || hasTabindex || meaningfulContent || hasStructuredDetail;
 }
 
 /** Tags whose content is not user-facing rendered text. */
@@ -218,6 +223,25 @@ function hasVisibleCss(element: Element): boolean {
         if (style.visibility === 'hidden' || style.visibility === 'collapse') {
           return false;
         }
+        if (style.opacity === '0' || parseFloat(style.opacity) === 0) {
+          // Distinguish a genuinely hidden modal from an element transitioning into view.
+          // An element is transitioning into view if:
+          // 1. It has an active transition on opacity or all
+          // 2. AND it has an explicit active visibility class/state
+          const hasTransition = Boolean(
+            (style.transitionProperty && (style.transitionProperty.includes('opacity') || style.transitionProperty.includes('all'))) ||
+            (style.transition && (style.transition.includes('opacity') || style.transition.includes('all')))
+          );
+          const hasActiveVisibleClass = element instanceof HTMLElement && (
+            element.classList.contains('visible') ||
+            element.classList.contains('open') ||
+            element.classList.contains('show') ||
+            element.classList.contains('active')
+          );
+          if (!(hasTransition && hasActiveVisibleClass)) {
+            return false;
+          }
+        }
       }
     } catch {
       // In case getComputedStyle fails in mock environments
@@ -232,6 +256,17 @@ function hasVisibleCss(element: Element): boolean {
     const inlineVisibility = element.style?.visibility;
     if (inlineVisibility === 'hidden' || inlineVisibility === 'collapse') {
       return false;
+    }
+    const inlineOpacity = element.style?.opacity;
+    if (inlineOpacity === '0' || (inlineOpacity !== '' && inlineOpacity !== undefined && parseFloat(inlineOpacity) === 0)) {
+      const hasActiveVisibleClass =
+        element.classList.contains('visible') ||
+        element.classList.contains('open') ||
+        element.classList.contains('show') ||
+        element.classList.contains('active');
+      if (!hasActiveVisibleClass) {
+        return false;
+      }
     }
   }
 
@@ -602,6 +637,17 @@ function extractAttributes(element: Element): Record<string, string> {
     'alt',
     'title',
     'role',
+    'class',
+    'data-detail',
+    'data-txn',
+    'data-date',
+    'data-timestamp',
+    'data-amount',
+    'data-merchant',
+    'datetime',
+    'aria-autocomplete',
+    'autocomplete',
+    'aria-controls',
     'aria-label',
     'aria-labelledby',
     'aria-describedby',
@@ -610,6 +656,7 @@ function extractAttributes(element: Element): Record<string, string> {
     'aria-selected',
     'aria-disabled',
     'aria-hidden',
+    'aria-modal',
     'disabled',
     'readonly',
     'inert'

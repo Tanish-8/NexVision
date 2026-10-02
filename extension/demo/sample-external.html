@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>OpenDocs — Developer Documentation</title>
+  <style>
+    body { font-family: sans-serif; margin: 40px; background: #fafafa; color: #222; }
+    header { margin-bottom: 24px; }
+    .search-box { margin-bottom: 20px; }
+    input { padding: 8px 12px; width: 300px; font-size: 14px; }
+    button { padding: 8px 16px; font-size: 14px; cursor: pointer; }
+    .doc-item { padding: 12px; margin: 8px 0; background: white; border: 1px solid #ddd; border-radius: 4px; }
+    .doc-detail { display: none; margin-top: 20px; padding: 16px; background: #e8f4fd; border: 1px solid #b6d4fe; border-radius: 4px; }
+    .doc-detail.visible { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OpenDocs — Developer Documentation</h1>
+    <p>Explore guides, API references, and architecture notes.</p>
+  </header>
+
+  <form id="docs-search-form" class="search-box">
+    <label for="docs-search">Search documentation:</label><br/>
+    <input type="search" id="docs-search" name="docs_search" placeholder="Search guides..." aria-label="Search documentation" />
+    <button type="submit" id="search-btn">Search</button>
+  </form>
+
+  <div id="results-section">
+    <h2>Available Guides</h2>
+    <div class="doc-item" id="doc-install" data-guide="installation" tabindex="0" role="button" aria-label="Installation Guide">
+      <h3>Installation Guide</h3>
+      <p>Quick start instructions for setting up the local runtime.</p>
+    </div>
+    <div class="doc-item" id="doc-api" data-guide="api" tabindex="0" role="button" aria-label="API Reference">
+      <h3>API Reference</h3>
+      <p>Complete documentation for client SDK and endpoints.</p>
+    </div>
+  </div>
+
+  <div id="doc-modal" class="doc-detail" role="dialog" aria-label="Guide Details">
+    <h2 id="modal-title">Installation Guide Details</h2>
+    <p id="modal-desc" data-detail="content">To install NexVision, ensure Node.js 20+ is installed and run npm install.</p>
+    <button id="modal-close" onclick="document.getElementById('doc-modal').classList.remove('visible')">Close</button>
+  </div>
+
+  <script>
+    document.getElementById('docs-search-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      const val = document.getElementById('docs-search').value.toLowerCase();
+      document.querySelectorAll('.doc-item').forEach(el => {
+        el.style.display = (!val || el.textContent.toLowerCase().includes(val)) ? 'block' : 'none';
+      });
+    });
+    document.querySelectorAll('.doc-item').forEach(el => {
+      el.addEventListener('click', function() {
+        document.getElementById('doc-modal').classList.add('visible');
+        document.getElementById('modal-title').textContent = this.querySelector('h3').textContent + ' Details';
+      });
+    });
+  </script>
+</body>
+</html>

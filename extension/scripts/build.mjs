@@ -58,11 +58,21 @@ copyFileSync(join(srcDir, 'popup', 'styles.css'), join(distDir, 'popup', 'styles
 // Copy popup HTML
 copyFileSync(join(srcDir, 'popup', 'popup.html'), join(distDir, 'popup', 'popup.html'));
 
-// Copy placeholder icons (minimal valid 1x1 transparent PNG)
-const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-const iconPlaceholder = Buffer.from(pngBase64, 'base64');
-['16', '48', '128'].forEach(size => {
-  writeFileSync(join(distDir, 'icons', `icon${size}.png`), iconPlaceholder);
+// Copy official extension icons
+const iconsSrcDir = join(rootDir, 'icons');
+const iconsDistDir = join(distDir, 'icons');
+mkdirSync(iconsDistDir, { recursive: true });
+
+['16', '32', '48', '128'].forEach(size => {
+  const iconSrc = join(iconsSrcDir, `icon${size}.png`);
+  const iconDest = join(iconsDistDir, `icon${size}.png`);
+  if (existsSync(iconSrc)) {
+    copyFileSync(iconSrc, iconDest);
+  } else {
+    // Fallback minimal valid PNG if icon missing
+    const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    writeFileSync(iconDest, Buffer.from(pngBase64, 'base64'));
+  }
 });
 
 console.log('✓ Build complete — output in extension/dist');

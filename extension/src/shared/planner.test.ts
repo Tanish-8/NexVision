@@ -19,10 +19,26 @@ import {
   planNextStep,
   validatePlannerInput,
   validateActionRoleCompatibility,
+  validateTaskFieldParameter,
+  validateTaskPhase,
+  validateTaskPlan,
+  validatePhaseExecutionState,
+  validateSafeModelHistoryStep,
+  VALID_PHASE_INTENTS,
+  VALID_TASK_ARCHETYPES,
   DeterministicRulePlanner,
   DEFAULT_MAX_PERCEPTION_AGE_MS,
   DEFAULT_MIN_CONFIDENCE,
-  DEFAULT_STRICT_ROLE_MATCHING
+  DEFAULT_STRICT_ROLE_MATCHING,
+  extractSearchQueryFromGoal,
+  cleanSearchQueryCandidate,
+  resolveActivePhase,
+  isMediaContentGoal,
+  isProfileOrChannelCandidate,
+  isMediaContentCandidate,
+  isProfileOrChannelUrl,
+  isMediaContentUrl,
+  validateAndNormalizeSearchQuery
 } from './planner.js';
 import type {
   PlannerGoal,
@@ -31,7 +47,14 @@ import type {
   PlannerInput,
   PlannerDriver,
   AdvisoryProposalResult,
-  AdvisoryStepProposal
+  AdvisoryStepProposal,
+  TaskPlan,
+  TaskPhase,
+  PhaseIntent,
+  TaskFieldParameter,
+  PhaseExecutionState,
+  SafeModelHistoryStep,
+  PlannerHistoryStep
 } from './planner.js';
 import type { PageElement, PageRepresentation } from './types.js';
 import type { ActionTarget } from './actions.js';
@@ -80,6 +103,7 @@ function createMockPlannerInput(overrides?: {
   goal?: Partial<PlannerGoal>;
   context?: Partial<PlannerContext>;
   options?: Partial<PlannerOptions>;
+  history?: readonly PlannerHistoryStep[];
 }): PlannerInput {
   const defaultGoal: PlannerGoal = {
     id: 'goal-checkout-1',
@@ -99,7 +123,8 @@ function createMockPlannerInput(overrides?: {
   return {
     goal: { ...defaultGoal, ...overrides?.goal },
     context: { ...defaultContext, ...overrides?.context },
-    ...(overrides?.options !== undefined ? { options: overrides.options } : {})
+    ...(overrides?.options !== undefined ? { options: overrides.options } : {}),
+    ...(overrides?.history !== undefined ? { history: overrides.history } : {})
   };
 }
 
@@ -1347,5 +1372,1756 @@ describe('Determinism & Serialization', () => {
     const deserialized = JSON.parse(serialized);
 
     expect(deserialized).toEqual(result);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Phase A — Hierarchical Task Plan & Phase Contracts
+// ---------------------------------------------------------------------------
+
+describe('Phase A — Hierarchical Task Plan & Phase Contracts', () => {
+  describe('TaskFieldParameter representation', () => {
+    it('validates a standard field parameter correctly', () => {
+      const param: TaskFieldParameter = {
+        fieldName: 'task name',
+        targetValue: 'college',
+        completed: false
+      };
+      expect(validateTaskFieldParameter(param)).toBeNull();
+    });
+
+    it('validates a vault reference field parameter', () => {
+      const vaultParam: TaskFieldParameter = {
+        fieldName: 'email',
+        targetValue: 'profile.email',
+        isVaultReference: true,
+        completed: true
+      };
+      expect(validateTaskFieldParameter(vaultParam)).toBeNull();
+    });
+
+    it('validates a field parameter with rawTargetValue', () => {
+      const paramWithRaw: TaskFieldParameter = {
+        fieldName: 'dueDate',
+        targetValue: '2026-09-29',
+        rawTargetValue: "today's date",
+        completed: false
+      };
+      expect(validateTaskFieldParameter(paramWithRaw)).toBeNull();
+    });
+
+    it('rejects invalid field parameters', () => {
+      expect(validateTaskFieldParameter(null)).toContain('must be a non-null object');
+      expect(validateTaskFieldParameter({})).toContain('fieldName must be a non-empty string');
+      expect(validateTaskFieldParameter({ fieldName: 'name', targetValue: 123 })).toContain('targetValue must be a string');
+      expect(validateTaskFieldParameter({ fieldName: 'name', targetValue: 'val', rawTargetValue: 123 })).toContain('rawTargetValue must be a string');
+      expect(validateTaskFieldParameter({ fieldName: 'name', targetValue: 'val', isVaultReference: 'yes' })).toContain('isVaultReference must be a boolean');
+      expect(validateTaskFieldParameter({ fieldName: 'name', targetValue: 'val', completed: 'no' })).toContain('completed must be a boolean');
+    });
+  });
+
+  describe('TaskPhase representation', () => {
+    it('validates an open_surface phase', () => {
+      const phase: TaskPhase = {
+        phaseId: 'phase-0',
+        phaseIndex: 0,
+        intent: 'open_surface',
+        description: 'Open the task creation dialog',
+        targetHint: 'Add Task, Create, +',
+        allowedActions: ['click'],
+        expectedOutcome: 'Task creation modal appears',
+        requiredForCompletion: true
+      };
+      expect(validateTaskPhase(phase)).toBeNull();
+    });
+
+    it('validates a fill_field phase with fieldParameter', () => {
+      const phase: TaskPhase = {
+        phaseId: 'phase-1',
+        phaseIndex: 1,
+        intent: 'fill_field',
+        description: 'Enter task name',
+        fieldParameter: {
+          fieldName: 'task name',
+          targetValue: 'college'
+        },
+        allowedActions: ['type', 'focus']
+      };
+      expect(validateTaskPhase(phase)).toBeNull();
+    });
+
+    it('rejects invalid task phase properties', () => {
+      expect(validateTaskPhase(null)).toContain('must be a non-null object');
+      expect(validateTaskPhase({ phaseIndex: 0 })).toContain('phase.phaseId must be a non-empty string');
+      expect(validateTaskPhase({ phaseId: 'p0', phaseIndex: -1 })).toContain('phase.phaseIndex must be a non-negative integer');
+      expect(validateTaskPhase({ phaseId: 'p0', phaseIndex: 0, intent: 'invalid_intent' })).toContain('phase.intent must belong to valid PhaseIntent vocabulary');
+      expect(validateTaskPhase({ phaseId: 'p0', phaseIndex: 0, intent: 'search', description: '' })).toContain('phase.description must be a non-empty string');
+      expect(validateTaskPhase({ phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'valid', targetHint: '' })).toContain('phase.targetHint must be a non-empty string');
+      expect(validateTaskPhase({ phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'valid', allowedActions: ['invalid' as any] })).toContain('allowedActions elements must be valid ActionTypes');
+      expect(validateTaskPhase({ phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'valid', fieldParameter: { fieldName: '' } as any })).toContain('fieldName must be a non-empty string');
+    });
+  });
+
+  describe('TaskPlan representation & serialization', () => {
+    it('validates a full multi-phase TaskPlan', () => {
+      const plan: TaskPlan = {
+        planId: 'plan-task-create-1',
+        archetype: 'form_submission',
+        summary: 'Create and add a task with name college, status pending, due date today, priority medium',
+        phases: [
+          {
+            phaseId: 'phase-open',
+            phaseIndex: 0,
+            intent: 'open_surface',
+            description: 'Open new task creation form',
+            targetHint: 'Add Task, New, +',
+            allowedActions: ['click']
+          },
+          {
+            phaseId: 'phase-name',
+            phaseIndex: 1,
+            intent: 'fill_field',
+            description: 'Enter task name',
+            fieldParameter: { fieldName: 'name', targetValue: 'college' },
+            allowedActions: ['type']
+          },
+          {
+            phaseId: 'phase-status',
+            phaseIndex: 2,
+            intent: 'select_option',
+            description: 'Set status to pending',
+            fieldParameter: { fieldName: 'status', targetValue: 'pending' },
+            allowedActions: ['click', 'type']
+          },
+          {
+            phaseId: 'phase-submit',
+            phaseIndex: 3,
+            intent: 'submit',
+            description: 'Submit task form',
+            targetHint: 'Save, Create, Submit',
+            allowedActions: ['click']
+          }
+        ],
+        currentPhaseIndex: 0,
+        extractedParameters: {
+          name: 'college',
+          status: 'pending',
+          dueDate: 'today',
+          priority: 'medium'
+        }
+      };
+
+      expect(validateTaskPlan(plan)).toBeNull();
+
+      // JSON round-trip serialization preservation
+      const json = JSON.stringify(plan);
+      const parsed = JSON.parse(json);
+      expect(parsed).toEqual(plan);
+      expect(validateTaskPlan(parsed)).toBeNull();
+    });
+
+    it('rejects invalid TaskPlan objects', () => {
+      expect(validateTaskPlan(null)).toContain('must be a non-null object');
+      expect(validateTaskPlan({})).toContain('plan.planId must be a non-empty string');
+      expect(validateTaskPlan({ planId: 'p1', archetype: 'invalid_arch' })).toContain('plan.archetype must belong to valid TaskArchetype vocabulary');
+      expect(validateTaskPlan({ planId: 'p1', archetype: 'form_submission', summary: '' })).toContain('plan.summary must be a non-empty string');
+      expect(validateTaskPlan({ planId: 'p1', archetype: 'form_submission', summary: 'ok', phases: [] })).toContain('plan.phases must contain at least one phase');
+      expect(validateTaskPlan({
+        planId: 'p1',
+        archetype: 'form_submission',
+        summary: 'ok',
+        phases: [{ phaseId: 'ph0', phaseIndex: 0, intent: 'search', description: 'desc' }],
+        currentPhaseIndex: 5
+      })).toContain('plan.currentPhaseIndex must be an integer between 0 and phases.length (1)');
+      expect(validateTaskPlan({
+        planId: 'p1',
+        archetype: 'form_submission',
+        summary: 'ok',
+        phases: [{ phaseId: 'ph0', phaseIndex: 0, intent: 'search', description: 'desc' }],
+        currentPhaseIndex: 0,
+        extractedParameters: { badKey: 123 as any }
+      })).toContain("plan.extractedParameters['badKey'] must be a string");
+    });
+  });
+
+  describe('PhaseExecutionState representation', () => {
+    it('validates a valid PhaseExecutionState', () => {
+      const state: PhaseExecutionState = {
+        activePhase: {
+          phaseId: 'ph-1',
+          phaseIndex: 1,
+          intent: 'fill_field',
+          description: 'Enter name',
+          allowedActions: ['type']
+        },
+        completedPhaseIds: ['ph-0'],
+        remainingPhaseIds: ['ph-2', 'ph-3'],
+        totalPhases: 4,
+        retryCountInCurrentPhase: 0
+      };
+      expect(validatePhaseExecutionState(state)).toBeNull();
+    });
+
+    it('validates terminal PhaseExecutionState with undefined activePhase', () => {
+      const terminalState: PhaseExecutionState = {
+        activePhase: undefined,
+        completedPhaseIds: ['ph-0', 'ph-1', 'ph-2', 'ph-3'],
+        remainingPhaseIds: [],
+        totalPhases: 4,
+        retryCountInCurrentPhase: 0
+      };
+      expect(validatePhaseExecutionState(terminalState)).toBeNull();
+    });
+
+    it('rejects invalid PhaseExecutionState', () => {
+      expect(validatePhaseExecutionState(null)).toContain('must be a non-null object');
+      expect(validatePhaseExecutionState({ completedPhaseIds: 'not-array' })).toContain('completedPhaseIds must be an array');
+      expect(validatePhaseExecutionState({ completedPhaseIds: [], remainingPhaseIds: 'not-array' })).toContain('remainingPhaseIds must be an array');
+      expect(validatePhaseExecutionState({ completedPhaseIds: [], remainingPhaseIds: [], totalPhases: -1 })).toContain('totalPhases must be a non-negative integer');
+      expect(validatePhaseExecutionState({ completedPhaseIds: [], remainingPhaseIds: [], totalPhases: 1, retryCountInCurrentPhase: -1 })).toContain('retryCountInCurrentPhase must be a non-negative integer');
+    });
+  });
+
+  describe('SafeModelHistoryStep representation', () => {
+    it('validates a privacy-safe history step carrying phase provenance', () => {
+      const step: SafeModelHistoryStep = {
+        stepIndex: 1,
+        phaseIndex: 1,
+        phaseIntent: 'fill_field',
+        actionType: 'type',
+        targetElementId: 'elem-task-name',
+        targetRole: 'textbox',
+        fulfilledParameter: 'task.name',
+        perceivedOutcome: 'success'
+      };
+      expect(validateSafeModelHistoryStep(step)).toBeNull();
+
+      // Confirms typed text is NOT part of SafeModelHistoryStep contract
+      expect((step as any).text).toBeUndefined();
+      expect((step as any).payload).toBeUndefined();
+    });
+
+    it('rejects malformed SafeModelHistoryStep', () => {
+      expect(validateSafeModelHistoryStep(null)).toContain('must be a non-null object');
+      expect(validateSafeModelHistoryStep({ stepIndex: -1 })).toContain('stepIndex must be a non-negative integer');
+      expect(validateSafeModelHistoryStep({ stepIndex: 0, phaseIndex: -1 })).toContain('phaseIndex must be a non-negative integer');
+      expect(validateSafeModelHistoryStep({ stepIndex: 0, phaseIntent: 'invalid_intent' })).toContain('phaseIntent must belong to valid PhaseIntent vocabulary');
+      expect(validateSafeModelHistoryStep({ stepIndex: 0, actionType: 'invalid_action' as any })).toContain("actionType must be one of 'click', 'type', 'focus'");
+      expect(validateSafeModelHistoryStep({ stepIndex: 0, actionType: 'click', targetElementId: '' })).toContain('targetElementId must be a non-empty string');
+      expect(validateSafeModelHistoryStep({ stepIndex: 0, actionType: 'click', targetElementId: 'el1', perceivedOutcome: 'unknown' as any })).toContain("perceivedOutcome must be 'success', 'no_change', or 'error'");
+    });
+  });
+
+  describe('PlannerInput Integration with Phase A Contracts', () => {
+    it('accepts PlannerInput with valid taskPlan and phaseState', async () => {
+      const validPlan: TaskPlan = {
+        planId: 'plan-1',
+        archetype: 'search_and_act',
+        summary: 'Search for tutorial and open first video',
+        phases: [
+          { phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'Search query', allowedActions: ['click', 'type'] },
+          { phaseId: 'p1', phaseIndex: 1, intent: 'select_result', description: 'Select video', allowedActions: ['click'] }
+        ],
+        currentPhaseIndex: 0
+      };
+
+      const validPhaseState: PhaseExecutionState = {
+        activePhase: validPlan.phases[0],
+        completedPhaseIds: [],
+        remainingPhaseIds: ['p1'],
+        totalPhases: 2,
+        retryCountInCurrentPhase: 0
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          taskPlan: validPlan
+        },
+        context: {
+          phaseState: validPhaseState
+        }
+      });
+
+      expect(validatePlannerInput(input)).toBeNull();
+      const result = await planNextStep(input);
+      expect(result.status).toBe('ACTION');
+    });
+
+    it('rejects proposal with INCOMPATIBLE_ACTION_FOR_PHASE when action violates activePhase.allowedActions', async () => {
+      const validPlan: TaskPlan = {
+        planId: 'plan-1',
+        archetype: 'search_and_act',
+        summary: 'Search for tutorial and open first video',
+        phases: [
+          { phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'Search query', allowedActions: ['type'] },
+          { phaseId: 'p1', phaseIndex: 1, intent: 'select_result', description: 'Select video', allowedActions: ['click'] }
+        ],
+        currentPhaseIndex: 0
+      };
+
+      const validPhaseState: PhaseExecutionState = {
+        activePhase: validPlan.phases[0], // allowedActions: ['type'] only
+        completedPhaseIds: [],
+        remainingPhaseIds: ['p1'],
+        totalPhases: 2,
+        retryCountInCurrentPhase: 0
+      };
+
+      // createMockPlannerInput defaults to button click
+      const input = createMockPlannerInput({
+        goal: {
+          taskPlan: validPlan
+        },
+        context: {
+          phaseState: validPhaseState
+        }
+      });
+
+      const result = await planNextStep(input);
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toBe('INCOMPATIBLE_ACTION_FOR_PHASE');
+      }
+    });
+
+    it('rejects PlannerInput with malformed taskPlan', () => {
+      const input = createMockPlannerInput({
+        goal: {
+          taskPlan: { planId: '' } as any
+        }
+      });
+      const err = validatePlannerInput(input);
+      expect(err).toContain('goal.taskPlan');
+    });
+
+    it('rejects PlannerInput with malformed phaseState', () => {
+      const input = createMockPlannerInput({
+        context: {
+          phaseState: { totalPhases: -1 } as any
+        }
+      });
+      const err = validatePlannerInput(input);
+      expect(err).toContain('context.phaseState');
+    });
+
+    it('validates history step with phaseIndex and phaseIntent', () => {
+      const input = createMockPlannerInput();
+      const inputWithPhaseHistory = {
+        ...input,
+        history: [
+          {
+            stepIndex: 0,
+            action: {
+              id: 'a0',
+              type: 'click' as const,
+              target: createMockActionTarget()
+            },
+            phaseIndex: 0,
+            phaseIntent: 'open_surface' as const,
+            fulfilledParameter: 'task.openModal',
+            perceivedOutcome: 'success' as const
+          }
+        ]
+      };
+      expect(validatePlannerInput(inputWithPhaseHistory)).toBeNull();
+    });
+
+    it('rejects history step with invalid phaseIntent', () => {
+      const input = createMockPlannerInput();
+      const inputWithBadHistory = {
+        ...input,
+        history: [
+          {
+            stepIndex: 0,
+            action: {
+              id: 'a0',
+              type: 'click' as const,
+              target: createMockActionTarget()
+            },
+            phaseIntent: 'bogus_phase' as any
+          }
+        ]
+      };
+      const err = validatePlannerInput(inputWithBadHistory);
+      expect(err).toContain('phaseIntent must belong to valid PhaseIntent vocabulary');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase E: Generic Browser Action Layer & Capability-Aware Selection
+  // -------------------------------------------------------------------------
+  describe('Phase E: Generic Browser Action Layer & Capability-Aware Selection', () => {
+    const planner = new DeterministicRulePlanner();
+
+    it('1. select_option + native <select> -> type', async () => {
+      const selectElement = createMockPageElement({
+        id: 'status-select',
+        tagName: 'select',
+        role: 'combobox',
+        accessibleName: 'Status',
+        visibleText: 'Select Status'
+      });
+      const selectTarget = createMockActionTarget({
+        elementId: 'status-select',
+        role: 'combobox'
+      });
+      const selectPhase: TaskPhase = {
+        phaseId: 'p-status',
+        phaseIndex: 0,
+        intent: 'select_option',
+        description: 'Select status as pending',
+        targetHint: 'status',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'status', targetValue: 'pending' }
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-status',
+          description: 'Set status to pending',
+          intent: 'custom',
+          taskPlan: {
+            planId: 'tp-1',
+            archetype: 'form_submission',
+            summary: 'Form flow',
+            phases: [selectPhase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          page: createMockPage([selectElement]),
+          availableTargets: [selectTarget],
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        expect(res.action.type).toBe('type');
+        expect(res.action.target.elementId).toBe('status-select');
+        if (res.action.type === 'type') {
+          expect(res.action.payload?.text).toBe('pending');
+          expect(res.action.payload?.pressEnter).toBe(false);
+        }
+      }
+    });
+
+    it('2. select_option + radio -> click', async () => {
+      const radioElement = createMockPageElement({
+        id: 'priority-medium-radio',
+        tagName: 'input',
+        role: 'radio',
+        accessibleName: 'Medium Priority',
+        visibleText: 'Medium'
+      });
+      const radioTarget = createMockActionTarget({
+        elementId: 'priority-medium-radio',
+        role: 'radio'
+      });
+      const selectPhase: TaskPhase = {
+        phaseId: 'p-priority',
+        phaseIndex: 0,
+        intent: 'select_option',
+        description: 'Select priority as medium',
+        targetHint: 'medium',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'priority', targetValue: 'medium' }
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-priority',
+          description: 'Choose medium priority',
+          intent: 'custom',
+          taskPlan: {
+            planId: 'tp-2',
+            archetype: 'form_submission',
+            summary: 'Form flow',
+            phases: [selectPhase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          page: createMockPage([radioElement]),
+          availableTargets: [radioTarget],
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        expect(res.action.type).toBe('click');
+        expect(res.action.target.elementId).toBe('priority-medium-radio');
+      }
+    });
+
+    it('3. select_option + checkbox -> click', async () => {
+      const checkboxElement = createMockPageElement({
+        id: 'agree-terms-checkbox',
+        tagName: 'input',
+        role: 'checkbox',
+        accessibleName: 'I Agree',
+        visibleText: 'Agree to terms'
+      });
+      const checkboxTarget = createMockActionTarget({
+        elementId: 'agree-terms-checkbox',
+        role: 'checkbox'
+      });
+      const selectPhase: TaskPhase = {
+        phaseId: 'p-terms',
+        phaseIndex: 0,
+        intent: 'select_option',
+        description: 'Check terms agreement',
+        targetHint: 'terms',
+        allowedActions: ['click', 'type']
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-terms',
+          description: 'Agree to terms',
+          intent: 'custom',
+          taskPlan: {
+            planId: 'tp-3',
+            archetype: 'form_submission',
+            summary: 'Form flow',
+            phases: [selectPhase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          page: createMockPage([checkboxElement]),
+          availableTargets: [checkboxTarget],
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        expect(res.action.type).toBe('click');
+        expect(res.action.target.elementId).toBe('agree-terms-checkbox');
+      }
+    });
+
+    it('4. select_option + ARIA combobox -> click', async () => {
+      const comboboxElement = createMockPageElement({
+        id: 'custom-dropdown-trigger',
+        tagName: 'div',
+        role: 'combobox',
+        accessibleName: 'Category Selector',
+        visibleText: 'Select category'
+      });
+      const comboboxTarget = createMockActionTarget({
+        elementId: 'custom-dropdown-trigger',
+        role: 'combobox'
+      });
+      const selectPhase: TaskPhase = {
+        phaseId: 'p-category',
+        phaseIndex: 0,
+        intent: 'select_option',
+        description: 'Open category combobox',
+        targetHint: 'category',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'category', targetValue: 'electronics' }
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-category',
+          description: 'Select category',
+          intent: 'custom',
+          taskPlan: {
+            planId: 'tp-4',
+            archetype: 'form_submission',
+            summary: 'Form flow',
+            phases: [selectPhase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          page: createMockPage([comboboxElement]),
+          availableTargets: [comboboxTarget],
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        expect(res.action.type).toBe('click');
+        expect(res.action.target.elementId).toBe('custom-dropdown-trigger');
+      }
+    });
+
+    it('7. select_option never falls through to search intent (does not prioritize global searchbox)', async () => {
+      const searchBox = createMockPageElement({
+        id: 'global-search',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search everywhere',
+        visibleText: ''
+      });
+      const selectElement = createMockPageElement({
+        id: 'status-dropdown',
+        tagName: 'select',
+        role: 'combobox',
+        accessibleName: 'Status',
+        visibleText: 'Status'
+      });
+      const searchTarget = createMockActionTarget({
+        elementId: 'global-search',
+        role: 'searchbox'
+      });
+      const selectTarget = createMockActionTarget({
+        elementId: 'status-dropdown',
+        role: 'combobox'
+      });
+
+      const selectPhase: TaskPhase = {
+        phaseId: 'p-select',
+        phaseIndex: 1,
+        intent: 'select_option',
+        description: 'Select status',
+        targetHint: 'status',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'status', targetValue: 'in_progress' }
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-taskflow',
+          description: 'Create and add a task with name college and status in_progress',
+          intent: 'custom',
+          taskPlan: {
+            planId: 'tp-tf',
+            archetype: 'form_submission',
+            summary: 'Create task',
+            phases: [
+              { phaseId: 'p-title', phaseIndex: 0, intent: 'fill_field', description: 'Enter title', allowedActions: ['type'] },
+              selectPhase
+            ],
+            currentPhaseIndex: 1
+          }
+        },
+        context: {
+          page: createMockPage([searchBox, selectElement]),
+          availableTargets: [searchTarget, selectTarget],
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: ['p-title'],
+            remainingPhaseIds: [],
+            totalPhases: 2,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        // Must select the status select, NOT the search box
+        expect(res.action.target.elementId).toBe('status-dropdown');
+        expect(res.action.type).toBe('type');
+        if (res.action.type === 'type') {
+          expect(res.action.payload?.text).toBe('in_progress');
+          expect(res.action.payload?.pressEnter).toBe(false);
+        }
+      }
+    });
+
+    it('7b. select_option with overarching goal.intent === "search" never falls through to searchbox', async () => {
+      const searchBox = createMockPageElement({
+        id: 'site-search',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search products',
+        visibleText: ''
+      });
+      const selectElement = createMockPageElement({
+        id: 'category-dropdown',
+        tagName: 'select',
+        role: 'combobox',
+        accessibleName: 'Category',
+        visibleText: 'Category'
+      });
+      const searchTarget = createMockActionTarget({
+        elementId: 'site-search',
+        role: 'searchbox'
+      });
+      const selectTarget = createMockActionTarget({
+        elementId: 'category-dropdown',
+        role: 'combobox'
+      });
+
+      const selectPhase: TaskPhase = {
+        phaseId: 'p-category',
+        phaseIndex: 1,
+        intent: 'select_option',
+        description: 'Select category electronics',
+        targetHint: 'category',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'category', targetValue: 'electronics' }
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-search-category',
+          description: 'Search products and select category electronics',
+          intent: 'search', // Overarching goal intent is search
+          taskPlan: {
+            planId: 'tp-search-cat',
+            archetype: 'search_and_act',
+            summary: 'Search and category flow',
+            phases: [
+              { phaseId: 'p-search', phaseIndex: 0, intent: 'search', description: 'Search query', allowedActions: ['type'] },
+              selectPhase
+            ],
+            currentPhaseIndex: 1
+          }
+        },
+        context: {
+          page: createMockPage([searchBox, selectElement]),
+          availableTargets: [searchTarget, selectTarget],
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: ['p-search'],
+            remainingPhaseIds: [],
+            totalPhases: 2,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        expect(res.action.target.elementId).toBe('category-dropdown');
+        expect(res.action.type).toBe('type');
+        if (res.action.type === 'type') {
+          expect(res.action.payload?.text).toBe('electronics');
+          expect(res.action.payload?.pressEnter).toBe(false);
+        }
+      }
+    });
+
+    it('7c. select_option with only searchbox present fails with NO_FEASIBLE_TARGET instead of falling through', async () => {
+      const searchBox = createMockPageElement({
+        id: 'global-search-only',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        visibleText: ''
+      });
+      const searchTarget = createMockActionTarget({
+        elementId: 'global-search-only',
+        role: 'searchbox'
+      });
+
+      const selectPhase: TaskPhase = {
+        phaseId: 'p-status',
+        phaseIndex: 0,
+        intent: 'select_option',
+        description: 'Select status',
+        targetHint: 'status',
+        allowedActions: ['click', 'type'],
+        fieldParameter: { fieldName: 'status', targetValue: 'pending' }
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-status-only',
+          description: 'Select status',
+          intent: 'search',
+          taskPlan: {
+            planId: 'tp-status',
+            archetype: 'form_submission',
+            summary: 'Status flow',
+            phases: [selectPhase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          page: createMockPage([searchBox]),
+          availableTargets: [searchTarget],
+          phaseState: {
+            activePhase: selectPhase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('FAILED');
+      if (res.status === 'FAILED') {
+        expect(res.reason).toBe('NO_FEASIBLE_TARGET');
+      }
+    });
+
+    it('8. existing search behavior remains unchanged', async () => {
+      const searchBox = createMockPageElement({
+        id: 'search-input',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        visibleText: ''
+      });
+      const searchTarget = createMockActionTarget({
+        elementId: 'search-input',
+        role: 'searchbox'
+      });
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-search',
+          description: 'Search for headphones',
+          intent: 'search',
+          parameters: { text: 'headphones' }
+        },
+        context: {
+          page: createMockPage([searchBox]),
+          availableTargets: [searchTarget]
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        expect(res.action.type).toBe('type');
+        expect(res.action.target.elementId).toBe('search-input');
+        if (res.action.type === 'type') {
+          expect(res.action.payload?.text).toBe('headphones');
+          expect(res.action.payload?.pressEnter).toBe(true);
+        }
+      }
+    });
+
+    it('9. existing fill_field behavior remains unchanged', async () => {
+      const textInput = createMockPageElement({
+        id: 'task-title',
+        tagName: 'input',
+        role: 'textbox',
+        accessibleName: 'Task Title',
+        visibleText: ''
+      });
+      const titleTarget = createMockActionTarget({
+        elementId: 'task-title',
+        role: 'textbox'
+      });
+
+      const fillPhase: TaskPhase = {
+        phaseId: 'p-title',
+        phaseIndex: 0,
+        intent: 'fill_field',
+        description: 'Enter task title',
+        targetHint: 'title',
+        allowedActions: ['type'],
+        fieldParameter: { fieldName: 'title', targetValue: 'college' }
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-fill',
+          description: 'Enter task title',
+          intent: 'type',
+          taskPlan: {
+            planId: 'tp-fill',
+            archetype: 'form_submission',
+            summary: 'Form flow',
+            phases: [fillPhase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          page: createMockPage([textInput]),
+          availableTargets: [titleTarget],
+          phaseState: {
+            activePhase: fillPhase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const res = await planNextStep(input, planner);
+      expect(res.status).toBe('ACTION');
+      if (res.status === 'ACTION') {
+        expect(res.action.type).toBe('type');
+        expect(res.action.target.elementId).toBe('task-title');
+        if (res.action.type === 'type') {
+          expect(res.action.payload?.text).toBe('college');
+          expect(res.action.payload?.pressEnter).toBe(false);
+        }
+      }
+    });
+
+    it('10. privacy behavior remains unchanged (sensitive field parameters masked in history validation)', () => {
+      const sensitivePhase: TaskPhase = {
+        phaseId: 'p-pass',
+        phaseIndex: 0,
+        intent: 'fill_field',
+        description: 'Enter confidential password',
+        fieldParameter: { fieldName: 'password', targetValue: 'super_secret_999' },
+        allowedActions: ['type']
+      };
+
+      const plan: TaskPlan = {
+        planId: 'tp-priv',
+        archetype: 'form_submission',
+        summary: 'Enter sensitive information',
+        phases: [sensitivePhase],
+        currentPhaseIndex: 0
+      };
+
+      const planError = validateTaskPlan(plan);
+      expect(planError).toBeNull();
+
+      // SafeModelHistoryStep validation rejects non-string or unknown outcome
+      const invalidOutcomeStep = {
+        stepIndex: 0,
+        actionType: 'type',
+        targetElementId: 'pwd-input',
+        perceivedOutcome: 'leaked_data'
+      };
+      const histErr = validateSafeModelHistoryStep(invalidOutcomeStep);
+      expect(histErr).toContain("perceivedOutcome must be 'success', 'no_change', or 'error'");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Generic Search-Phase Interaction Policy & Autocomplete Handling (Section 7 A-G)
+  // -------------------------------------------------------------------------
+  describe('Generic Search-Phase Interaction Policy & Autocomplete Handling', () => {
+    const planner = new DeterministicRulePlanner();
+
+    it('extractSearchQueryFromGoal extracts query from compound and simple descriptions', () => {
+      expect(extractSearchQueryFromGoal('Search for MrBeast', 'Search for MrBeast and play the first video')).toBe('MrBeast');
+      expect(extractSearchQueryFromGoal(undefined, 'Search for MrBeast and play the first video')).toBe('MrBeast');
+      expect(extractSearchQueryFromGoal(undefined, 'Search for laptops under ₹50,000')).toBe('laptops under ₹50,000');
+      expect(extractSearchQueryFromGoal(undefined, 'Find wireless headphones and view details')).toBe('wireless headphones');
+      expect(extractSearchQueryFromGoal('Search "retro sneakers"', undefined)).toBe('retro sneakers');
+    });
+
+    it('A. Search input + autocomplete option: expected action = type + pressEnter; suggestion is NOT selected', () => {
+      const searchBox = createMockPageElement({
+        id: 'search-input',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        interactive: true
+      });
+      const suggestionOption = createMockPageElement({
+        id: 'suggestion-mrbeast',
+        tagName: 'div',
+        role: 'option',
+        accessibleName: 'MrBeast',
+        visibleText: 'MrBeast',
+        interactive: true
+      });
+
+      const targets: ActionTarget[] = [
+        createMockActionTarget({ elementId: 'suggestion-mrbeast', role: 'option', confidence: 0.95 }),
+        createMockActionTarget({ elementId: 'search-input', role: 'searchbox', confidence: 0.95 })
+      ];
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-search',
+          description: 'Search for MrBeast and play the first video',
+          intent: 'search'
+        },
+        context: {
+          page: createMockPage([suggestionOption, searchBox]),
+          availableTargets: targets
+        }
+      });
+
+      const result = planner.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status === 'ACTION') {
+        expect(result.proposal.targetElementId).toBe('search-input');
+        expect(result.proposal.actionType).toBe('type');
+        expect(result.proposal.payload).toEqual({
+          text: 'MrBeast',
+          clearFirst: true,
+          pressEnter: true
+        });
+      }
+    });
+
+    it('B. Search input + multiple autocomplete suggestions: search input remains preferred', () => {
+      const searchBox = createMockPageElement({
+        id: 'search-input',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        interactive: true
+      });
+      const suggestions = [
+        createMockPageElement({ id: 'sugg-1', role: 'option', visibleText: 'MrBeast', interactive: true }),
+        createMockPageElement({ id: 'sugg-2', role: 'option', visibleText: 'MrBeast video', interactive: true }),
+        createMockPageElement({ id: 'sugg-3', role: 'option', visibleText: 'MrBeast first video', interactive: true }),
+        createMockPageElement({ id: 'sugg-4', role: 'menuitem', visibleText: 'MrBeast gaming', interactive: true })
+      ];
+
+      const targets: ActionTarget[] = [
+        ...suggestions.map(s => createMockActionTarget({ elementId: s.id, role: s.role, confidence: 1.0 })),
+        createMockActionTarget({ elementId: 'search-input', role: 'searchbox', confidence: 0.9 })
+      ];
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-multi-sugg',
+          description: 'Search for MrBeast and play the first video',
+          intent: 'search'
+        },
+        context: {
+          page: createMockPage([...suggestions, searchBox]),
+          availableTargets: targets
+        }
+      });
+
+      const result = planner.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status === 'ACTION') {
+        expect(result.proposal.targetElementId).toBe('search-input');
+        expect(result.proposal.actionType).toBe('type');
+        expect(result.proposal.payload?.pressEnter).toBe(true);
+      }
+    });
+
+    it('C. Search input with no autocomplete: existing behavior preserved', () => {
+      const searchBox = createMockPageElement({
+        id: 'search-input',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search query',
+        interactive: true
+      });
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-clean-search',
+          description: 'Search for mechanical keyboards',
+          intent: 'search'
+        },
+        context: {
+          page: createMockPage([searchBox]),
+          availableTargets: [createMockActionTarget({ elementId: 'search-input', role: 'searchbox' })]
+        }
+      });
+
+      const result = planner.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status === 'ACTION') {
+        expect(result.proposal.targetElementId).toBe('search-input');
+        expect(result.proposal.actionType).toBe('type');
+        expect(result.proposal.payload).toEqual({
+          text: 'mechanical keyboards',
+          clearFirst: true,
+          pressEnter: true
+        });
+      }
+    });
+
+    it('D. Search input + explicit search button: search input preferred; fallback button preserved if no input', () => {
+      const searchBox = createMockPageElement({
+        id: 'search-input',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        interactive: true
+      });
+      const searchBtn = createMockPageElement({
+        id: 'search-btn',
+        tagName: 'button',
+        role: 'button',
+        accessibleName: 'Search',
+        interactive: true
+      });
+
+      // Both present: search input preferred for typing query + enter
+      const inputBoth = createMockPlannerInput({
+        goal: {
+          id: 'goal-both',
+          description: 'Search for laptops under ₹50,000',
+          intent: 'search'
+        },
+        context: {
+          page: createMockPage([searchBtn, searchBox]),
+          availableTargets: [
+            createMockActionTarget({ elementId: 'search-btn', role: 'button' }),
+            createMockActionTarget({ elementId: 'search-input', role: 'searchbox' })
+          ]
+        }
+      });
+
+      const resultBoth = planner.proposeStep(inputBoth);
+      expect(resultBoth.status).toBe('ACTION');
+      if (resultBoth.status === 'ACTION') {
+        expect(resultBoth.proposal.targetElementId).toBe('search-input');
+        expect(resultBoth.proposal.actionType).toBe('type');
+        expect(resultBoth.proposal.payload?.pressEnter).toBe(true);
+      }
+
+      // Only button present: fallback click on search button preserved
+      const inputBtnOnly = createMockPlannerInput({
+        goal: {
+          id: 'goal-btn-only',
+          description: 'Search for laptops',
+          intent: 'search'
+        },
+        context: {
+          page: createMockPage([searchBtn]),
+          availableTargets: [createMockActionTarget({ elementId: 'search-btn', role: 'button' })]
+        }
+      });
+
+      const resultBtnOnly = planner.proposeStep(inputBtnOnly);
+      expect(resultBtnOnly.status).toBe('ACTION');
+      if (resultBtnOnly.status === 'ACTION') {
+        expect(resultBtnOnly.proposal.targetElementId).toBe('search-btn');
+        expect(resultBtnOnly.proposal.actionType).toBe('click');
+      }
+    });
+
+    it('E. Search phase must not click suggestion merely because it has high lexical similarity', () => {
+      // Suggestion has 100% exact lexical similarity to the user goal
+      const highLexicalSuggestion = createMockPageElement({
+        id: 'exact-match-suggestion',
+        tagName: 'div',
+        role: 'option',
+        accessibleName: 'Search for MrBeast and play the first video',
+        visibleText: 'Search for MrBeast and play the first video',
+        interactive: true
+      });
+      const searchBox = createMockPageElement({
+        id: 'search-box',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        interactive: true
+      });
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-lexical',
+          description: 'Search for MrBeast and play the first video',
+          intent: 'search'
+        },
+        context: {
+          page: createMockPage([highLexicalSuggestion, searchBox]),
+          availableTargets: [
+            createMockActionTarget({ elementId: 'exact-match-suggestion', role: 'option' }),
+            createMockActionTarget({ elementId: 'search-box', role: 'searchbox' })
+          ]
+        }
+      });
+
+      const result = planner.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status === 'ACTION') {
+        expect(result.proposal.targetElementId).toBe('search-box');
+        expect(result.proposal.actionType).toBe('type');
+      }
+    });
+
+    it('F. After search submission: compound goal transitions to select_result', () => {
+      const searchPhase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'search',
+        description: 'Search for MrBeast',
+        allowedActions: ['type']
+      };
+      const selectResultPhase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'select_result',
+        description: 'Select the video result',
+        allowedActions: ['click']
+      };
+      const plan: TaskPlan = {
+        planId: 'plan-comp',
+        archetype: 'search_and_act',
+        summary: 'Search and play',
+        phases: [searchPhase, selectResultPhase],
+        currentPhaseIndex: 0
+      };
+
+      const historyAfterSearch = [
+        {
+          stepIndex: 0,
+          action: {
+            id: 'act-0',
+            type: 'type' as const,
+            target: createMockActionTarget({ elementId: 'search-input', role: 'searchbox' }),
+            payload: { text: 'MrBeast', pressEnter: true }
+          },
+          perceivedOutcome: 'success' as const,
+          phaseIndex: 0,
+          phaseIntent: 'search' as const
+        }
+      ];
+
+      const active = resolveActivePhase(
+        { id: 'goal-comp', description: 'Search for MrBeast and play the first video', taskPlan: plan },
+        undefined,
+        historyAfterSearch
+      );
+
+      expect(active?.phaseIndex).toBe(1);
+      expect(active?.intent).toBe('select_result');
+    });
+
+    it('G. select_result phase: actual result links remain selectable and preferred', () => {
+      const searchBox = createMockPageElement({
+        id: 'search-input',
+        tagName: 'input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        visibleText: 'MrBeast',
+        interactive: true
+      });
+      const videoResultLink = createMockPageElement({
+        id: 'video-card-1',
+        tagName: 'a',
+        role: 'link',
+        accessibleName: 'MrBeast: $1,000,000 Video',
+        visibleText: 'MrBeast: $1,000,000 Video',
+        attributes: { href: '/watch?v=123' },
+        interactive: true
+      });
+
+      const selectResultPhase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'select_result',
+        description: 'Select the video result',
+        targetHint: 'MrBeast',
+        allowedActions: ['click']
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-select',
+          description: 'Search for MrBeast and play the first video',
+          intent: 'click',
+          taskPlan: {
+            planId: 'plan-select',
+            archetype: 'search_and_act',
+            summary: 'Search and play',
+            phases: [
+              { phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'Search', allowedActions: ['type'] },
+              selectResultPhase
+            ],
+            currentPhaseIndex: 1
+          }
+        },
+        context: {
+          page: createMockPage([searchBox, videoResultLink]),
+          availableTargets: [
+            createMockActionTarget({ elementId: 'search-input', role: 'searchbox' }),
+            createMockActionTarget({ elementId: 'video-card-1', role: 'link' })
+          ],
+          phaseState: {
+            activePhase: selectResultPhase,
+            completedPhaseIds: ['p0'],
+            remainingPhaseIds: [],
+            totalPhases: 2,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const result = planner.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status === 'ACTION') {
+        expect(result.proposal.targetElementId).toBe('video-card-1');
+        expect(result.proposal.actionType).toBe('click');
+      }
+    });
+
+    it('H. Content result candidate is strictly preferred over generic profile/channel link in select_result', () => {
+      // Channel / profile card appears earlier in DOM, has more tokens matching "MrBeast"
+      const channelCard = createMockPageElement({
+        id: 'channel-card-elem-1',
+        tagName: 'a',
+        role: 'link',
+        accessibleName: 'MrBeast @MrBeast • 519M subscribers • Official MrBeast Channel',
+        visibleText: 'MrBeast @MrBeast • 519M subscribers',
+        attributes: { href: '/@MrBeast' },
+        interactive: true
+      });
+
+      // Video result appears later in DOM with media URL and timestamp
+      const videoResult = createMockPageElement({
+        id: 'video-card-elem-2',
+        tagName: 'a',
+        role: 'link',
+        accessibleName: '$456,000 Squid Game In Real Life! by MrBeast 25 minutes 758M views',
+        visibleText: '$456,000 Squid Game In Real Life!',
+        attributes: { href: '/watch?v=0e3GPea1Tyg' },
+        interactive: true
+      });
+
+      const selectResultPhase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'select_result',
+        description: 'Select the first video',
+        targetHint: 'MrBeast',
+        allowedActions: ['click']
+      };
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-play',
+          description: 'Search for MrBeast and play the first video',
+          intent: 'click',
+          taskPlan: {
+            planId: 'plan-play',
+            archetype: 'search_and_act',
+            summary: 'Search and play',
+            phases: [
+              { phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'Search for MrBeast', allowedActions: ['type'] },
+              selectResultPhase
+            ],
+            currentPhaseIndex: 1
+          }
+        },
+        context: {
+          // Channel card appears first in DOM order
+          page: createMockPage([channelCard, videoResult]),
+          availableTargets: [
+            createMockActionTarget({ elementId: 'channel-card-elem-1', role: 'link' }),
+            createMockActionTarget({ elementId: 'video-card-elem-2', role: 'link' })
+          ],
+          phaseState: {
+            activePhase: selectResultPhase,
+            completedPhaseIds: ['p0'],
+            remainingPhaseIds: [],
+            totalPhases: 2,
+            retryCountInCurrentPhase: 0,
+            phaseStatus: 'in_progress',
+            phaseAttempts: 0
+          }
+        }
+      });
+
+      const result = planner.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status === 'ACTION') {
+        // Video candidate MUST be selected, NOT the channel card
+        expect(result.proposal.targetElementId).toBe('video-card-elem-2');
+        expect(result.proposal.actionType).toBe('click');
+      }
+    });
+
+    it('I. Generic content vs profile helpers correctly classify elements and URLs', () => {
+      expect(isMediaContentGoal('Search for MrBeast and play the first video')).toBe(true);
+      expect(isMediaContentGoal('Watch this video')).toBe(true);
+      expect(isMediaContentGoal('Search for laptops under ₹50,000')).toBe(false);
+
+      expect(isProfileOrChannelUrl('/@MrBeast')).toBe(true);
+      expect(isProfileOrChannelUrl('/channel/UCX6OQ3DkcsbYNE6H8uQQuVA')).toBe(true);
+      expect(isProfileOrChannelUrl('/user/someone')).toBe(true);
+      expect(isProfileOrChannelUrl('/watch?v=123')).toBe(false);
+
+      expect(isMediaContentUrl('/watch?v=123')).toBe(true);
+      expect(isMediaContentUrl('/video/abc')).toBe(true);
+      expect(isMediaContentUrl('/@MrBeast')).toBe(false);
+
+      const channelElem = createMockPageElement({
+        id: 'c1',
+        role: 'link',
+        accessibleName: '@Creator 100K subscribers',
+        attributes: { href: '/@Creator' }
+      });
+      expect(isProfileOrChannelCandidate(channelElem)).toBe(true);
+      expect(isMediaContentCandidate(channelElem)).toBe(false);
+
+      const videoElem = createMockPageElement({
+        id: 'v1',
+        role: 'link',
+        accessibleName: 'Awesome Clip 12:34 50K views',
+        attributes: { href: '/watch?v=xyz' }
+      });
+      expect(isProfileOrChannelCandidate(videoElem)).toBe(false);
+      expect(isMediaContentCandidate(videoElem)).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // NexBank & Generic Item-Retrieval Search Tests (Regression Suite)
+  // -------------------------------------------------------------------------
+  describe('NexBank & Generic Item-Retrieval Search Tests (Regression Suite)', () => {
+    it('1. Search query extraction: "Find my latest Amazon transaction." -> "Amazon"', () => {
+      expect(extractSearchQueryFromGoal(undefined, 'Find my latest Amazon transaction.')).toBe('Amazon');
+      expect(extractSearchQueryFromGoal('Search for the latest Amazon transaction.', 'Find my latest Amazon transaction.')).toBe('Amazon');
+    });
+
+    it('2. Search query extraction: "Find my latest Swiggy transaction." -> "Swiggy"', () => {
+      expect(extractSearchQueryFromGoal(undefined, 'Find my latest Swiggy transaction.')).toBe('Swiggy');
+      expect(extractSearchQueryFromGoal('Search for latest Swiggy transaction', undefined)).toBe('Swiggy');
+    });
+
+    it('3. "latest" is not included in search query for generic entity-retrieval goals', () => {
+      const q1 = extractSearchQueryFromGoal(undefined, 'Find my latest Amazon transaction.');
+      expect(q1).not.toContain('latest');
+      expect(q1).toBe('Amazon');
+
+      const q2 = extractSearchQueryFromGoal(undefined, 'Find my most recent salary transaction.');
+      expect(q2).not.toContain('most recent');
+      expect(q2).not.toContain('recent');
+      expect(q2).toBe('salary');
+
+      const q3 = extractSearchQueryFromGoal(undefined, 'Find the latest Netflix payment.');
+      expect(q3).not.toContain('latest');
+      expect(q3).not.toContain('payment');
+      expect(q3).toBe('Netflix');
+    });
+
+    it('5. Latest matching transaction is selected based on parsed date recency', async () => {
+      const rowOldest = createMockPageElement({
+        id: 'txn-011',
+        tagName: 'tr',
+        role: 'generic',
+        attributes: { role: 'row', 'data-merchant': 'Amazon', 'data-date': '2026-09-02' },
+        visibleText: 'Amazon Shopping −₹3,799 02 Sep 2026 Completed',
+        interactive: true
+      });
+      const rowMiddle = createMockPageElement({
+        id: 'txn-008',
+        tagName: 'tr',
+        role: 'generic',
+        attributes: { role: 'row', 'data-merchant': 'Amazon', 'data-date': '2026-09-25' },
+        visibleText: 'Amazon Shopping −₹2,199 25 Sep 2026 Completed',
+        interactive: true
+      });
+      const rowLatest = createMockPageElement({
+        id: 'txn-001',
+        tagName: 'tr',
+        role: 'generic',
+        attributes: { role: 'row', 'data-merchant': 'Amazon', 'data-date': '2026-09-30' },
+        visibleText: 'Amazon Shopping −₹4,299 30 Sep 2026 Completed',
+        interactive: true
+      });
+
+      // Provide oldest first in availableTargets to ensure selection is NOT based on DOM position
+      const targetOldest = createMockActionTarget({ elementId: 'txn-011', role: 'generic', confidence: 0.9 });
+      const targetMiddle = createMockActionTarget({ elementId: 'txn-008', role: 'generic', confidence: 0.9 });
+      const targetLatest = createMockActionTarget({ elementId: 'txn-001', role: 'generic', confidence: 0.9 });
+
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-amazon-latest',
+          description: 'Find my latest Amazon transaction.',
+          taskPlan: {
+            planId: 'plan-1',
+            archetype: 'search_and_act',
+            summary: 'Find latest Amazon transaction',
+            phases: [
+              { phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'Search Amazon', allowedActions: ['type'] },
+              { phaseId: 'p1', phaseIndex: 1, intent: 'select_result', description: 'Select latest transaction', targetHint: 'Amazon', allowedActions: ['click'] }
+            ],
+            currentPhaseIndex: 1
+          }
+        },
+        context: {
+          page: createMockPage([rowOldest, rowMiddle, rowLatest]),
+          availableTargets: [targetOldest, targetMiddle, targetLatest],
+          phaseState: {
+            activePhase: { phaseId: 'p1', phaseIndex: 1, intent: 'select_result', description: 'Select latest transaction', targetHint: 'Amazon', allowedActions: ['click'] },
+            completedPhaseIds: ['p0'],
+            remainingPhaseIds: [],
+            totalPhases: 2,
+            retryCountInCurrentPhase: 0
+          }
+        },
+        history: [
+          {
+            stepIndex: 0,
+            action: { id: 'act-type-amazon', type: 'type', target: createMockActionTarget({ elementId: 'search-input', role: 'searchbox', confidence: 0.9 }), payload: { text: 'Amazon', pressEnter: true } },
+            perceivedOutcome: 'success',
+            phaseIndex: 0
+          }
+        ]
+      });
+
+      const result = await planNextStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status === 'ACTION') {
+        expect(result.targetElementId).toBe('txn-001'); // strictly 30 Sep 2026 row!
+        expect(result.action.type).toBe('click');
+      }
+    });
+  });
+
+  describe('Intent Understanding & Entity Extraction Regression Suite (Repair Verification)', () => {
+    it('Instruction A: "Find my latest Amazon transaction and show its details."', () => {
+      const parsed = cleanSearchQueryCandidate('Find my latest Amazon transaction and show its details.');
+      expect(parsed.merchant).toBe('Amazon');
+      expect(parsed.query).toBe('Amazon');
+      expect(parsed.constraint).toBe('latest');
+      expect(parsed.isLatest).toBe(true);
+      expect(parsed.entityNoun).toBe('transaction');
+      expect(parsed.requestedAction).toBe('show its details');
+      expect(extractSearchQueryFromGoal('Find my latest Amazon transaction and show its details.')).toBe('Amazon');
+    });
+
+    it('Instruction B: "Show me the most recent Swiggy payment."', () => {
+      const parsed = cleanSearchQueryCandidate('Show me the most recent Swiggy payment.');
+      expect(parsed.merchant).toBe('Swiggy');
+      expect(parsed.query).toBe('Swiggy');
+      expect(parsed.constraint).toBe('most recent');
+      expect(parsed.isLatest).toBe(true);
+      expect(parsed.entityNoun).toBe('payment');
+      expect(extractSearchQueryFromGoal('Show me the most recent Swiggy payment.')).toBe('Swiggy');
+    });
+
+    it('Instruction C: "Open my Netflix transaction from September."', () => {
+      const parsed = cleanSearchQueryCandidate('Open my Netflix transaction from September.');
+      expect(parsed.merchant).toBe('Netflix');
+      expect(parsed.query).toBe('Netflix');
+      expect(parsed.temporalFilter?.toLowerCase()).toBe('september');
+      expect(parsed.entityNoun).toBe('transaction');
+      expect(extractSearchQueryFromGoal('Open my Netflix transaction from September.')).toBe('Netflix');
+    });
+
+    it('Instruction D: "Find the Amazon transaction for ₹4,299."', () => {
+      const parsed = cleanSearchQueryCandidate('Find the Amazon transaction for ₹4,299.');
+      expect(parsed.merchant).toBe('Amazon');
+      expect(parsed.query).toBe('Amazon');
+      expect(parsed.amountFilter).toBe('₹4,299');
+      expect(parsed.entityNoun).toBe('transaction');
+      expect(extractSearchQueryFromGoal('Find the Amazon transaction for ₹4,299.')).toBe('Amazon');
+    });
+
+    it('Instruction E: "Show the details of my latest transaction."', () => {
+      const parsed = cleanSearchQueryCandidate('Show the details of my latest transaction.');
+      expect(parsed.merchant).toBeUndefined();
+      expect(parsed.constraint).toBe('latest');
+      expect(parsed.isLatest).toBe(true);
+      expect(parsed.entityNoun).toBe('transaction');
+      // No merchant should be extracted
+      expect(parsed.query).toBeUndefined();
+    });
+
+    it('Instruction F: "Find my most recent transaction from Amazon and tell me its amount."', () => {
+      const parsed = cleanSearchQueryCandidate('Find my most recent transaction from Amazon and tell me its amount.');
+      expect(parsed.merchant).toBe('Amazon');
+      expect(parsed.query).toBe('Amazon');
+      expect(parsed.constraint).toBe('most recent');
+      expect(parsed.isLatest).toBe(true);
+      expect(parsed.entityNoun).toBe('transaction');
+      expect(parsed.requestedAction).toBe('tell me its amount');
+      expect(extractSearchQueryFromGoal('Find my most recent transaction from Amazon and tell me its amount.')).toBe('Amazon');
+    });
+
+    it('Distinguishes action phrases and words from search entities', () => {
+      const actionWords = ['find', 'latest', 'transaction', 'show', 'details', 'and', 'my', 'the'];
+      const query = extractSearchQueryFromGoal('Find my latest Amazon transaction and show its details.');
+      expect(query).toBe('Amazon');
+      expect(query).toBeDefined();
+      for (const word of actionWords) {
+        expect(query!.toLowerCase()).not.toContain(word);
+      }
+    });
+
+    it('Handles sequential tasks with different merchants without leaking prior state', () => {
+      const merchants = ['Amazon', 'Swiggy', 'Netflix', 'Flipkart', 'Uber'];
+      for (const merchant of merchants) {
+        const goal = `Find my latest ${merchant} transaction and show its details.`;
+        const extracted = extractSearchQueryFromGoal(goal);
+        expect(extracted).toBe(merchant);
+      }
+    });
+
+    describe('Phase 3 Regression: Search Query Validation & Normalization', () => {
+      it('Full instruction incorrectly returned as search text is normalized to extracted merchant', () => {
+        const goal = 'Find my latest Amazon transaction and show its details';
+        const rawLLMQuery = 'amazon transaction and show its';
+        const validated = validateAndNormalizeSearchQuery(rawLLMQuery, goal);
+        expect(validated.valid).toBe(true);
+        expect(validated.query).toBe('Amazon');
+        expect(validated.merchant).toBe('Amazon');
+
+        const fullInstructionQuery = 'Find my latest Amazon transaction and show its details';
+        const validatedFull = validateAndNormalizeSearchQuery(fullInstructionQuery, goal);
+        expect(validatedFull.valid).toBe(true);
+        expect(validatedFull.query).toBe('Amazon');
+      });
+
+      it('Correct merchant extraction across diverse instructions', () => {
+        const amazon = validateAndNormalizeSearchQuery('', 'Find my latest Amazon transaction and show its details');
+        expect(amazon.valid).toBe(true);
+        expect(amazon.query).toBe('Amazon');
+        expect(amazon.merchant).toBe('Amazon');
+
+        const swiggy = validateAndNormalizeSearchQuery('Find my latest Swiggy order', 'Find my latest Swiggy order');
+        expect(swiggy.valid).toBe(true);
+        expect(swiggy.query).toBe('Swiggy');
+        expect(swiggy.merchant).toBe('Swiggy');
+
+        const netflix = validateAndNormalizeSearchQuery('netflix payment', 'Find my Netflix payment');
+        expect(netflix.valid).toBe(true);
+        expect(netflix.query).toBe('Netflix');
+        expect(netflix.merchant).toBe('Netflix');
+      });
+
+      it('Preserves legitimate multi-word search terms without reducing to single word', () => {
+        const docQuery = validateAndNormalizeSearchQuery(
+          'Search for installation guide',
+          'Search for installation guide',
+          undefined,
+          [{ id: 'item-1', role: 'button', visibleText: 'Installation Guide' }]
+        );
+        expect(docQuery.valid).toBe(true);
+        expect(docQuery.query).toBe('Installation Guide');
+        expect(docQuery.query?.split(' ').length).toBe(2);
+
+        const openDocsQuery = validateAndNormalizeSearchQuery('', 'Find the Installation Guide');
+        expect(openDocsQuery.valid).toBe(true);
+        expect(openDocsQuery.query).toBe('Installation Guide');
+
+        const multiWordWithPage = validateAndNormalizeSearchQuery(
+          'installation guide',
+          'Search for installation guide',
+          undefined,
+          [{ id: 'item-1', role: 'button', visibleText: 'Installation Guide' }]
+        );
+        expect(multiWordWithPage.valid).toBe(true);
+        expect(multiWordWithPage.query).toBe('Installation Guide');
+      });
+
+      it('Date-filtered merchant searches preserve search query and temporal filter constraint', () => {
+        const result = validateAndNormalizeSearchQuery('', 'Find transactions from Amazon for September');
+        expect(result.valid).toBe(true);
+        expect(result.query).toBe('Amazon');
+        expect(result.merchant).toBe('Amazon');
+        expect(result.temporalFilter?.toLowerCase()).toBe('september');
+      });
+
+      it('Full-date and amount instructions correctly normalize merchant and extract constraints', () => {
+        const amountRes = validateAndNormalizeSearchQuery('', 'Find my Amazon transaction for ₹4,299.');
+        expect(amountRes.valid).toBe(true);
+        expect(amountRes.query).toBe('Amazon');
+        expect(amountRes.merchant).toBe('Amazon');
+        expect(amountRes.amountFilter).toBe('₹4,299');
+
+        const dateRes = validateAndNormalizeSearchQuery('', 'Show me the Amazon transaction from 30 September 2026.');
+        expect(dateRes.valid).toBe(true);
+        expect(dateRes.query).toBe('Amazon');
+        expect(dateRes.merchant).toBe('Amazon');
+        expect(dateRes.temporalFilter).toBe('30 September 2026');
+
+        const convRes = validateAndNormalizeSearchQuery('', 'Can you show me the most recent purchase I made on Amazon?');
+        expect(convRes.valid).toBe(true);
+        expect(convRes.query).toBe('Amazon');
+      });
+
+      it('Ambiguous search instructions cannot be safely resolved and are rejected', () => {
+        const ambiguous1 = validateAndNormalizeSearchQuery('transaction', 'Show the details of my latest transaction.');
+        expect(ambiguous1.valid).toBe(false);
+        expect(ambiguous1.isAmbiguous).toBe(true);
+        expect(ambiguous1.reason).toContain('AMBIGUOUS_SEARCH_QUERY');
+
+        const ambiguous2 = validateAndNormalizeSearchQuery('details', 'Show details of recent orders');
+        expect(ambiguous2.valid).toBe(false);
+        expect(ambiguous2.isAmbiguous).toBe(true);
+      });
+
+      it('Existing deterministic planner behaviour utilizes validated search query for search intent', async () => {
+        const planner = new DeterministicRulePlanner();
+        const input: PlannerInput = {
+          goal: {
+            id: 'g-det-search',
+            description: 'Find my latest Amazon transaction and show its details',
+            intent: 'search'
+          },
+          context: {
+            stepIndex: 0,
+            capturedAt: Date.now(),
+            currentTime: Date.now(),
+            page: {
+              schemaVersion: '1.0',
+              metadata: { url: 'file:///demo/nexvision-demo.html', title: 'NexBank' },
+              viewport: { width: 1280, height: 720 },
+              elements: [
+                { id: 'txn-search-input', role: 'searchbox', interactive: true, attributes: { role: 'searchbox', name: 'search' } }
+              ]
+            },
+            availableTargets: [
+              {
+                elementId: 'txn-search-input',
+                point: { x: 100, y: 100 },
+                viewportBounds: { x: 50, y: 80, width: 200, height: 40 },
+                confidence: 0.95,
+                observationId: 'obs-1',
+                role: 'searchbox'
+              }
+            ]
+          }
+        };
+
+        const decision = await planner.proposeStep(input);
+        expect(decision.status).toBe('ACTION');
+        if (decision.status === 'ACTION') {
+          expect(decision.proposal.actionType).toBe('type');
+          expect(decision.proposal.payload?.text).toBe('Amazon');
+          expect(decision.proposal.payload?.pressEnter).toBe(true);
+        }
+      });
+    });
   });
 });

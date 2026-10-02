@@ -576,5 +576,507 @@ describe('Local Privacy Engine (Phase 4)', () => {
       expect(result.pageRepresentation.elements[2].visibleText).toBe('ID 12345678901234567890');
       expect(result.findings.some((f) => f.category === 'phone')).toBe(false);
     });
+
+    // Stage 4 Regression Tests: IFSC code and alphanumeric identifier boundary handling
+    it('does not detect synthetic IFSC code NEXB0001234 as a phone number', () => {
+      const page = createBaseRepresentation([
+        { id: 'elem-ifsc', tagName: 'span', visibleText: 'IFSC: NEXB0001234' }
+      ]);
+      const findings = detectPrivacyFindings(page);
+      expect(findings.some((f) => f.category === 'phone')).toBe(false);
+
+      const sanitized = sanitizePageRepresentation(page);
+      expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('IFSC: NEXB0001234');
+    });
+
+    it('does not detect customer ID CUST9998888 as a phone number', () => {
+      const page = createBaseRepresentation([
+        { id: 'elem-cust', tagName: 'span', visibleText: 'Customer ID: CUST9998888' }
+      ]);
+      const findings = detectPrivacyFindings(page);
+      expect(findings.some((f) => f.category === 'phone')).toBe(false);
+
+      const sanitized = sanitizePageRepresentation(page);
+      expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Customer ID: CUST9998888');
+    });
+
+    it('does not detect transaction reference TXN-928374 as a phone number', () => {
+      const page = createBaseRepresentation([
+        { id: 'elem-txn', tagName: 'span', visibleText: 'Reference: TXN-928374' }
+      ]);
+      const findings = detectPrivacyFindings(page);
+      expect(findings.some((f) => f.category === 'phone')).toBe(false);
+
+      const sanitized = sanitizePageRepresentation(page);
+      expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Reference: TXN-928374');
+    });
+
+    it('detects and sanitizes legitimate Indian formatted phone number +91 98765 43210', () => {
+      const rawPhone = '+91 98765 43210';
+      const page = createBaseRepresentation([
+        { id: 'elem-in-phone', tagName: 'span', visibleText: `Support: ${rawPhone}` }
+      ]);
+      const findings = detectPrivacyFindings(page);
+      const phoneFinding = findings.find((f) => f.category === 'phone');
+      expect(phoneFinding).toBeDefined();
+
+      const sanitized = sanitizePageRepresentation(page);
+      expect(sanitized.pageRepresentation.elements[0].visibleText).toBe(`Support: ${REDACTION_TOKENS.PHONE}`);
+      expect(sanitized.pageRepresentation.elements[0].visibleText).not.toContain(rawPhone);
+    });
+
+    it('detects and sanitizes legitimate landline formatted phone number (040) 2345-6789', () => {
+      const rawPhone = '(040) 2345-6789';
+      const page = createBaseRepresentation([
+        { id: 'elem-landline', tagName: 'span', visibleText: `Hyderabad Office: ${rawPhone}` }
+      ]);
+      const findings = detectPrivacyFindings(page);
+      const phoneFinding = findings.find((f) => f.category === 'phone');
+      expect(phoneFinding).toBeDefined();
+
+      const sanitized = sanitizePageRepresentation(page);
+      expect(sanitized.pageRepresentation.elements[0].visibleText).toBe(`Hyderabad Office: ${REDACTION_TOKENS.PHONE}`);
+      expect(sanitized.pageRepresentation.elements[0].visibleText).not.toContain(rawPhone);
+    });
+
+    // Stage 2 Regression Tests: Attribute sanitization (aria-label, title, placeholder, alt, aria-description)
+    it('sanitizes synthetic emails and phones across aria-label, title, placeholder, alt, and aria-description attributes', () => {
+      const rawEmail = 'sensitive.user@example.com';
+      const rawPhone = '+91 98765 43210';
+      const page = createBaseRepresentation([
+        {
+          id: 'elem-aria-label',
+          tagName: 'button',
+          attributes: {
+            'aria-label': `Contact ${rawEmail} directly`
+          }
+        },
+        {
+          id: 'elem-title',
+          tagName: 'a',
+          attributes: {
+            title: `Reach helpline at ${rawPhone}`
+          }
+        },
+        {
+          id: 'elem-placeholder-attr',
+          tagName: 'input',
+          placeholder: `e.g. ${rawEmail}`,
+          attributes: {
+            placeholder: `e.g. ${rawEmail}`
+          }
+        },
+        {
+          id: 'elem-alt',
+          tagName: 'img',
+          attributes: {
+            alt: `Profile photo of ${rawEmail} (${rawPhone})`
+          }
+        },
+        {
+          id: 'elem-aria-desc',
+          tagName: 'div',
+          attributes: {
+            'aria-description': `User verification sent to ${rawEmail} and ${rawPhone}`
+          }
+        }
+      ]);
+
+      const sanitized = sanitizePageRepresentation(page);
+      const elements = sanitized.pageRepresentation.elements;
+
+      // elem-aria-label
+      expect(elements[0].attributes?.['aria-label']).toBe(`Contact ${REDACTION_TOKENS.EMAIL} directly`);
+      expect(elements[0].attributes?.['aria-label']).not.toContain(rawEmail);
+
+      // elem-title
+      expect(elements[1].attributes?.['title']).toBe(`Reach helpline at ${REDACTION_TOKENS.PHONE}`);
+      expect(elements[1].attributes?.['title']).not.toContain(rawPhone);
+
+      // elem-placeholder-attr
+      expect(elements[2].placeholder).toBe(`e.g. ${REDACTION_TOKENS.EMAIL}`);
+      expect(elements[2].attributes?.['placeholder']).toBe(`e.g. ${REDACTION_TOKENS.EMAIL}`);
+      expect(elements[2].placeholder).not.toContain(rawEmail);
+      expect(elements[2].attributes?.['placeholder']).not.toContain(rawEmail);
+
+      // elem-alt
+      expect(elements[3].attributes?.['alt']).toBe(
+        `Profile photo of ${REDACTION_TOKENS.EMAIL} (${REDACTION_TOKENS.PHONE})`
+      );
+      expect(elements[3].attributes?.['alt']).not.toContain(rawEmail);
+      expect(elements[3].attributes?.['alt']).not.toContain(rawPhone);
+
+      // elem-aria-desc
+      expect(elements[4].attributes?.['aria-description']).toBe(
+        `User verification sent to ${REDACTION_TOKENS.EMAIL} and ${REDACTION_TOKENS.PHONE}`
+      );
+      expect(elements[4].attributes?.['aria-description']).not.toContain(rawEmail);
+      expect(elements[4].attributes?.['aria-description']).not.toContain(rawPhone);
+
+      // Verify findings were recorded with correct sources
+      expect(sanitized.findings.length).toBeGreaterThan(0);
+      const emailFindings = sanitized.findings.filter((f) => f.category === 'email');
+      const phoneFindings = sanitized.findings.filter((f) => f.category === 'phone');
+      expect(emailFindings.length).toBeGreaterThan(0);
+      expect(phoneFindings.length).toBeGreaterThan(0);
+    });
+
+    it('sanitizes password placeholder attribute to REDACTION_TOKENS.PASSWORD', () => {
+      const page = createBaseRepresentation([
+        {
+          id: 'elem-pwd-attr',
+          tagName: 'input',
+          inputType: 'password',
+          placeholder: 'Enter your ultra secret password',
+          attributes: {
+            placeholder: 'Enter your ultra secret password',
+            type: 'password'
+          }
+        }
+      ]);
+
+      const sanitized = sanitizePageRepresentation(page);
+      const elem = sanitized.pageRepresentation.elements[0];
+
+      expect(elem.placeholder).toBe(REDACTION_TOKENS.PASSWORD);
+      expect(elem.attributes?.['placeholder']).toBe(REDACTION_TOKENS.PASSWORD);
+      expect(elem.attributes?.['placeholder']).not.toContain('ultra secret password');
+    });
+
+    it('preserves harmless attribute values without alteration', () => {
+      const page = createBaseRepresentation([
+        {
+          id: 'elem-harmless',
+          tagName: 'button',
+          attributes: {
+            'aria-label': 'Submit Transaction',
+            title: 'Click to confirm your order',
+            placeholder: 'Search store catalog',
+            alt: 'Company corporate logo',
+            'aria-description': 'Activates the checkout sequence'
+          }
+        }
+      ]);
+
+      const sanitized = sanitizePageRepresentation(page);
+      const attrs = sanitized.pageRepresentation.elements[0].attributes;
+
+      expect(attrs?.['aria-label']).toBe('Submit Transaction');
+      expect(attrs?.['title']).toBe('Click to confirm your order');
+      expect(attrs?.['placeholder']).toBe('Search store catalog');
+      expect(attrs?.['alt']).toBe('Company corporate logo');
+      expect(attrs?.['aria-description']).toBe('Activates the checkout sequence');
+      expect(sanitized.findings.length).toBe(0);
+    });
+  });
+
+  // 23. Phase 2.6 Residual Privacy Exposure Remediation Suite
+  describe('Phase 2.6 Residual Privacy Exposure Remediation Suite', () => {
+    describe('A. Masked financial identifiers', () => {
+      it('redacts space-separated masked card (XXXX XXXX 4821) while preserving 4-digit suffix for grounding', () => {
+        const rawText = 'Payment card: XXXX XXXX 4821';
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-card-x-space',
+            tagName: 'span',
+            visibleText: rawText,
+            attributes: { 'aria-label': rawText }
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('Payment card: [CARD_ENDING_4821]');
+        expect(elem.attributes?.['aria-label']).toBe('Payment card: [CARD_ENDING_4821]');
+        expect(elem.visibleText).not.toContain('XXXX XXXX 4821');
+        expect(elem.visibleText).not.toContain('XXXX');
+      });
+
+      it('redacts asterisk-masked card (**** 4821) while preserving 4-digit suffix for grounding', () => {
+        const rawText = 'Primary card: **** 4821';
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-card-star',
+            tagName: 'button',
+            visibleText: rawText,
+            attributes: { title: rawText }
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('Primary card: [CARD_ENDING_4821]');
+        expect(elem.attributes?.['title']).toBe('Primary card: [CARD_ENDING_4821]');
+        expect(elem.visibleText).not.toContain('**** 4821');
+      });
+
+      it('redacts bullet-masked card (•••• 4821) while preserving 4-digit suffix for grounding', () => {
+        const rawText = 'Debit card: •••• 4821';
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-card-bullet',
+            tagName: 'div',
+            visibleText: rawText
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('Debit card: [CARD_ENDING_4821]');
+        expect(elem.visibleText).not.toContain('••••');
+      });
+
+      it('redacts dash-separated masked card (XXXX-XXXX-XXXX-4821)', () => {
+        const rawText = 'Account: XXXX-XXXX-XXXX-4821';
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-card-dash',
+            tagName: 'span',
+            visibleText: rawText
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('Account: [CARD_ENDING_4821]');
+      });
+
+      it('redacts compact masked card (XX4821)', () => {
+        const rawText = 'Card ending: XX4821';
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-card-compact',
+            tagName: 'span',
+            visibleText: rawText
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('Card ending: [CARD_ENDING_4821]');
+      });
+
+      it('redacts fully masked cards (XXXX XXXX XXXX XXXX and ••••••••••••) to REDACTION_TOKENS.CARD', () => {
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-card-full-x',
+            tagName: 'span',
+            visibleText: 'Card: XXXX XXXX XXXX XXXX'
+          },
+          {
+            id: 'elem-card-full-bullet',
+            tagName: 'span',
+            visibleText: 'Card: ••••••••••••'
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Card: [REDACTED_CARD]');
+        expect(sanitized.pageRepresentation.elements[1].visibleText).toBe('Card: [REDACTED_CARD]');
+      });
+    });
+
+    describe('B. Customer names', () => {
+      it('redacts contextual name in button text ("Welcome, Arjun Reddy")', () => {
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-welcome-btn',
+            tagName: 'button',
+            visibleText: 'Welcome, Arjun Reddy',
+            attributes: { 'aria-label': 'Welcome, Arjun Reddy' }
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('Welcome, [REDACTED_NAME]');
+        expect(elem.attributes?.['aria-label']).toBe('Welcome, [REDACTED_NAME]');
+        expect(elem.visibleText).not.toContain('Arjun Reddy');
+      });
+
+      it('redacts contextual name in accessible names and labels ("Search records for Arjun Reddy")', () => {
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-search-target',
+            tagName: 'button',
+            visibleText: 'Search records for Arjun Reddy',
+            attributes: {
+              title: 'Search records for Arjun Reddy',
+              'aria-description': 'Search records for Arjun Reddy'
+            }
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('Search records for [REDACTED_NAME]');
+        expect(elem.attributes?.['title']).toBe('Search records for [REDACTED_NAME]');
+        expect(elem.attributes?.['aria-description']).toBe('Search records for [REDACTED_NAME]');
+        expect(elem.visibleText).not.toContain('Arjun Reddy');
+      });
+
+      it('redacts user profile and logged in notices', () => {
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-profile-photo',
+            tagName: 'img',
+            attributes: { alt: 'Profile photo of Arjun Reddy' }
+          },
+          {
+            id: 'elem-logged-in',
+            tagName: 'div',
+            visibleText: 'Signed in as Priya Sharma'
+          },
+          {
+            id: 'elem-user-label',
+            tagName: 'span',
+            visibleText: 'Customer Name: Rohan Verma'
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].attributes?.['alt']).toBe('Profile photo of [REDACTED_NAME]');
+        expect(sanitized.pageRepresentation.elements[1].visibleText).toBe('Signed in as [REDACTED_NAME]');
+        expect(sanitized.pageRepresentation.elements[2].visibleText).toBe('Customer Name: [REDACTED_NAME]');
+      });
+
+      it('redacts semantic customer name inputs based on element metadata (autocomplete="name")', () => {
+        const page = createBaseRepresentation([
+          {
+            id: 'elem-cust-input',
+            tagName: 'input',
+            visibleText: 'Arjun Reddy',
+            placeholder: 'Arjun Reddy',
+            attributes: {
+              autocomplete: 'name',
+              name: 'customer_name',
+              value: 'Arjun Reddy'
+            }
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const elem = sanitized.pageRepresentation.elements[0];
+
+        expect(elem.visibleText).toBe('[REDACTED_NAME]');
+        expect(elem.placeholder).toBe('[REDACTED_NAME]');
+        expect(elem.attributes?.['value']).toBe('[REDACTED_NAME]');
+        expect(elem.visibleText).not.toContain('Arjun Reddy');
+      });
+
+      it('preserves non-sensitive titles, action buttons, and merchants (zero false positives)', () => {
+        const page = createBaseRepresentation([
+          { id: 'btn-1', tagName: 'button', visibleText: 'Submit Order' },
+          { id: 'btn-2', tagName: 'button', visibleText: 'Amazon Pay' },
+          { id: 'btn-3', tagName: 'button', visibleText: 'Swiggy Delivery' },
+          { id: 'btn-4', tagName: 'button', visibleText: 'Netflix Subscription' },
+          { id: 'btn-5', tagName: 'button', visibleText: 'Order History' },
+          { id: 'btn-6', tagName: 'span', visibleText: 'Find my latest Amazon transaction' },
+          { id: 'btn-7', tagName: 'span', visibleText: 'Find Swiggy transaction' }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Submit Order');
+        expect(sanitized.pageRepresentation.elements[1].visibleText).toBe('Amazon Pay');
+        expect(sanitized.pageRepresentation.elements[2].visibleText).toBe('Swiggy Delivery');
+        expect(sanitized.pageRepresentation.elements[3].visibleText).toBe('Netflix Subscription');
+        expect(sanitized.pageRepresentation.elements[4].visibleText).toBe('Order History');
+        expect(sanitized.pageRepresentation.elements[5].visibleText).toBe('Find my latest Amazon transaction');
+        expect(sanitized.pageRepresentation.elements[6].visibleText).toBe('Find Swiggy transaction');
+      });
+    });
+
+    describe('C. Banking identifier false-positive regression guarantees', () => {
+      it('strictly preserves IFSC code (NEXB0001234) without alteration', () => {
+        const page = createBaseRepresentation([
+          { id: 'elem-ifsc', tagName: 'span', visibleText: 'IFSC: NEXB0001234' }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('IFSC: NEXB0001234');
+      });
+
+      it('strictly preserves synthetic Customer ID (CUST-99214) and Transaction ID (TXN-8849201)', () => {
+        const page = createBaseRepresentation([
+          { id: 'elem-cust-id', tagName: 'span', visibleText: 'Customer ID: CUST-99214' },
+          { id: 'elem-txn-id', tagName: 'span', visibleText: 'Transaction: TXN-8849201' }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Customer ID: CUST-99214');
+        expect(sanitized.pageRepresentation.elements[1].visibleText).toBe('Transaction: TXN-8849201');
+      });
+    });
+
+    describe('D. Phase 2.8 Standalone customer-name boundary tests', () => {
+      it('redacts standalone name in ordinary table cells (<td>Arjun Reddy</td>)', () => {
+        const page = createBaseRepresentation([
+          { id: 'cell-name', tagName: 'td', visibleText: 'Arjun Reddy' }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('[REDACTED_NAME]');
+      });
+
+      it('redacts standalone name in ARIA labels (<div aria-label="Arjun Reddy">Profile</div>)', () => {
+        const page = createBaseRepresentation([
+          { id: 'div-profile', tagName: 'div', visibleText: 'Profile', attributes: { 'aria-label': 'Arjun Reddy' } }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].attributes?.['aria-label']).toBe('[REDACTED_NAME]');
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Profile');
+      });
+
+      it('redacts standalone name with non-standard prefix ("Account belonging to Arjun Reddy")', () => {
+        const page = createBaseRepresentation([
+          { id: 'p-account', tagName: 'p', visibleText: 'Account belonging to Arjun Reddy' }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Account belonging to [REDACTED_NAME]');
+      });
+
+      it('redacts 3-word standalone customer names', () => {
+        const page = createBaseRepresentation([
+          { id: 'btn-switch', tagName: 'button', visibleText: 'Arjun Kumar Reddy' }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('[REDACTED_NAME]');
+      });
+
+      it('preserves ordinary interface labels and locations', () => {
+        const page = createBaseRepresentation([
+          { id: 'l1', tagName: 'button', visibleText: 'Submit' },
+          { id: 'l2', tagName: 'button', visibleText: 'Continue' },
+          { id: 'l3', tagName: 'button', visibleText: 'Submit Order' },
+          { id: 'l4', tagName: 'button', visibleText: 'Amazon Pay' },
+          { id: 'l5', tagName: 'button', visibleText: 'Swiggy Delivery' },
+          { id: 'l6', tagName: 'button', visibleText: 'Netflix Subscription' },
+          { id: 'l7', tagName: 'span', visibleText: 'Hyderabad Office: Open' },
+          { id: 'l8', tagName: 'span', visibleText: 'Customer ID: CUST-99214' },
+          { id: 'l9', tagName: 'span', visibleText: 'Transaction: TXN-8849201' }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        expect(sanitized.pageRepresentation.elements[0].visibleText).toBe('Submit');
+        expect(sanitized.pageRepresentation.elements[1].visibleText).toBe('Continue');
+        expect(sanitized.pageRepresentation.elements[2].visibleText).toBe('Submit Order');
+        expect(sanitized.pageRepresentation.elements[3].visibleText).toBe('Amazon Pay');
+        expect(sanitized.pageRepresentation.elements[4].visibleText).toBe('Swiggy Delivery');
+        expect(sanitized.pageRepresentation.elements[5].visibleText).toBe('Netflix Subscription');
+        expect(sanitized.pageRepresentation.elements[6].visibleText).toBe('Hyderabad Office: Open');
+        expect(sanitized.pageRepresentation.elements[7].visibleText).toBe('Customer ID: CUST-99214');
+        expect(sanitized.pageRepresentation.elements[8].visibleText).toBe('Transaction: TXN-8849201');
+      });
+    });
   });
 });

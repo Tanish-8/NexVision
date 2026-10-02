@@ -16,7 +16,7 @@
  * - Strict JSON advisory response parsing; rejects prose, malformed JSON, and out-of-bounds values.
  */
 
-import type { ActionType } from '../shared/actions.js';
+import type { ActionType, ActionTarget } from '../shared/actions.js';
 import type { PageElement } from '../shared/types.js';
 import {
   type AdvisoryProposalResult,
@@ -24,6 +24,7 @@ import {
   type PhaseExecutionState,
   type PhaseIntent,
   type PlannerDriver,
+  type PlannerGoal,
   type PlannerInput,
   type PlannerResult,
   type SafeModelHistoryStep,
@@ -36,7 +37,12 @@ import {
   planNextStep,
   isMediaContentGoal,
   isProfileOrChannelCandidate,
-  isMediaContentCandidate
+  isMediaContentCandidate,
+  cleanSearchQueryCandidate,
+  extractTimestampFromElement,
+  isLatestSelectionConstraint,
+  validateAndNormalizeSearchQuery,
+  type SearchQueryValidationResult
 } from '../shared/planner.js';
 
 import { stripMarkdownFences } from './llamaVisionAdapter.js';
@@ -510,11 +516,26 @@ export function scoreCandidateRelevance(
         if (isSearchControl || normalizedRole === 'textbox') {
           score -= 18; // Suppress searchbox and textboxes
         }
-        // Strongly prefer real navigation links/anchors over generic decorative buttons (e.g. play icon)
-        if (hasHref || role === 'link') {
+        // Strongly prefer real navigation links/anchors, result rows, or list items over generic decorative buttons
+        const isResultRole = hasHref || role === 'link' || (role as string) === 'row' || (role as string) === 'listitem';
+        if (isResultRole) {
           score += 8;
         } else if (role === 'button') {
           score -= 4; // Generic decorative buttons depressed relative to destination links
+        }
+
+        // Recency bonus for latest selection goals
+        if (activePhase && isLatestSelectionConstraint(undefined, activePhase.description, activePhase.targetHint)) {
+          const timestamp = extractTimestampFromElement({
+            id: 'candidate',
+            role: (role as any) ?? undefined,
+            accessibleName,
+            visibleText,
+            attributes: candidateContext?.attributes
+          });
+          if (timestamp !== undefined) {
+            score += 15;
+          }
         }
         break;
       }
@@ -620,6 +641,7 @@ export function compactCandidatesForModel(
     ...(c.accessibleName !== undefined ? { accessibleName: c.accessibleName } : {}),
     ...(c.visibleText !== undefined ? { visibleText: c.visibleText } : {}),
     ...(c.placeholder !== undefined ? { placeholder: c.placeholder } : {}),
+    ...(c.attributes !== undefined ? { attributes: c.attributes } : {}),
     ...(c.focused === true ? { focused: true } : {}),
     ...(c.hasHref === true ? { hasHref: true } : {}),
     confidence: c.confidence
@@ -651,7 +673,8 @@ export const LOCAL_AGENT_SYSTEM_PROMPT =
   '13. When typing a COMPLETE search query or replacement value into an input, ALWAYS type the ENTIRE intended text as a single "type" action — do NOT split the text across multiple steps. For example, to search for "laptops under 50000", type the full string in one action, not in parts.\n' +
   '14. When typing into an input that may already contain text (e.g. after a previous "type" action on the same element, or when the input is focused), set clearFirst:true in the payload to replace the existing content rather than append to it.\n' +
   '15. When a "currentPhase" is specified in the prompt, focus exclusively on fulfilling that phase\'s objective and targetHint/field. Your actionType MUST be one of currentPhase.allowedActions.\n' +
-  '16. When the current phase is a "search" phase, always target the primary search input using "type" with pressEnter:true and clearFirst:true to submit the search. Do NOT click autocomplete suggestions, search suggestion dropdown options, or search prediction links.\n\n' +
+  '16. When the current phase is a "search" phase, always target the primary search input using "type" with pressEnter:true and clearFirst:true to submit the search. Do NOT click autocomplete suggestions, search suggestion dropdown options, or search prediction links.\n' +
+  '17. When currentPhase.field.targetValue is provided, and the selected action is a "type" action targeting that field, payload.text MUST equal the exact currentPhase.field.targetValue. Do NOT append entity words (such as transaction, payment, order) or temporal/selection constraints (such as latest, most recent) or other descriptive words to the structured field target. For example, if currentPhase.field.targetValue is "Amazon", payload.text must be "Amazon" (NOT "Amazon transaction", "latest Amazon transaction", or "Amazon payment").\n\n' +
   'Schema for action:\n' +
   '{"type": "ACTION", "targetElementId": "<id>", "actionType": "click"|"type"|"focus", "payload": {"text": "...", "clearFirst": true, "pressEnter": true}, "rationale": "<brief reason>", "estimatedProgress": 0.5}\n\n' +
   'Schema for completion:\n' +
@@ -908,13 +931,30 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
       matchedElement?.tagName?.toLowerCase() === 'a'
     );
 
+    // Defensively sanitize any sensitive attributes in candidate target
+    const sanitizedAttributes: Record<string, string> | undefined = matchedElement?.attributes
+      ? Object.fromEntries(
+          Object.entries(matchedElement.attributes).map(([key, val]) => [
+            key,
+            sanitizeFreeFormText(val) ?? val
+          ])
+        )
+      : undefined;
+
+    const sanitizedPlaceholder =
+      matchedElement?.placeholder !== undefined && matchedElement.placeholder.trim() !== ''
+        ? sanitizeFreeFormText(matchedElement.placeholder.trim())
+        : undefined;
+
     candidateTargets.push({
       elementId: target.elementId,
       ...(role !== undefined ? { role } : {}),
-      ...(accessibleName !== undefined ? { accessibleName } : (matchedElement?.placeholder ? { accessibleName: matchedElement.placeholder } : {})),
+      ...(accessibleName !== undefined
+        ? { accessibleName }
+        : (sanitizedPlaceholder ? { accessibleName: sanitizedPlaceholder } : {})),
       ...(visibleText !== undefined ? { visibleText } : {}),
-      ...(matchedElement?.placeholder !== undefined ? { placeholder: matchedElement.placeholder } : {}),
-      ...(matchedElement?.attributes !== undefined ? { attributes: matchedElement.attributes } : {}),
+      ...(sanitizedPlaceholder !== undefined ? { placeholder: sanitizedPlaceholder } : {}),
+      ...(sanitizedAttributes !== undefined ? { attributes: sanitizedAttributes } : {}),
       confidence: target.confidence,
       // Propagate focus state so the model can skip redundant click→focus steps
       ...(matchedElement?.state?.focused === true ? { focused: true } : {}),
@@ -941,7 +981,9 @@ export function buildModelPromptPayload(input: PlannerInput): ModelPromptPayload
         actionType: h.action.type,
         targetElementId: h.action.target.elementId,
         ...(h.action.target.role !== undefined ? { targetRole: h.action.target.role } : {}),
-        ...(h.perceivedOutcome !== undefined ? { perceivedOutcome: h.perceivedOutcome } : {}),
+        ...(h.perceivedOutcome !== undefined
+          ? { perceivedOutcome: sanitizeFreeFormText(h.perceivedOutcome) ?? h.perceivedOutcome }
+          : {}),
         ...(h.phaseIndex !== undefined ? { phaseIndex: h.phaseIndex } : {}),
         ...(h.phaseIntent !== undefined ? { phaseIntent: h.phaseIntent } : {}),
         ...(h.fulfilledParameter !== undefined ? { fulfilledParameter: sanitizeFreeFormText(h.fulfilledParameter) } : {})
@@ -1241,6 +1283,166 @@ export function normalizeModelProposal(
 }
 
 /**
+ * Determines whether a target element matches the field or search input required by the active phase.
+ * Pure function: deterministic, no side effects, no privacy data emitted.
+ */
+export function doesTargetCorrespondToPhaseField(
+  activePhase: TaskPhase,
+  pageElement?: PageElement,
+  actionTarget?: ActionTarget
+): boolean {
+  const targetId = (actionTarget?.elementId ?? pageElement?.id ?? '').toLowerCase();
+  const role = (pageElement?.role ?? actionTarget?.role ?? '').toLowerCase();
+  const tagName = (pageElement?.tagName ?? '').toLowerCase();
+  const inputType = (pageElement?.inputType ?? pageElement?.attributes?.['type'] ?? '').toLowerCase();
+
+  const isInputLike =
+    role === 'searchbox' ||
+    role === 'textbox' ||
+    role === 'combobox' ||
+    tagName === 'input' ||
+    tagName === 'textarea' ||
+    targetId.includes('search') ||
+    targetId.includes('input') ||
+    targetId.includes('textbox') ||
+    (!pageElement && !actionTarget);
+
+  if (!isInputLike && role !== '' && tagName !== '') {
+    return false;
+  }
+
+  // 1. Search phase: any text entry/search input target corresponds to the search input
+  if (activePhase.intent === 'search') {
+    return true;
+  }
+
+  // 2. Structured fieldParameter with fieldName
+  const fieldName = activePhase.fieldParameter?.fieldName?.toLowerCase().trim();
+  if (!fieldName) {
+    return activePhase.intent === 'fill_field';
+  }
+
+  if (fieldName === 'search' || fieldName === 'query') {
+    return isInputLike;
+  }
+
+  const labelParts = [
+    targetId,
+    pageElement?.accessibleName ?? '',
+    pageElement?.visibleText ?? '',
+    pageElement?.placeholder ?? '',
+    pageElement?.attributes?.['name'] ?? '',
+    pageElement?.attributes?.['aria-label'] ?? '',
+    pageElement?.attributes?.['title'] ?? '',
+    pageElement?.attributes?.['id'] ?? ''
+  ];
+  const combinedText = labelParts.filter(Boolean).join(' ').toLowerCase();
+
+  if (combinedText.includes(fieldName)) {
+    return true;
+  }
+
+  const tokens = fieldName.split(/[\s_-]+/).filter((t) => t.length > 1);
+  if (tokens.length > 0 && tokens.some((t) => combinedText.includes(t))) {
+    return true;
+  }
+
+  const hint = activePhase.targetHint?.toLowerCase().trim();
+  if (hint && hint.length > 1 && combinedText.includes(hint)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Normalizes an action proposal against the active phase contract:
+ * When activePhase.fieldParameter?.targetValue is defined and the model proposes
+ * a type action on the target corresponding to that field/search input,
+ * payload.text is deterministically normalized to activePhase.fieldParameter.targetValue.
+ * For search phases, clearFirst: true and pressEnter: true are also enforced.
+ */
+export function normalizeActionProposalForPhase(
+  proposal: AdvisoryStepProposal,
+  activePhase?: TaskPhase,
+  pageElements?: readonly PageElement[],
+  availableTargets?: readonly ActionTarget[],
+  goal?: PlannerGoal
+): AdvisoryStepProposal {
+  if (proposal.actionType !== 'type') {
+    return proposal;
+  }
+
+  const targetId = proposal.targetElementId;
+  const pageElement = pageElements?.find((e) => e.id === targetId);
+  const actionTarget = availableTargets?.find((t) => t.elementId === targetId);
+
+  const isSearchPhase = activePhase?.intent === 'search';
+  const isSearchRole =
+    actionTarget?.role === 'searchbox' ||
+    pageElement?.role === 'searchbox' ||
+    pageElement?.attributes?.['role'] === 'searchbox';
+  const isSearchTarget = doesTargetCorrespondToPhaseField(
+    activePhase ?? { phaseId: 'p-search', phaseIndex: 0, intent: 'search', description: 'search' },
+    pageElement,
+    actionTarget
+  );
+
+  // If this action targets a search field or occurs during a search phase:
+  // Deterministically validate and normalize the query candidate.
+  if (isSearchPhase || isSearchRole || isSearchTarget) {
+    const rawCandidate =
+      proposal.payload?.text ??
+      activePhase?.fieldParameter?.targetValue ??
+      '';
+
+    const validation = validateAndNormalizeSearchQuery(
+      rawCandidate,
+      goal?.description,
+      activePhase?.description,
+      pageElements
+    );
+
+    if (validation.valid && validation.query) {
+      return {
+        ...proposal,
+        payload: {
+          ...proposal.payload,
+          text: validation.query,
+          clearFirst: true,
+          pressEnter: true
+        }
+      };
+    }
+  }
+
+  if (
+    !activePhase?.fieldParameter?.targetValue ||
+    activePhase.fieldParameter.targetValue.trim() === ''
+  ) {
+    return proposal;
+  }
+
+  if (!doesTargetCorrespondToPhaseField(activePhase, pageElement, actionTarget)) {
+    return proposal;
+  }
+
+  return {
+    ...proposal,
+    payload: {
+      ...proposal.payload,
+      text: activePhase.fieldParameter.targetValue,
+      ...(activePhase.intent === 'search'
+        ? {
+            clearFirst: true,
+            pressEnter: true
+          }
+        : {})
+    }
+  };
+}
+
+/**
  * Scans a string for balanced top-level curly-brace candidate substrings `{ ... }`.
  * Tracks string literals (including escaped quotes) so that braces inside strings
  * do not alter object depth.
@@ -1304,6 +1506,48 @@ export function findTopLevelJsonObjectCandidates(text: string): string[] {
  * - Rejects ambiguous responses containing multiple distinct valid JSON objects.
  * - Returns null if a single valid JSON object cannot be extracted.
  */
+/**
+ * Safely parses a JSON candidate string, applying targeted sanitization for
+ * small-model formatting quirks (e.g. pipe syntax in arrays or trailing commas)
+ * if strict JSON.parse fails.
+ */
+export function tryParseJsonCandidate(candidate: string): Record<string, unknown> | null {
+  if (!candidate || typeof candidate !== 'string') return null;
+  const trimmed = candidate.trim();
+  try {
+    const direct = JSON.parse(trimmed);
+    if (typeof direct === 'object' && direct !== null && !Array.isArray(direct)) {
+      return direct as Record<string, unknown>;
+    }
+  } catch {
+    // Attempt standard small-model JSON syntax repairs
+  }
+
+  // Pre-sanitize candidate:
+  // 1. Replace smart quotes: “ and ” with "
+  let sanitized = trimmed.replace(/[\u201C\u201D]/g, '"');
+
+  // 2. Repair pipe-separated array elements (e.g. ["click"|"type"|"focus"] -> ["click", "type", "focus"])
+  sanitized = sanitized.replace(/\[\s*"([^"]+)"(?:\s*\|\s*"([^"]+)")+\s*\]/g, (_m) => {
+    const parts = _m.replace(/[\[\]]/g, '').split(/\s*\|\s*/).map(p => p.trim());
+    return `[${parts.join(', ')}]`;
+  });
+
+  // 3. Remove trailing commas before } or ]
+  sanitized = sanitized.replace(/,\s*([}\]])/g, '$1');
+
+  try {
+    const parsed = JSON.parse(sanitized);
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Still not valid JSON
+  }
+
+  return null;
+}
+
 export function extractSingleJsonObject(raw: string): Record<string, unknown> | null {
   // Strategy 1: Check for markdown code fences
   const fenceRegex = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
@@ -1313,13 +1557,9 @@ export function extractSingleJsonObject(raw: string): Record<string, unknown> | 
     const validFenceObjects: Record<string, unknown>[] = [];
     for (const match of fenceMatches) {
       const inner = match[1].trim();
-      try {
-        const parsed = JSON.parse(inner);
-        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-          validFenceObjects.push(parsed as Record<string, unknown>);
-        }
-      } catch {
-        // Content within this fence is not valid JSON
+      const parsed = tryParseJsonCandidate(inner);
+      if (parsed) {
+        validFenceObjects.push(parsed);
       }
     }
 
@@ -1337,13 +1577,9 @@ export function extractSingleJsonObject(raw: string): Record<string, unknown> | 
   const validObjects: Record<string, unknown>[] = [];
 
   for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        validObjects.push(parsed as Record<string, unknown>);
-      }
-    } catch {
-      // Candidate substring is not valid JSON
+    const parsed = tryParseJsonCandidate(candidate);
+    if (parsed) {
+      validObjects.push(parsed);
     }
   }
 
@@ -1776,13 +2012,10 @@ export class LocalAgentDriver implements PlannerDriver {
       userPrompt
     });
 
-    if (chatResult.success) {
-      console.log(
-        `[NexVision LocalAgent] Step ${input.context.stepIndex}: raw model response = ${chatResult.content}`
-      );
-    }
-
     if (!chatResult.success) {
+      console.log(
+        `[NexVision LocalAgent] Step ${input.context.stepIndex}: inference failed (${chatResult.error.message})`
+      );
       return {
         status: 'FAILED',
         reason: chatResult.error.message
@@ -1792,10 +2025,24 @@ export class LocalAgentDriver implements PlannerDriver {
     // 3. Strict response parsing
     const parsed = parseAdvisoryResponse(chatResult.content);
 
+    const actionType = parsed.status === 'ACTION' ? parsed.proposal.actionType : 'none';
+    const targetId = parsed.status === 'ACTION' ? parsed.proposal.targetElementId : 'none';
+
+    console.log(
+      `[NexVision LocalAgent] Step ${input.context.stepIndex}: inference response received ` +
+      `(length=${chatResult.content.length}, parseStatus=${parsed.status}, action=${actionType}, targetId=${targetId})`
+    );
+
     // 4. Respect explicit completion preconditions
     if (parsed.status === 'COMPLETED') {
       const activePhase = resolveActivePhase(input.goal, input.context, input.history);
       if (input.context.completion?.satisfied !== true && activePhase?.intent !== 'verify_outcome') {
+        if (activePhase?.intent === 'select_result') {
+          return {
+            status: 'FAILED',
+            reason: 'NO_MATCHING_RESULTS'
+          };
+        }
         return {
           status: 'FAILED',
           reason: 'UNSUPPORTED_GOAL'
@@ -1814,6 +2061,39 @@ export class LocalAgentDriver implements PlannerDriver {
           };
         }
       }
+
+      // 6. Search-phase query validation & targetValue normalization
+      const isSearchTarget =
+        activePhase?.intent === 'search' ||
+        input.context.page.elements.find((e) => e.id === parsed.proposal.targetElementId)?.role === 'searchbox' ||
+        input.context.availableTargets.find((t) => t.elementId === parsed.proposal.targetElementId)?.role === 'searchbox';
+
+      if (parsed.proposal.actionType === 'type' && isSearchTarget) {
+        const queryValidation = validateAndNormalizeSearchQuery(
+          parsed.proposal.payload?.text,
+          input.goal.description,
+          activePhase?.description,
+          input.context.page.elements
+        );
+        if (!queryValidation.valid) {
+          return {
+            status: 'FAILED',
+            reason: queryValidation.reason ?? 'AMBIGUOUS_SEARCH_QUERY: Cannot safely resolve search target from instruction'
+          };
+        }
+      }
+
+      const normalizedProposal = normalizeActionProposalForPhase(
+        parsed.proposal,
+        activePhase,
+        input.context.page.elements,
+        input.context.availableTargets,
+        input.goal
+      );
+      return {
+        ...parsed,
+        proposal: normalizedProposal
+      };
     }
 
     return parsed;
@@ -1872,12 +2152,13 @@ export const TASK_DECOMPOSITION_SYSTEM_PROMPT =
   '1. Decompose the goal based on its semantic intent, NOT website-specific selectors or internal IDs.\n' +
   '2. Allowed archetypes: "search_and_act", "form_submission", "navigation_act", "data_extraction", "generic_workflow".\n' +
   '3. Allowed phase intents: "open_surface", "search", "select_result", "fill_field", "select_option", "submit", "navigate", "verify_outcome", "custom".\n' +
-  '4. Allowed low-level actions in phases: "click", "type", "focus".\n' +
+  '4. Allowed low-level actions in phases: array of string literals from ["click", "type", "focus"] (e.g. ["click", "type"]). Never use pipe characters inside JSON.\n' +
   '5. Do NOT invent CSS selectors, element IDs, or coordinate values.\n' +
   '6. Extract explicit parameters into fieldParameter (fieldName and targetValue) and extractedParameters when present.\n' +
   '7. The plan must contain at least 1 phase and at most 8 phases.\n' +
   '8. Phase indices must be 0-indexed and sequential (0, 1, 2, ...).\n' +
-  '9. Return STRICTLY valid JSON only matching the schema below. No conversational prose or markdown outside the JSON.\n\n' +
+  '9. Return STRICTLY valid JSON only matching the schema below. No conversational prose, markdown outside the JSON, trailing commas, or pipe characters.\n' +
+  '10. For goals requesting to find or inspect a specific record/item with selection constraints (e.g. "Find my latest Amazon transaction", "Find most recent salary transaction"): create a "search" phase (with fieldParameter targetValue containing ONLY the entity to search, excluding selection constraints like "latest") followed by a "select_result" phase to select the matching record.\n\n' +
   'Schema:\n' +
   '{\n' +
   '  "planId": "<unique_id>",\n' +
@@ -1891,7 +2172,7 @@ export const TASK_DECOMPOSITION_SYSTEM_PROMPT =
   '      "description": "<what this phase achieves>",\n' +
   '      "targetHint": "<optional descriptive label/keyword of element to target>",\n' +
   '      "fieldParameter": {"fieldName": "<field>", "targetValue": "<value>"},\n' +
-  '      "allowedActions": ["click"|"type"|"focus"],\n' +
+  '      "allowedActions": ["click", "type"],\n' +
   '      "expectedOutcome": "<expected state after phase>"\n' +
   '    }\n' +
   '  ],\n' +
@@ -2038,6 +2319,102 @@ export function normalizeDecomposedTaskPlan(
 
       return phaseObj;
     });
+
+    // Deterministic item-retrieval / search query normalization:
+    // If goal seeks a specific item (e.g. "Find my latest Amazon transaction and show its details"),
+    // extract clean search entity ("Amazon") and ensure:
+    // 1. Search phase has fieldParameter with targetValue = cleanEntity, targetHint = cleanEntity, description = "Search for " + cleanEntity.
+    // 2. Select phase preserves selection constraint and entity noun.
+    if (goalDescription && Array.isArray(norm['phases']) && norm['phases'].length > 0) {
+      const queryValidation = validateAndNormalizeSearchQuery('', goalDescription);
+      const cleanEntity = queryValidation.query;
+      const queryAnalysis = cleanSearchQueryCandidate(goalDescription);
+      const isItemRetrieval = Boolean(
+        cleanEntity && (queryAnalysis.constraint || queryAnalysis.entityNoun || queryAnalysis.amountFilter || queryAnalysis.temporalFilter)
+      );
+
+      if (isItemRetrieval && cleanEntity) {
+        const phases = norm['phases'] as Array<Record<string, unknown>>;
+
+        // If an open_surface phase was generated before search for an item retrieval goal,
+        // remove it so search is phase 0, since the dashboard/search surface is already active.
+        const openSurfaceIdx = phases.findIndex(p => p['intent'] === 'open_surface');
+        const searchIdx = phases.findIndex(p => p['intent'] === 'search');
+        if (openSurfaceIdx !== -1 && searchIdx !== -1 && openSurfaceIdx < searchIdx) {
+          phases.splice(openSurfaceIdx, 1);
+          phases.forEach((p, idx) => {
+            p['phaseIndex'] = idx;
+            p['phaseId'] = `phase-${idx}`;
+          });
+        }
+
+        // 1. Normalize all search phase metadata consistently
+        const searchPhase = phases.find(p => p['intent'] === 'search');
+        if (searchPhase) {
+          if (!searchPhase['fieldParameter'] || typeof searchPhase['fieldParameter'] !== 'object') {
+            searchPhase['fieldParameter'] = {
+              fieldName: 'search',
+              targetValue: cleanEntity
+            };
+          } else {
+            const fp = searchPhase['fieldParameter'] as Record<string, unknown>;
+            fp['targetValue'] = cleanEntity;
+            if (!fp['fieldName']) {
+              fp['fieldName'] = 'search';
+            }
+          }
+          searchPhase['targetHint'] = cleanEntity;
+          searchPhase['description'] = `Search for ${cleanEntity}`;
+        }
+
+        // 2. Normalize or append select_result phase, preserving temporal/selection constraint
+        const selectPhase = (norm['phases'] as Array<Record<string, unknown>>).find(p => p['intent'] === 'select_result');
+        const selectDescription = `Select the ${queryAnalysis.constraint ?? 'matching'} ${cleanEntity} ${queryAnalysis.entityNoun ?? 'transaction'}`;
+        if (selectPhase) {
+          selectPhase['targetHint'] = cleanEntity;
+          if (!selectPhase['description'] || selectPhase['description'] === '') {
+            selectPhase['description'] = selectDescription;
+          }
+        } else {
+          const nextIdx = (norm['phases'] as Array<Record<string, unknown>>).length;
+          (norm['phases'] as Array<Record<string, unknown>>).push({
+            phaseId: `phase-${nextIdx}`,
+            phaseIndex: nextIdx,
+            intent: 'select_result',
+            description: selectDescription,
+            targetHint: cleanEntity,
+            allowedActions: ['click'],
+            expectedOutcome: 'Matching result selected and details displayed'
+          });
+        }
+      } else if (!cleanEntity && queryAnalysis.constraint && queryAnalysis.entityNoun) {
+        // Goal seeks a record without a merchant filter (e.g. "Show the details of my latest transaction").
+        // No search input is needed. Ensure the primary active phase is select_result.
+        const phases = norm['phases'] as Array<Record<string, unknown>>;
+        const selectDesc = `Select the ${queryAnalysis.constraint} ${queryAnalysis.entityNoun}`;
+        const searchIdx = phases.findIndex(p => p['intent'] === 'search');
+        if (searchIdx !== -1) {
+          phases.splice(searchIdx, 1);
+          phases.forEach((p, idx) => {
+            p['phaseIndex'] = idx;
+            p['phaseId'] = `phase-${idx}`;
+          });
+        }
+        const selectPhase = phases.find(p => p['intent'] === 'select_result');
+        if (!selectPhase) {
+          phases.unshift({
+            phaseId: 'phase-0',
+            phaseIndex: 0,
+            intent: 'select_result',
+            description: selectDesc,
+            allowedActions: ['click'],
+            expectedOutcome: 'Latest transaction selected and details displayed'
+          });
+        } else {
+          selectPhase['description'] = selectDesc;
+        }
+      }
+    }
   }
 
   // Normalize extractedParameters if present
@@ -2101,21 +2478,71 @@ export async function decomposeTaskGoal(
       return undefined;
     }
 
-    const raw = chatResult.content;
-    if (typeof raw !== 'string' || raw.trim() === '') {
-      return undefined;
+    let raw = chatResult.content;
+    const parseAttempt = (text: string): Record<string, unknown> | null => {
+      if (typeof text !== 'string' || text.trim() === '') return null;
+      const cleaned = stripMarkdownFences(text).trim();
+      const direct = tryParseJsonCandidate(cleaned);
+      if (direct) return direct;
+      return extractSingleJsonObject(text);
+    };
+
+    let parsedObj = parseAttempt(raw);
+
+    if (!parsedObj) {
+      try {
+        const retryResult = await client.chat({
+          systemPrompt: TASK_DECOMPOSITION_SYSTEM_PROMPT,
+          userPrompt,
+          temperature: 0,
+          maxTokens: (optionsOrClient as TaskDecompositionOptions)?.maxTokens ?? 1024
+        });
+        if (retryResult.success && typeof retryResult.content === 'string') {
+          parsedObj = parseAttempt(retryResult.content);
+        }
+      } catch {
+        // Retry failed; fall through
+      }
     }
 
-    // Parse JSON safely using direct JSON.parse or extractSingleJsonObject
-    let parsedObj: Record<string, unknown> | null = null;
-    const cleaned = stripMarkdownFences(raw).trim();
-    try {
-      const direct = JSON.parse(cleaned);
-      if (typeof direct === 'object' && direct !== null && !Array.isArray(direct)) {
-        parsedObj = direct as Record<string, unknown>;
+    if (!parsedObj) {
+      const queryAnalysis = cleanSearchQueryCandidate(goalDescription);
+      const fallbackEntity = queryAnalysis.merchant ?? (queryAnalysis.query && queryAnalysis.query.length > 0 ? queryAnalysis.query : undefined);
+      if (fallbackEntity && (queryAnalysis.isLatest || queryAnalysis.constraint || queryAnalysis.entityNoun || queryAnalysis.amountFilter || queryAnalysis.temporalFilter)) {
+        parsedObj = {
+          planId: `plan-decomp-fallback-${Date.now()}`,
+          archetype: 'search_and_act',
+          userGoal: goalDescription.trim(),
+          summary: `Search for ${fallbackEntity} and view details`,
+          phases: [
+            {
+              phaseId: 'phase-0',
+              phaseIndex: 0,
+              intent: 'search',
+              description: `Search for ${fallbackEntity}`,
+              targetHint: fallbackEntity,
+              fieldParameter: {
+                fieldName: 'search',
+                targetValue: fallbackEntity
+              },
+              allowedActions: ['type'],
+              expectedOutcome: `Search results for ${fallbackEntity} displayed`
+            },
+            {
+              phaseId: 'phase-1',
+              phaseIndex: 1,
+              intent: 'select_result',
+              description: `Select the ${queryAnalysis.constraint ?? 'matching'} ${fallbackEntity} ${queryAnalysis.entityNoun ?? 'record'}`,
+              targetHint: fallbackEntity,
+              allowedActions: ['click'],
+              expectedOutcome: `Matching ${fallbackEntity} selected and details displayed`
+            }
+          ],
+          currentPhaseIndex: 0,
+          extractedParameters: {}
+        };
+        console.log(`[NexVision Decomposer] Applied deterministic TaskPlan fallback for '${fallbackEntity}'`);
       }
-    } catch {
-      parsedObj = extractSingleJsonObject(raw);
     }
 
     if (!parsedObj) {

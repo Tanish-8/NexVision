@@ -11,9 +11,21 @@
  * 4. Preserves all UI grounding structure (id, tagName, role, bounds, state, relationships).
  */
 
-export { detectPrivacyFindings } from './detector.js';
+export {
+  detectPrivacyFindings,
+  isLikelyPersonName,
+  CUSTOMER_ID_PATTERN,
+  POSTAL_ADDRESS_PATTERN,
+  SENSITIVE_PAGE_CONTEXT_PATTERN,
+  COMMON_UI_AND_BRAND_WORDS
+} from './detector.js';
 export { isValidLuhn } from './luhn.js';
-export { redactText, sanitizePageRepresentation, sanitizeUrl } from './sanitizer.js';
+export {
+  redactText,
+  redactStandalonePersonNames,
+  sanitizePageRepresentation,
+  sanitizeUrl
+} from './sanitizer.js';
 export { REDACTION_TOKENS } from './types.js';
 export type {
   PrivacyCategory,

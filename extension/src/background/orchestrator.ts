@@ -21,6 +21,13 @@
  */
 
 import type { ElementProvenance, PageRepresentation, ScreenshotCaptureResult } from '../shared/types.js';
+import {
+  detectPrivacyFindings,
+  isLikelyPersonName,
+  CUSTOMER_ID_PATTERN,
+  POSTAL_ADDRESS_PATTERN,
+  SENSITIVE_PAGE_CONTEXT_PATTERN
+} from '../privacy/index.js';
 
 // ---------------------------------------------------------------------------
 // Minimal provider interfaces
@@ -203,6 +210,96 @@ export interface UnifiedPerceptionOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Visual Privacy Gate (Phase 2.6 Fail-Closed Protection)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of evaluating visual privacy safety for screenshot submission.
+ */
+export interface VisualPrivacyGateResult {
+  allowed: boolean;
+  blockedReason?: string;
+  sensitiveCategories?: string[];
+}
+
+/**
+ * Evaluates whether submitting visual screenshot data to a vision model adapter
+ * risks exposing unredacted sensitive PII.
+ *
+ * Implements Phase 2.6 fail-closed screenshot privacy protection:
+ * Because DOM-to-screenshot pixel coordinates cannot be guaranteed to perfectly
+ * match rendered screenshot pixels in a background service worker (due to devicePixelRatio,
+ * zoom, subpixel layout, canvas rendering, or dynamic layout shifts), unmasked screenshots
+ * containing sensitive credentials or financial identifiers are blocked from vision-model submission.
+ */
+export function evaluateVisualPrivacyGate(page: PageRepresentation): VisualPrivacyGateResult {
+  const sensitiveCategories = new Set<string>();
+
+  // 1. Password input elements (inputType="password" or attributes.type="password")
+  const hasPasswordInput = page.elements.some(
+    el => el.inputType === 'password' || el.attributes?.['type'] === 'password'
+  );
+  if (hasPasswordInput) {
+    sensitiveCategories.add('password');
+  }
+
+  // 2. Sensitive privacy findings detected in DOM text or attributes
+  // Evaluates all categories supported by detector: password, card, email, phone, name, address, auth_token
+  const findings = detectPrivacyFindings(page);
+  for (const finding of findings) {
+    sensitiveCategories.add(finding.category);
+  }
+
+  // 3. Customer identifiers, standalone names, and postal addresses in DOM text/attributes
+  for (const el of page.elements) {
+    const textSignals = [
+      el.visibleText,
+      el.accessibleName,
+      el.placeholder,
+      el.attributes?.['aria-label'],
+      el.attributes?.['title'],
+      el.attributes?.['alt'],
+      el.attributes?.['aria-description']
+    ];
+
+    for (const text of textSignals) {
+      if (!text) continue;
+
+      if (CUSTOMER_ID_PATTERN.test(text)) {
+        sensitiveCategories.add('customer_id');
+      }
+
+      if (isLikelyPersonName(text)) {
+        sensitiveCategories.add('name');
+      }
+
+      if (POSTAL_ADDRESS_PATTERN.test(text)) {
+        sensitiveCategories.add('address');
+      }
+    }
+  }
+
+  // 4. Conservative page-context rules:
+  // Account, profile, billing, payment, checkout, customer-management pages require DOM-only perception
+  const url = page.metadata?.url ?? '';
+  const title = page.metadata?.title ?? '';
+  if (SENSITIVE_PAGE_CONTEXT_PATTERN.test(url) || SENSITIVE_PAGE_CONTEXT_PATTERN.test(title)) {
+    sensitiveCategories.add('sensitive_page_context');
+  }
+
+  if (sensitiveCategories.size > 0) {
+    const categoryList = Array.from(sensitiveCategories).sort().join(', ');
+    return {
+      allowed: false,
+      blockedReason: `Visual perception blocked: page contains sensitive data (${categoryList}) that cannot be reliably masked in screenshots.`,
+      sensitiveCategories: Array.from(sensitiveCategories)
+    };
+  }
+
+  return { allowed: true };
+}
+
+// ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
 
@@ -237,7 +334,43 @@ export async function perceivePage(
     };
   }
 
-  // 2. Screenshot capture — async, provider may throw.
+  // 2. Visual Privacy Gate Evaluation BEFORE Screenshot Capture (Phase 2.8 Fail-Closed Protection)
+  const gate = evaluateVisualPrivacyGate(domRepresentation);
+
+  if (visionAdapter.name !== 'NullVisionAdapter') {
+    if (!gate.allowed) {
+      // Visual perception blocked fail-closed BEFORE capturing any screenshot.
+      // Zero screenshot bytes are captured, zero image encoding occurs, and no visual model submission is made.
+      return {
+        success: false,
+        error: {
+          origin: 'vision',
+          code: 'VISUAL_PII_EXPOSURE_BLOCKED',
+          message: gate.blockedReason ?? 'Visual perception blocked due to sensitive PII on page'
+        }
+      };
+    }
+  }
+
+  // 3. For NullVisionAdapter when the page is sensitive:
+  // Safely return DOM-only perception without taking an unnecessary screenshot of sensitive page data.
+  if (visionAdapter.name === 'NullVisionAdapter' && !gate.allowed) {
+    return {
+      success: true,
+      domRepresentation,
+      screenshotRef: {
+        format: options?.screenshotFormat ?? 'png',
+        timestamp: Date.now()
+      },
+      visualObservations: [],
+      metadata: {
+        orchestratedAt: Date.now(),
+        visionAdapterName: visionAdapter.name
+      }
+    };
+  }
+
+  // 4. Screenshot capture — async, provider may throw. ONLY called when privacy gate has approved.
   let screenshotRef: ScreenshotReference;
   try {
     screenshotRef = await screenshotProvider();
@@ -251,7 +384,7 @@ export async function perceivePage(
     };
   }
 
-  // 3. Build VisionImageInput from the screenshot reference.
+  // 5. Build VisionImageInput from the approved screenshot reference.
   //    Physical screenshot dimensions are preferred when known; falls back to CSS viewport dimensions.
   const visionInput = {
     dimensions: screenshotRef.dimensions ?? {
@@ -262,7 +395,7 @@ export async function perceivePage(
     format: screenshotRef.format === 'jpeg' ? 'image/jpeg' : 'image/png'
   };
 
-  // 4. Visual perception — async, discriminated result.
+  // 6. Visual perception — async, discriminated result.
   let visionResult: Awaited<ReturnType<VisualPerceptionAdapter['perceive']>>;
   try {
     visionResult = await visionAdapter.perceive(visionInput);

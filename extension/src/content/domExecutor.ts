@@ -103,6 +103,10 @@ function isElementActionable(element: Element): boolean {
     if (inlineVisibility === 'hidden' || inlineVisibility === 'collapse') {
       return false;
     }
+    const inlineOpacity = element.style?.opacity;
+    if (inlineOpacity === '0' || (inlineOpacity !== '' && inlineOpacity !== undefined && parseFloat(inlineOpacity) === 0)) {
+      return false;
+    }
   }
 
   if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
@@ -113,6 +117,9 @@ function isElementActionable(element: Element): boolean {
           return false;
         }
         if (style.visibility === 'hidden' || style.visibility === 'collapse') {
+          return false;
+        }
+        if (style.opacity === '0' || parseFloat(style.opacity) === 0) {
           return false;
         }
       }
@@ -226,6 +233,25 @@ function setNativeInputValue(element: HTMLInputElement | HTMLTextAreaElement, va
   } else {
     element.value = value;
   }
+}
+
+/**
+ * Validates whether a string conforms to canonical ISO date format (YYYY-MM-DD)
+ * and represents a valid calendar date.
+ */
+function isValidIsoDateString(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
+  }
+  const parts = value.split('-').map(Number);
+  const y = parts[0];
+  const m = parts[1];
+  const d = parts[2];
+  if (typeof y !== 'number' || typeof m !== 'number' || typeof d !== 'number') {
+    return false;
+  }
+  const date = new Date(y, m - 1, d);
+  return date.getFullYear() === y && date.getMonth() === m - 1 && date.getDate() === d;
 }
 
 /**
@@ -383,6 +409,74 @@ export function executeDomAction(
       }
 
       case 'type': {
+        const payload: TypeActionPayload = action.payload;
+        if (!payload || typeof payload.text !== 'string') {
+          return makeFailureResult(
+            'INVALID_ACTION',
+            'Type action requires a valid string in payload.text',
+            action
+          );
+        }
+
+        // Generic native <select> option selection
+        const isSelect =
+          element instanceof HTMLSelectElement ||
+          (element.tagName && element.tagName.toLowerCase() === 'select');
+
+        if (isSelect) {
+          if (
+            element.hasAttribute('readonly') ||
+            Boolean((element as HTMLInputElement).readOnly)
+          ) {
+            return makeFailureResult(
+              'TARGET_NOT_ACTIONABLE',
+              `Target element "${target.elementId}" is read-only`,
+              action
+            );
+          }
+
+          const selectElem = element as HTMLSelectElement;
+          const targetText = payload.text.trim().toLowerCase();
+          const options = Array.from(selectElem.options || []);
+
+          // Match by value or text content (case-insensitive)
+          const matchingOption = options.find((opt) => {
+            const optVal = (opt.value || '').trim().toLowerCase();
+            const optText = (opt.text || opt.textContent || opt.label || '').trim().toLowerCase();
+            return optVal === targetText || optText === targetText;
+          });
+
+          if (!matchingOption) {
+            return makeFailureResult(
+              'TARGET_NOT_ACTIONABLE',
+              `No option matching "${payload.text}" found in select element "${target.elementId}"`,
+              action
+            );
+          }
+
+          if (typeof (selectElem as HTMLElement).focus === 'function') {
+            (selectElem as HTMLElement).focus();
+          }
+
+          selectElem.value = matchingOption.value;
+          matchingOption.selected = true;
+          selectElem.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+          selectElem.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+
+          const isOptionSelected =
+            selectElem.value === matchingOption.value || matchingOption.selected;
+
+          const successResult: ExecutionSuccessResult = {
+            success: true,
+            actionType: 'type',
+            elementId: target.elementId,
+            actionId,
+            timestamp: Date.now(),
+            valueMatch: isOptionSelected
+          };
+          return successResult;
+        }
+
         if (!isTextEntryElement(element)) {
           return makeFailureResult(
             'TARGET_NOT_ACTIONABLE',
@@ -399,15 +493,6 @@ export function executeDomAction(
           return makeFailureResult(
             'TARGET_NOT_ACTIONABLE',
             `Target element "${target.elementId}" is read-only`,
-            action
-          );
-        }
-
-        const payload: TypeActionPayload = action.payload;
-        if (!payload || typeof payload.text !== 'string') {
-          return makeFailureResult(
-            'INVALID_ACTION',
-            'Type action requires a valid string in payload.text',
             action
           );
         }
@@ -430,26 +515,78 @@ export function executeDomAction(
           }
         }
 
+        let valueMatch = false;
+
         // Insert typed text (NOTE: Strictly local execution, NEVER logged or returned)
         if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-          const currentVal = element.value || '';
-          setNativeInputValue(element, currentVal + payload.text);
+          const isDateInput =
+            (element instanceof HTMLInputElement || (element.tagName && element.tagName.toLowerCase() === 'input')) &&
+            (element as HTMLInputElement).type?.toLowerCase() === 'date';
 
-          try {
-            element.dispatchEvent(
-              new InputEvent('beforeinput', {
-                bubbles: true,
-                cancelable: true,
-                data: payload.text,
-                inputType: 'insertText'
-              })
-            );
-          } catch {
-            // Non-critical fallback
+          if (isDateInput) {
+            const dateValue = payload.text.trim();
+            if (!isValidIsoDateString(dateValue)) {
+              return makeFailureResult(
+                'INVALID_ACTION',
+                `Invalid date value for date input "${target.elementId}". Expected canonical YYYY-MM-DD format.`,
+                action
+              );
+            }
+
+            setNativeInputValue(element as HTMLInputElement, dateValue);
+
+            try {
+              element.dispatchEvent(
+                new InputEvent('beforeinput', {
+                  bubbles: true,
+                  cancelable: true,
+                  data: dateValue,
+                  inputType: 'insertText'
+                })
+              );
+            } catch {
+              // Non-critical fallback
+            }
+
+            element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+
+            // Live DOM canonical date verification
+            const liveDate = (element as HTMLInputElement).value;
+            valueMatch = liveDate === dateValue;
+          } else {
+            const currentVal = element.value || '';
+            setNativeInputValue(element, currentVal + payload.text);
+
+            try {
+              element.dispatchEvent(
+                new InputEvent('beforeinput', {
+                  bubbles: true,
+                  cancelable: true,
+                  data: payload.text,
+                  inputType: 'insertText'
+                })
+              );
+            } catch {
+              // Non-critical fallback
+            }
+
+            element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+
+            // Live DOM text verification (privacy-safe: boolean result only, value never returned/logged)
+            const liveVal = (element.value ?? '').trim().toLowerCase();
+            const expectedFull = (currentVal + payload.text).trim().toLowerCase();
+            const payloadText = payload.text.trim().toLowerCase();
+
+            if (payload.clearFirst) {
+              valueMatch = payloadText.length > 0 ? liveVal === payloadText : liveVal === '';
+            } else {
+              valueMatch = payloadText.length > 0
+                ? (liveVal === expectedFull || liveVal.includes(payloadText))
+                : liveVal === expectedFull;
+            }
           }
-
-          element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
         } else if (isContentEditableElement(element)) {
           const currentText = element.textContent || '';
           element.textContent = currentText + payload.text;
@@ -469,6 +606,19 @@ export function executeDomAction(
 
           element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
           element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+
+          // Live DOM contenteditable verification
+          const liveText = (element.textContent ?? '').trim().toLowerCase();
+          const expectedFull = (currentText + payload.text).trim().toLowerCase();
+          const payloadText = payload.text.trim().toLowerCase();
+
+          if (payload.clearFirst) {
+            valueMatch = payloadText.length > 0 ? liveText === payloadText : liveText === '';
+          } else {
+            valueMatch = payloadText.length > 0
+              ? (liveText === expectedFull || liveText.includes(payloadText))
+              : liveText === expectedFull;
+          }
         } else {
           return makeFailureResult(
             'TARGET_NOT_ACTIONABLE',
@@ -509,7 +659,8 @@ export function executeDomAction(
           actionType: 'type',
           elementId: target.elementId,
           actionId,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          valueMatch
         };
         return successResult;
       }

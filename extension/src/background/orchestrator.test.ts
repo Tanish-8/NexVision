@@ -8,7 +8,8 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import {
-  perceivePage
+  perceivePage,
+  evaluateVisualPrivacyGate
 } from './orchestrator.js';
 import type {
   DomPerceptionProvider,
@@ -568,5 +569,408 @@ describe('Phase 2C — Unified Perception Orchestrator', () => {
     expect(capturedInputDimensions).toEqual({ width: 1280, height: 720 });
     expect(result.screenshotRef.dimensions).toBeUndefined();
     expect(result.screenshotRef).not.toHaveProperty('dataUrl');
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 2.6 Fail-Closed Visual Privacy Gate Tests
+  // -------------------------------------------------------------------------
+
+  it('19. blocks visual perception fail-closed when DOM contains a password input field', async () => {
+    let perceiveCalled = false;
+    const testVisionAdapter: VisualPerceptionAdapter = {
+      name: 'TestVisionAdapter',
+      perceive: async () => {
+        perceiveCalled = true;
+        return { success: true, observations: [] };
+      }
+    };
+
+    const domWithPassword: PageRepresentation = {
+      schemaVersion: '1.0',
+      metadata: { title: 'Login Page', url: 'https://example.com/login' },
+      viewport: { width: 1280, height: 720 },
+      elements: [
+        {
+          id: 'pwd-input',
+          tagName: 'input',
+          role: 'textbox',
+          inputType: 'password',
+          interactive: true,
+          provenance: 'dom'
+        }
+      ]
+    };
+
+    // Verify evaluateVisualPrivacyGate helper directly
+    const gateResult = evaluateVisualPrivacyGate(domWithPassword);
+    expect(gateResult.allowed).toBe(false);
+    expect(gateResult.blockedReason).toContain('password');
+
+    // Verify perceivePage fail-closed behavior
+    const result = await perceivePage(
+      makeDomProvider(domWithPassword),
+      makeScreenshotProvider(),
+      testVisionAdapter
+    );
+
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error('Expected failure');
+    expect(result.error.origin).toBe('vision');
+    expect(result.error.code).toBe('VISUAL_PII_EXPOSURE_BLOCKED');
+    expect(result.error.message).toContain('password');
+    expect(perceiveCalled).toBe(false); // Screenshot was NEVER sent to vision model
+  });
+
+  it('20. blocks visual perception fail-closed when DOM contains financial card numbers', async () => {
+    let perceiveCalled = false;
+    const testVisionAdapter: VisualPerceptionAdapter = {
+      name: 'TestVisionAdapter',
+      perceive: async () => {
+        perceiveCalled = true;
+        return { success: true, observations: [] };
+      }
+    };
+
+    const domWithCard: PageRepresentation = {
+      schemaVersion: '1.0',
+      metadata: { title: 'Checkout Page', url: 'https://example.com/checkout' },
+      viewport: { width: 1280, height: 720 },
+      elements: [
+        {
+          id: 'card-display',
+          tagName: 'span',
+          visibleText: 'Card: XXXX XXXX 4821',
+          interactive: false,
+          provenance: 'dom'
+        }
+      ]
+    };
+
+    const gateResult = evaluateVisualPrivacyGate(domWithCard);
+    expect(gateResult.allowed).toBe(false);
+    expect(gateResult.blockedReason).toContain('card');
+
+    const result = await perceivePage(
+      makeDomProvider(domWithCard),
+      makeScreenshotProvider(),
+      testVisionAdapter
+    );
+
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error('Expected failure');
+    expect(result.error.origin).toBe('vision');
+    expect(result.error.code).toBe('VISUAL_PII_EXPOSURE_BLOCKED');
+    expect(result.error.message).toContain('card');
+    expect(perceiveCalled).toBe(false);
+  });
+
+  it('21. allows NullVisionAdapter even when DOM has sensitive data (DOM-only fallback mode)', async () => {
+    const nullVisionAdapter: VisualPerceptionAdapter = {
+      name: 'NullVisionAdapter',
+      perceive: async () => {
+        return { success: true, observations: [] };
+      }
+    };
+
+    const domWithSensitive: PageRepresentation = {
+      schemaVersion: '1.0',
+      metadata: { title: 'Sensitive Page', url: 'https://example.com/sensitive' },
+      viewport: { width: 1280, height: 720 },
+      elements: [
+        {
+          id: 'pwd-field',
+          tagName: 'input',
+          inputType: 'password',
+          interactive: true,
+          provenance: 'dom'
+        }
+      ]
+    };
+
+    // NullVisionAdapter does not send screenshot bytes to any model, so DOM-only perception succeeds
+    const result = await perceivePage(
+      makeDomProvider(domWithSensitive),
+      makeScreenshotProvider(),
+      nullVisionAdapter
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error('Expected success');
+    expect(result.visualObservations).toEqual([]);
+    expect(result.metadata.visionAdapterName).toBe('NullVisionAdapter');
+  });
+
+  it('22. allows visual perception with real/mock vision adapter when DOM contains only harmless content', async () => {
+    let perceiveCalled = false;
+    const testVisionAdapter: VisualPerceptionAdapter = {
+      name: 'TestVisionAdapter',
+      perceive: async () => {
+        perceiveCalled = true;
+        return { success: true, observations: [MOCK_OBSERVATION] };
+      }
+    };
+
+    const cleanDom: PageRepresentation = {
+      schemaVersion: '1.0',
+      metadata: { title: 'Harmless Store', url: 'https://example.com/store' },
+      viewport: { width: 1280, height: 720 },
+      elements: [
+        {
+          id: 'btn-order',
+          tagName: 'button',
+          visibleText: 'Submit Order',
+          interactive: true,
+          provenance: 'dom'
+        }
+      ]
+    };
+
+    const gateResult = evaluateVisualPrivacyGate(cleanDom);
+    expect(gateResult.allowed).toBe(true);
+
+    const result = await perceivePage(
+      makeDomProvider(cleanDom),
+      makeScreenshotProvider(),
+      testVisionAdapter
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error('Expected success');
+    expect(perceiveCalled).toBe(true);
+    expect(result.visualObservations.length).toBe(1);
+  });
+
+  describe('Phase 2.8 — Targeted Privacy Boundary Remediation Suite', () => {
+    const makeTrackingVisionAdapter = () => {
+      let perceiveCalls = 0;
+      const adapter: VisualPerceptionAdapter = {
+        name: 'TrackingVisionAdapter',
+        perceive: async () => {
+          perceiveCalls++;
+          return { success: true, observations: [MOCK_OBSERVATION] };
+        }
+      };
+      return { adapter, getCalls: () => perceiveCalls };
+    };
+
+    const makeTrackingScreenshotProvider = () => {
+      let captureCalls = 0;
+      const provider: ScreenshotProvider = async () => {
+        captureCalls++;
+        return makeScreenshotProvider()();
+      };
+      return { provider, getCalls: () => captureCalls };
+    };
+
+    const testCategories: Array<{
+      category: string;
+      dom: PageRepresentation;
+      expectedKeyword: string;
+    }> = [
+      {
+        category: 'password',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Login', url: 'https://example.com/login' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-pwd', tagName: 'input', inputType: 'password', interactive: true, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'password'
+      },
+      {
+        category: 'full card',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Checkout', url: 'https://example.com/pay' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-card', tagName: 'span', visibleText: 'Card: 4000-0000-0000-0002', interactive: false, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'card'
+      },
+      {
+        category: 'masked card',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Wallet', url: 'https://example.com/cards' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-mcard', tagName: 'span', visibleText: 'Card ending XXXX XXXX 4821', interactive: false, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'card'
+      },
+      {
+        category: 'email',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Contact', url: 'https://example.com/contact' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-email', tagName: 'span', visibleText: 'Email: arjun.reddy@example.com', interactive: false, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'email'
+      },
+      {
+        category: 'phone',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Support', url: 'https://example.com/help' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-phone', tagName: 'span', visibleText: 'Tel: +91 98765 43210', interactive: false, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'phone'
+      },
+      {
+        category: 'contextual customer name',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Dashboard', url: 'https://example.com/dash' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-cname', tagName: 'h1', visibleText: 'Welcome, Arjun Reddy', interactive: false, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'name'
+      },
+      {
+        category: 'standalone customer name',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Dashboard', url: 'https://example.com/dash' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-sname', tagName: 'button', visibleText: 'Arjun Reddy', interactive: true, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'name'
+      },
+      {
+        category: 'postal address',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Delivery', url: 'https://example.com/shipping' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-addr', tagName: 'p', visibleText: 'Deliver to: 12 Example Residency, Hyderabad', interactive: false, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'address'
+      },
+      {
+        category: 'customer ID',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Profile', url: 'https://example.com/user' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-custid', tagName: 'span', visibleText: 'Customer ID: CUST-99214', interactive: false, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'customer_id'
+      },
+      {
+        category: 'conservative page-context',
+        dom: {
+          schemaVersion: '1.0',
+          metadata: { title: 'Billing Overview', url: 'https://example.com/billing/overview' },
+          viewport: { width: 1280, height: 720 },
+          elements: [
+            { id: 'f-btn', tagName: 'button', visibleText: 'View Statements', interactive: true, provenance: 'dom' }
+          ]
+        },
+        expectedKeyword: 'sensitive_page_context'
+      }
+    ];
+
+    for (const tc of testCategories) {
+      it(`blocks visual perception fail-closed and prevents screenshot capture for ${tc.category}`, async () => {
+        const { adapter, getCalls: getVisionCalls } = makeTrackingVisionAdapter();
+        const { provider, getCalls: getCaptureCalls } = makeTrackingScreenshotProvider();
+
+        const gate = evaluateVisualPrivacyGate(tc.dom);
+        expect(gate.allowed).toBe(false);
+        expect(gate.sensitiveCategories).toContain(tc.expectedKeyword);
+
+        const result = await perceivePage(makeDomProvider(tc.dom), provider, adapter);
+
+        expect(result.success).toBe(false);
+        if (result.success) throw new Error('Expected failure');
+        expect(result.error.origin).toBe('vision');
+        expect(result.error.code).toBe('VISUAL_PII_EXPOSURE_BLOCKED');
+        expect(result.error.message).toContain(tc.expectedKeyword);
+
+        // Pre-capture invariant: screenshot capture was NEVER invoked
+        expect(getCaptureCalls()).toBe(0);
+        // Visual perception adapter was NEVER called
+        expect(getVisionCalls()).toBe(0);
+      });
+    }
+
+    it('allows standalone transaction ID on clean page without blocking screenshot capture', async () => {
+      const { adapter, getCalls: getVisionCalls } = makeTrackingVisionAdapter();
+      const { provider, getCalls: getCaptureCalls } = makeTrackingScreenshotProvider();
+
+      const txnDom: PageRepresentation = {
+        schemaVersion: '1.0',
+        metadata: { title: 'Store Catalog', url: 'https://example.com/store' },
+        viewport: { width: 1280, height: 720 },
+        elements: [
+          { id: 'elem-txn', tagName: 'span', visibleText: 'Transaction: TXN-8849201', interactive: false, provenance: 'dom' },
+          { id: 'btn-view', tagName: 'button', visibleText: 'View Details', interactive: true, provenance: 'dom' }
+        ]
+      };
+
+      const gate = evaluateVisualPrivacyGate(txnDom);
+      expect(gate.allowed).toBe(true);
+
+      const result = await perceivePage(makeDomProvider(txnDom), provider, adapter);
+      expect(result.success).toBe(true);
+      expect(getCaptureCalls()).toBe(1);
+      expect(getVisionCalls()).toBe(1);
+    });
+
+    it('handles retry from visual failure to NullVisionAdapter without screenshot capture on sensitive page', async () => {
+      const { adapter: visionAdapter, getCalls: getVisionCalls } = makeTrackingVisionAdapter();
+      const { provider: screenshotProvider, getCalls: getCaptureCalls } = makeTrackingScreenshotProvider();
+
+      const sensitiveDom: PageRepresentation = {
+        schemaVersion: '1.0',
+        metadata: { title: 'Dashboard', url: 'https://example.com/dash' },
+        viewport: { width: 1280, height: 720 },
+        elements: [
+          { id: 'f-user', tagName: 'button', visibleText: 'Arjun Reddy', interactive: true, provenance: 'dom' }
+        ]
+      };
+
+      // Attempt 1: Visual perception fails fail-closed
+      const firstResult = await perceivePage(makeDomProvider(sensitiveDom), screenshotProvider, visionAdapter);
+      expect(firstResult.success).toBe(false);
+      if (firstResult.success) throw new Error('Expected failure');
+      expect(firstResult.error.code).toBe('VISUAL_PII_EXPOSURE_BLOCKED');
+      expect(getCaptureCalls()).toBe(0);
+      expect(getVisionCalls()).toBe(0);
+
+      // Attempt 2: Fallback to NullVisionAdapter (DOM-only)
+      const nullAdapter: VisualPerceptionAdapter = {
+        name: 'NullVisionAdapter',
+        perceive: async () => ({ success: true, observations: [] })
+      };
+
+      const fallbackResult = await perceivePage(makeDomProvider(sensitiveDom), screenshotProvider, nullAdapter);
+      expect(fallbackResult.success).toBe(true);
+      if (!fallbackResult.success) throw new Error('Expected fallback success');
+      expect(fallbackResult.metadata.visionAdapterName).toBe('NullVisionAdapter');
+      expect(fallbackResult.visualObservations).toEqual([]);
+
+      // Invariant: screenshot capture was NEVER invoked on attempt 1 OR attempt 2
+      expect(getCaptureCalls()).toBe(0);
+    });
   });
 });

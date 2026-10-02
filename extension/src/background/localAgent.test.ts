@@ -6,6 +6,8 @@ import {
   type PlannerDriver,
   type PlannerResult,
   type PlannerActionDecision,
+  type TaskPhase,
+  type SafeModelHistoryStep,
   planNextStep
 } from '../shared/planner.js';
 
@@ -28,9 +30,21 @@ import {
   DefaultLocalLlamaChatClient,
   compactCandidatesForModel,
   MAX_MODEL_CANDIDATES,
+  getPhaseRolePriority,
+  scoreCandidateRelevance,
+  type ModelCandidateTarget,
   normalizeModelProposal,
   findTopLevelJsonObjectCandidates,
-  extractSingleJsonObject
+  tryParseJsonCandidate,
+  extractSingleJsonObject,
+  decomposeTaskGoal,
+  TASK_DECOMPOSITION_SYSTEM_PROMPT,
+  buildTaskDecompositionUserPrompt,
+  summarizeTaskPlanForLogs,
+  normalizeDecomposedTaskPlan,
+  doesTargetCorrespondToPhaseField,
+  normalizeActionProposalForPhase,
+  type TaskPlan
 } from './localAgent.js';
 
 // ---------------------------------------------------------------------------
@@ -2278,7 +2292,7 @@ describe('Planning Output Boundary Hardening (Goals D & E)', () => {
   });
 
   describe('Goal E: Default Local Planning Completion Budget', () => {
-    it('proves DefaultLocalLlamaChatClient sends default max_tokens: 1024 in request payload', async () => {
+    it('proves DefaultLocalLlamaChatClient sends default max_tokens: 1024 and does NOT send response_format', async () => {
       let capturedBody: any;
       const mockFetch = vi.fn().mockImplementation((_url, init) => {
         capturedBody = JSON.parse(init.body);
@@ -2310,8 +2324,12 @@ describe('Planning Output Boundary Hardening (Goals D & E)', () => {
       expect(result.success).toBe(true);
       expect(capturedBody).toBeDefined();
       expect(capturedBody.max_tokens).toBe(1024);
-      expect(capturedBody.response_format).toEqual({ type: 'json_object' });
+      // response_format must NOT be sent — it triggers llama.cpp JSON grammar
+      // constraint mode which adds ~108 s of latency with no application benefit
+      // since parseAdvisoryResponse() already validates JSON strictly.
+      expect(capturedBody.response_format).toBeUndefined();
     });
+
 
     it('allows overriding maxTokens when explicitly provided in options', async () => {
       let capturedBody: any;
@@ -2820,6 +2838,2396 @@ describe('clearFirst propagation and query-text-replace regression', () => {
     expect(safeAction.payload.text).toBe('');
     // clearFirst and pressEnter may be present (structural, non-PII)
     expect(safeAction.payload.clearFirst).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Post-search click candidate ranking (Bug 2 verification)
+  // -------------------------------------------------------------------------
+
+  describe('Post-search click candidate ranking', () => {
+    it('3. ranks navigation link candidate matching target above generic button in post-search click phase', () => {
+      const candidates: import('./localAgent.js').ModelCandidateTarget[] = [
+        { elementId: 'elem-btn-play', role: 'button', accessibleName: 'Play', visibleText: 'Play', confidence: 0.9 },
+        {
+          elementId: 'elem-link-dest',
+          role: 'link',
+          accessibleName: 'I Built A City To Save Kids From Illegal Labor by Creator',
+          visibleText: 'I Built A City To Save Kids From Illegal Labor',
+          hasHref: true,
+          confidence: 0.9
+        }
+      ];
+      const goalDesc = 'Search for Creator and play this video: I Built A City To Save Kids From Illegal Labor';
+
+      // In post-search click phase (isPostSearchClick = true):
+      const postSearchResult = compactCandidatesForModel(candidates, goalDesc, 20, true);
+      expect(postSearchResult[0].elementId).toBe('elem-link-dest');
+      expect(postSearchResult[1].elementId).toBe('elem-btn-play');
+    });
+
+    it('4. preserves button priority over link for ordinary button tasks', () => {
+      const candidates: import('./localAgent.js').ModelCandidateTarget[] = [
+        { elementId: 'elem-btn-submit', role: 'button', accessibleName: 'Submit Order', visibleText: 'Submit', confidence: 0.9 },
+        { elementId: 'elem-link-help', role: 'link', accessibleName: 'Help Link', visibleText: 'Help', confidence: 0.9 }
+      ];
+      // Ordinary button task without post-search phase:
+      const normalResult = compactCandidatesForModel(candidates, 'Submit order', 20, false);
+      expect(normalResult[0].elementId).toBe('elem-btn-submit');
+    });
+
+    it('buildAgentUserPrompt automatically applies post-search ranking when goal intent is click on compound goal', () => {
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'g-comp',
+          description: 'Search for Creator and play this video: I Built A City To Save Kids',
+          intent: 'click'
+        },
+        context: {
+          page: {
+            schemaVersion: '1.0',
+            metadata: { title: 'Search Results' },
+            viewport: { width: 1280, height: 800 },
+            elements: [
+              { id: 'btn-play', role: 'button', tagName: 'button', accessibleName: 'Play', interactive: true },
+              { id: 'link-dest', role: 'link', tagName: 'a', accessibleName: 'I Built A City To Save Kids', attributes: { href: '/watch?v=123' }, interactive: true }
+            ]
+          },
+          availableTargets: [
+            { elementId: 'btn-play', role: 'button', confidence: 1, viewportBounds: { x: 10, y: 10, width: 50, height: 30 }, point: { x: 35, y: 25 }, observationId: 'o1' },
+            { elementId: 'link-dest', role: 'link', confidence: 1, viewportBounds: { x: 10, y: 50, width: 200, height: 30 }, point: { x: 110, y: 65 }, observationId: 'o2' }
+          ],
+          capturedAt: Date.now(),
+          currentTime: Date.now(),
+          stepIndex: 1
+        },
+        history: [
+          {
+            stepIndex: 0,
+            action: {
+              id: 'a0',
+              type: 'type',
+              target: { elementId: 'search-input', point: { x: 100, y: 20 }, viewportBounds: { x: 80, y: 10, width: 200, height: 30 }, confidence: 1, observationId: 'os0' },
+              payload: { text: '', pressEnter: true }
+            },
+            perceivedOutcome: 'success'
+          }
+        ]
+      });
+
+      const promptStr = buildAgentUserPrompt(input);
+      const parsed = JSON.parse(promptStr);
+      expect(parsed.availableTargets[0].elementId).toBe('link-dest');
+      expect(parsed.availableTargets[1].elementId).toBe('btn-play');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase B — Upfront Task Understanding & Decomposition Tests
+  // -------------------------------------------------------------------------
+
+  describe('Phase B — Upfront Task Understanding & Decomposition', () => {
+    it('1. decomposes a search-only goal into search -> verify_outcome plan', async () => {
+      const mockPlan: TaskPlan = {
+        planId: 'plan-search-1',
+        archetype: 'search_and_act',
+        summary: 'Search for laptops under ₹50,000',
+        phases: [
+          { phaseId: 'phase-0', phaseIndex: 0, intent: 'search', description: 'Enter search query and submit', allowedActions: ['type'] },
+          { phaseId: 'phase-1', phaseIndex: 1, intent: 'verify_outcome', description: 'Verify results displayed', allowedActions: ['click'] }
+        ],
+        currentPhaseIndex: 0
+      };
+
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify(mockPlan)
+        })
+      };
+
+      const result = await decomposeTaskGoal('Search for laptops under ₹50,000', { client: mockClient });
+      expect(result).toBeDefined();
+      expect(result?.archetype).toBe('search_and_act');
+      expect(result?.phases).toHaveLength(2);
+      expect(result?.phases[0].intent).toBe('search');
+      expect(result?.phases[1].intent).toBe('verify_outcome');
+    });
+
+    it('2. decomposes a compound search/action goal into search -> select_result -> verify_outcome', async () => {
+      const mockPlan: TaskPlan = {
+        planId: 'plan-yt-1',
+        archetype: 'search_and_act',
+        summary: 'Search for creator and open video',
+        phases: [
+          { phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'Search for MrBeast', allowedActions: ['type'] },
+          { phaseId: 'p1', phaseIndex: 1, intent: 'select_result', description: 'Select the video result', targetHint: 'I Built A City', allowedActions: ['click'] },
+          { phaseId: 'p2', phaseIndex: 2, intent: 'verify_outcome', description: 'Verify video page loaded', allowedActions: ['click'] }
+        ],
+        currentPhaseIndex: 0
+      };
+
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify(mockPlan)
+        })
+      };
+
+      const result = await decomposeTaskGoal(
+        'Search for MrBeast and play I Built A City To Save Kids From Illegal Labor',
+        { client: mockClient }
+      );
+      expect(result).toBeDefined();
+      expect(result?.phases).toHaveLength(3);
+      expect(result?.phases[0].intent).toBe('search');
+      expect(result?.phases[1].intent).toBe('select_result');
+      expect(result?.phases[2].intent).toBe('verify_outcome');
+    });
+
+    it('3. decomposes a multi-field form goal into open_surface -> fill_field -> select_option -> submit -> verify_outcome', async () => {
+      const mockPlan: TaskPlan = {
+        planId: 'plan-task-1',
+        archetype: 'form_submission',
+        summary: 'Create and add task with attributes',
+        phases: [
+          { phaseId: 'p0', phaseIndex: 0, intent: 'open_surface', description: 'Open creation form', targetHint: 'Add Task, Create', allowedActions: ['click'] },
+          { phaseId: 'p1', phaseIndex: 1, intent: 'fill_field', description: 'Enter name', fieldParameter: { fieldName: 'name', targetValue: 'college' }, allowedActions: ['type'] },
+          { phaseId: 'p2', phaseIndex: 2, intent: 'select_option', description: 'Select status', fieldParameter: { fieldName: 'status', targetValue: 'pending' }, allowedActions: ['click', 'type'] },
+          { phaseId: 'p3', phaseIndex: 3, intent: 'fill_field', description: 'Enter due date', fieldParameter: { fieldName: 'due date', targetValue: 'today' }, allowedActions: ['type'] },
+          { phaseId: 'p4', phaseIndex: 4, intent: 'select_option', description: 'Select priority', fieldParameter: { fieldName: 'priority', targetValue: 'medium' }, allowedActions: ['click', 'type'] },
+          { phaseId: 'p5', phaseIndex: 5, intent: 'submit', description: 'Submit created task', targetHint: 'Save, Create', allowedActions: ['click'] },
+          { phaseId: 'p6', phaseIndex: 6, intent: 'verify_outcome', description: 'Confirm task created', allowedActions: ['click'] }
+        ],
+        currentPhaseIndex: 0,
+        extractedParameters: {
+          name: 'college',
+          status: 'pending',
+          dueDate: 'today',
+          priority: 'medium'
+        }
+      };
+
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify(mockPlan)
+        })
+      };
+
+      const result = await decomposeTaskGoal(
+        'Create and add a task with name college, status pending, due date today and priority medium',
+        { client: mockClient }
+      );
+      expect(result).toBeDefined();
+      expect(result?.archetype).toBe('form_submission');
+      expect(result?.phases).toHaveLength(7);
+      expect(result?.phases[0].intent).toBe('open_surface');
+      expect(result?.phases[1].fieldParameter?.fieldName).toBe('name');
+      expect(result?.phases[1].fieldParameter?.targetValue).toBe('college');
+      expect(result?.phases[5].intent).toBe('submit');
+    });
+
+    it('4. decomposes a navigation/action goal into navigate/open_surface -> select_option/click -> verify_outcome', async () => {
+      const mockPlan: TaskPlan = {
+        planId: 'plan-settings-1',
+        archetype: 'navigation_act',
+        summary: 'Go to settings and enable dark mode',
+        phases: [
+          { phaseId: 'p0', phaseIndex: 0, intent: 'navigate', description: 'Navigate to settings', targetHint: 'Settings', allowedActions: ['click'] },
+          { phaseId: 'p1', phaseIndex: 1, intent: 'select_option', description: 'Toggle dark mode', targetHint: 'Dark mode', allowedActions: ['click'] },
+          { phaseId: 'p2', phaseIndex: 2, intent: 'verify_outcome', description: 'Verify dark mode is enabled', allowedActions: ['click'] }
+        ],
+        currentPhaseIndex: 0
+      };
+
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify(mockPlan)
+        })
+      };
+
+      const result = await decomposeTaskGoal('Go to settings and enable dark mode', { client: mockClient });
+      expect(result).toBeDefined();
+      expect(result?.archetype).toBe('navigation_act');
+      expect(result?.phases).toHaveLength(3);
+    });
+
+    it('5. returns undefined on invalid model JSON response', async () => {
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: 'Here is your plan: { this is definitely not valid json }'
+        })
+      };
+
+      const result = await decomposeTaskGoal('Search for items', { client: mockClient });
+      expect(result).toBeUndefined();
+    });
+
+    it('6. returns undefined on truncated model output', async () => {
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: '{"planId": "p1", "archetype": "search_and_act", "phases": [{"phaseId": "p0", "phaseIndex": 0'
+        })
+      };
+
+      const result = await decomposeTaskGoal('Search for items', { client: mockClient });
+      expect(result).toBeUndefined();
+    });
+
+    it('7. returns undefined on invalid TaskPlan schema (e.g. invalid archetype)', async () => {
+      const mockPlan = {
+        planId: 'p1',
+        archetype: 'teleport_to_mars',
+        summary: 'Invalid plan',
+        phases: [{ phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'Search' }],
+        currentPhaseIndex: 0
+      };
+
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify(mockPlan)
+        })
+      };
+
+      const result = await decomposeTaskGoal('Search for items', { client: mockClient });
+      expect(result).toBeUndefined();
+    });
+
+    it('8. returns undefined on empty phase list', async () => {
+      const mockPlan = {
+        planId: 'p1',
+        archetype: 'search_and_act',
+        summary: 'Empty phases',
+        phases: [],
+        currentPhaseIndex: 0
+      };
+
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify(mockPlan)
+        })
+      };
+
+      const result = await decomposeTaskGoal('Search for items', { client: mockClient });
+      expect(result).toBeUndefined();
+    });
+
+    it('9. returns undefined on model timeout or chat failure', async () => {
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: false,
+          error: { code: 'TIMEOUT', message: 'Local inference timeout after 120s' }
+        })
+      };
+
+      const result = await decomposeTaskGoal('Search for items', { client: mockClient });
+      expect(result).toBeUndefined();
+    });
+
+    it('10. handles chat exception cleanly with undefined fallback', async () => {
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockRejectedValue(new Error('Connection reset by peer'))
+      };
+
+      const result = await decomposeTaskGoal('Search for items', { client: mockClient });
+      expect(result).toBeUndefined();
+    });
+
+    it('11. proves no DOM or PageRepresentation is passed into decomposition request', async () => {
+      let capturedRequest: any;
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockImplementation((req) => {
+          capturedRequest = req;
+          return Promise.resolve({
+            success: true,
+            content: JSON.stringify({
+              planId: 'p1',
+              archetype: 'search_and_act',
+              summary: 'search',
+              phases: [{ phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'search' }],
+              currentPhaseIndex: 0
+            })
+          });
+        })
+      };
+
+      await decomposeTaskGoal('Search for laptops', { client: mockClient });
+      expect(capturedRequest).toBeDefined();
+
+      const userPayload = JSON.parse(capturedRequest.userPrompt);
+      expect(userPayload.goal).toBe('Search for laptops');
+      expect((userPayload as any).page).toBeUndefined();
+      expect((userPayload as any).availableTargets).toBeUndefined();
+      expect((userPayload as any).elements).toBeUndefined();
+      expect((userPayload as any).dom).toBeUndefined();
+      expect((userPayload as any).metadata).toBeUndefined();
+    });
+
+    it('12. proves no screenshot or vision input is passed into decomposition request', async () => {
+      let capturedRequest: any;
+      const mockClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockImplementation((req) => {
+          capturedRequest = req;
+          return Promise.resolve({
+            success: true,
+            content: JSON.stringify({
+              planId: 'p1',
+              archetype: 'search_and_act',
+              summary: 'search',
+              phases: [{ phaseId: 'p0', phaseIndex: 0, intent: 'search', description: 'search' }],
+              currentPhaseIndex: 0
+            })
+          });
+        })
+      };
+
+      await decomposeTaskGoal('Search for laptops', { client: mockClient });
+      expect(capturedRequest).toBeDefined();
+
+      expect((capturedRequest as any).screenshot).toBeUndefined();
+      expect((capturedRequest as any).dataUrl).toBeUndefined();
+      expect((capturedRequest as any).image).toBeUndefined();
+      expect(capturedRequest.userPrompt).not.toContain('data:image');
+    });
+
+    it('13. proves sensitive parameter values are not written to summarizeTaskPlanForLogs', () => {
+      const planWithSensitiveParams: TaskPlan = {
+        planId: 'plan-sens-1',
+        archetype: 'form_submission',
+        summary: 'Submit sensitive order form',
+        phases: [
+          { phaseId: 'p0', phaseIndex: 0, intent: 'fill_field', description: 'Enter password', fieldParameter: { fieldName: 'password', targetValue: 'super-secret-password-123' }, allowedActions: ['type'] },
+          { phaseId: 'p1', phaseIndex: 1, intent: 'fill_field', description: 'Enter card', fieldParameter: { fieldName: 'credit_card', targetValue: '4111-2222-3333-4444' }, allowedActions: ['type'] }
+        ],
+        currentPhaseIndex: 0,
+        extractedParameters: {
+          password: 'super-secret-password-123',
+          credit_card: '4111-2222-3333-4444'
+        }
+      };
+
+      const logOutput = summarizeTaskPlanForLogs(planWithSensitiveParams);
+      // Confirms parameter keys are shown
+      expect(logOutput).toContain('password');
+      expect(logOutput).toContain('credit_card');
+      // Confirms raw sensitive values are NEVER printed in logs
+      expect(logOutput).not.toContain('super-secret-password-123');
+      expect(logOutput).not.toContain('4111-2222-3333-4444');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase C — Phase-Conditioned Grounding & Candidate Ranking Tests
+  // -------------------------------------------------------------------------
+  describe('Phase C — Phase-Conditioned Grounding & Candidate Ranking', () => {
+    function scoreCandidate(c: ModelCandidateTarget, goalDesc: string, phase?: TaskPhase): number {
+      const goalKeywords = goalDesc.toLowerCase().split(/[\s,;.!?]+/).filter(w => w.length > 2);
+      const hasHref = Boolean(c.attributes?.['href']) || c.hasHref === true;
+      return scoreCandidateRelevance(c.role, c.accessibleName, c.visibleText, goalKeywords, false, hasHref, phase, {
+        placeholder: c.placeholder,
+        attributes: c.attributes
+      });
+    }
+
+    // 1. OPEN_SURFACE: "Create Task" button outranks searchbox
+    it('1. OPEN_SURFACE: "Create Task" button outranks global searchbox', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'global-search',
+        role: 'searchbox',
+        accessibleName: 'Search site',
+        confidence: 1.0,
+        interactive: true
+      };
+      const createBtn: ModelCandidateTarget = {
+        elementId: 'btn-create',
+        role: 'button',
+        accessibleName: 'Create Task',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const phase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'open_surface',
+        description: 'Open task creation drawer',
+        targetHint: 'Create Task',
+        allowedActions: ['click']
+      };
+
+      const searchScore = scoreCandidate(searchBox, 'Create a new task', phase);
+      const createScore = scoreCandidate(createBtn, 'Create a new task', phase);
+
+      expect(createScore).toBeGreaterThan(searchScore);
+
+      const compacted = compactCandidatesForModel([searchBox, createBtn], 'Create a new task', 10, { activePhase: phase });
+      expect(compacted[0].elementId).toBe('btn-create');
+    });
+
+    // 2. FILL_FIELD: Task Name textbox outranks Search tasks textbox for fieldName = "name"
+    it('2. FILL_FIELD: Task Name textbox outranks Search tasks textbox for fieldName = "name"', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'search-tasks',
+        role: 'textbox',
+        accessibleName: 'Search tasks',
+        confidence: 1.0,
+        interactive: true
+      };
+      const taskNameInput: ModelCandidateTarget = {
+        elementId: 'task-name-input',
+        role: 'textbox',
+        accessibleName: 'Task Name',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const phase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'fill_field',
+        description: 'Enter task name',
+        targetHint: 'Task Name',
+        fieldParameter: {
+          fieldName: 'name',
+          targetValue: 'college'
+        },
+        allowedActions: ['type']
+      };
+
+      const searchScore = scoreCandidate(searchBox, 'Create task with name college', phase);
+      const nameScore = scoreCandidate(taskNameInput, 'Create task with name college', phase);
+
+      expect(nameScore).toBeGreaterThan(searchScore);
+
+      const compacted = compactCandidatesForModel([searchBox, taskNameInput], 'Create task with name college', 10, { activePhase: phase });
+      expect(compacted[0].elementId).toBe('task-name-input');
+    });
+
+    // 3. SELECT_OPTION: Status combobox preferred for fieldName = "status"
+    it('3. SELECT_OPTION: Status combobox is preferred over searchbox and priority combobox for fieldName = "status"', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'search-box',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        confidence: 1.0,
+        interactive: true
+      };
+      const prioritySelect: ModelCandidateTarget = {
+        elementId: 'priority-select',
+        role: 'combobox',
+        accessibleName: 'Priority',
+        confidence: 1.0,
+        interactive: true
+      };
+      const statusSelect: ModelCandidateTarget = {
+        elementId: 'status-select',
+        role: 'combobox',
+        accessibleName: 'Status',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const phase: TaskPhase = {
+        phaseId: 'p2',
+        phaseIndex: 2,
+        intent: 'select_option',
+        description: 'Select pending status',
+        fieldParameter: {
+          fieldName: 'status',
+          targetValue: 'pending'
+        },
+        allowedActions: ['click']
+      };
+
+      const statusScore = scoreCandidate(statusSelect, 'Select status pending', phase);
+      const priorityScore = scoreCandidate(prioritySelect, 'Select status pending', phase);
+      const searchScore = scoreCandidate(searchBox, 'Select status pending', phase);
+
+      expect(statusScore).toBeGreaterThan(priorityScore);
+      expect(statusScore).toBeGreaterThan(searchScore);
+
+      const compacted = compactCandidatesForModel([searchBox, prioritySelect, statusSelect], 'Select status pending', 10, { activePhase: phase });
+      expect(compacted[0].elementId).toBe('status-select');
+    });
+
+    // 4. SUBMIT: Save button is preferred over searchbox and unrelated button
+    it('4. SUBMIT: Save button is preferred over searchbox and unrelated buttons', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'search-box',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        confidence: 1.0,
+        interactive: true
+      };
+      const cancelBtn: ModelCandidateTarget = {
+        elementId: 'btn-cancel',
+        role: 'button',
+        accessibleName: 'Cancel',
+        confidence: 1.0,
+        interactive: true
+      };
+      const saveBtn: ModelCandidateTarget = {
+        elementId: 'btn-save',
+        role: 'button',
+        accessibleName: 'Save Task',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const phase: TaskPhase = {
+        phaseId: 'p3',
+        phaseIndex: 3,
+        intent: 'submit',
+        description: 'Save the task',
+        targetHint: 'save',
+        allowedActions: ['click']
+      };
+
+      const saveScore = scoreCandidate(saveBtn, 'Save and submit task', phase);
+      const cancelScore = scoreCandidate(cancelBtn, 'Save and submit task', phase);
+      const searchScore = scoreCandidate(searchBox, 'Save and submit task', phase);
+
+      expect(saveScore).toBeGreaterThan(cancelScore);
+      expect(saveScore).toBeGreaterThan(searchScore);
+
+      const compacted = compactCandidatesForModel([searchBox, cancelBtn, saveBtn], 'Save and submit task', 10, { activePhase: phase });
+      expect(compacted[0].elementId).toBe('btn-save');
+    });
+
+    // 5. SELECT_RESULT: Destination-bearing result link preferred over generic button / searchbox
+    it('5. SELECT_RESULT: Destination-bearing result link preferred over generic button and searchbox', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'search-box',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        confidence: 1.0,
+        interactive: true
+      };
+      const playBtn: ModelCandidateTarget = {
+        elementId: 'btn-play',
+        role: 'button',
+        accessibleName: 'Play',
+        confidence: 1.0,
+        interactive: true
+      };
+      const resultLink: ModelCandidateTarget = {
+        elementId: 'result-video-link',
+        role: 'link',
+        accessibleName: 'I Built A City To Save Kids From Illegal Labor',
+        confidence: 1.0,
+        attributes: { href: '/watch?v=city123' },
+        interactive: true
+      };
+
+      const phase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'select_result',
+        description: 'Play requested video',
+        targetHint: 'I Built A City',
+        allowedActions: ['click']
+      };
+
+      const linkScore = scoreCandidate(resultLink, 'Play I Built A City video', phase);
+      const playScore = scoreCandidate(playBtn, 'Play I Built A City video', phase);
+      const searchScore = scoreCandidate(searchBox, 'Play I Built A City video', phase);
+
+      expect(linkScore).toBeGreaterThan(playScore);
+      expect(linkScore).toBeGreaterThan(searchScore);
+
+      const compacted = compactCandidatesForModel([searchBox, playBtn, resultLink], 'Play I Built A City video', 10, { activePhase: phase });
+      expect(compacted[0].elementId).toBe('result-video-link');
+    });
+
+    // 6. SEARCH: Searchbox remains strongly preferred
+    it('6. SEARCH: Searchbox remains strongly preferred over other inputs', () => {
+      const noteInput: ModelCandidateTarget = {
+        elementId: 'note-input',
+        role: 'textbox',
+        accessibleName: 'User Note',
+        confidence: 1.0,
+        interactive: true
+      };
+      const searchInput: ModelCandidateTarget = {
+        elementId: 'search-box',
+        role: 'searchbox',
+        accessibleName: 'Search query',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const phase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'search',
+        description: 'Search for laptops',
+        targetHint: 'Search',
+        allowedActions: ['type']
+      };
+
+      const searchScore = scoreCandidate(searchInput, 'Search for laptops', phase);
+      const noteScore = scoreCandidate(noteInput, 'Search for laptops', phase);
+
+      expect(searchScore).toBeGreaterThan(noteScore);
+
+      const compacted = compactCandidatesForModel([noteInput, searchInput], 'Search for laptops', 10, { activePhase: phase });
+      expect(compacted[0].elementId).toBe('search-box');
+    });
+
+    // 7. Candidate compaction: Phase-relevant targets survive compaction beyond MAX_MODEL_CANDIDATES
+    it('7. Candidate compaction: Phase-relevant targets survive compaction when candidate count exceeds budget', () => {
+      // Create 25 generic navigation buttons that would otherwise fill MAX_MODEL_CANDIDATES (20)
+      const genericTargets: ModelCandidateTarget[] = Array.from({ length: 25 }, (_, i) => ({
+        elementId: `nav-elem-${i}`,
+        role: 'button',
+        accessibleName: `Navigation Menu Item ${i}`,
+        confidence: 0.8,
+        interactive: true
+      }));
+
+      // Phase-relevant form field
+      const relevantFormField: ModelCandidateTarget = {
+        elementId: 'target-task-name',
+        role: 'textbox',
+        accessibleName: 'Task Name',
+        confidence: 0.9,
+        interactive: true
+      };
+
+      const candidates = [...genericTargets, relevantFormField];
+
+      const phase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'fill_field',
+        description: 'Fill task name',
+        fieldParameter: { fieldName: 'name', targetValue: 'college' },
+        allowedActions: ['type']
+      };
+
+      const compacted = compactCandidatesForModel(candidates, 'Create task with name college', 20, { activePhase: phase });
+
+      expect(compacted.length).toBeLessThanOrEqual(20);
+      const found = compacted.find(c => c.elementId === 'target-task-name');
+      expect(found).toBeDefined();
+      expect(compacted[0].elementId).toBe('target-task-name');
+    });
+
+    // 8. Allowed action enforcement: Action rejected when not in allowedActions
+    it('8. Allowed action enforcement: Driver rejects model action violating phase allowedActions', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-submit-btn',
+            actionType: 'click', // violating phase allowedActions ['type']
+            rationale: 'Trying to click button instead of typing'
+          })
+        })
+      };
+
+      const driver = new LocalAgentDriver(mockChatClient);
+
+      const phase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'fill_field',
+        description: 'Enter task name',
+        allowedActions: ['type']
+      };
+
+      const baseInput = createMockPlannerInput();
+      const input: PlannerInput = {
+        ...baseInput,
+        goal: {
+          ...baseInput.goal,
+          taskPlan: {
+            planId: 'plan-test',
+            archetype: 'form_submission',
+            summary: 'Fill form',
+            phases: [phase],
+            currentPhaseIndex: 0
+          }
+        },
+        context: {
+          ...baseInput.context,
+          phaseState: {
+            activePhase: phase,
+            completedPhaseIds: [],
+            remainingPhaseIds: [],
+            totalPhases: 1,
+            retryCountInCurrentPhase: 0
+          }
+        }
+      };
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') {
+        expect(result.reason).toContain('INCOMPATIBLE_ACTION_FOR_PHASE');
+      }
+
+      // Also verify planNextStep rejects it via planner orchestration
+      const planResult = await planNextStep(input, driver);
+      expect(planResult.status).toBe('FAILED');
+      if (planResult.status === 'FAILED') {
+        expect(planResult.reason).toBe('INCOMPATIBLE_ACTION_FOR_PHASE');
+      }
+    });
+
+    // 9. History: SafeModelHistoryStep maintains phase metadata without exposing raw typed text
+    it('9. History: safe model history exposes phaseIndex, phaseIntent, fulfilledParameter without raw typed text', () => {
+      const historyStep = {
+        stepIndex: 1,
+        action: {
+          id: 'act-1',
+          type: 'type' as const,
+          target: {
+            elementId: 'task-name-input',
+            role: 'textbox' as const,
+            point: { x: 100, y: 100 },
+            viewportBounds: { x: 50, y: 50, width: 100, height: 30 },
+            confidence: 1.0,
+            observationId: 'obs-1'
+          },
+          payload: { text: 'super-secret-password-123' }
+        },
+        perceivedOutcome: 'success' as const,
+        phaseIndex: 1,
+        phaseIntent: 'fill_field' as const,
+        fulfilledParameter: 'name'
+      };
+
+      const input = createMockPlannerInput({
+        history: [historyStep]
+      });
+
+      const payload = buildModelPromptPayload(input);
+      expect(payload.history).toBeDefined();
+      expect(payload.history).toHaveLength(1);
+      const step = payload.history![0] as SafeModelHistoryStep;
+      expect(step.phaseIndex).toBe(1);
+      expect(step.phaseIntent).toBe('fill_field');
+      expect(step.fulfilledParameter).toBe('name');
+      // Verify raw typed text is NOT present in history
+      expect((step as any).text).toBeUndefined();
+      expect((step as any).payload).toBeUndefined();
+      expect(JSON.stringify(payload)).not.toContain('super-secret-password-123');
+    });
+
+    // 10. Backward compatibility: When taskPlan === undefined, existing candidate ranking remains identical
+    it('10. Backward compatibility: When taskPlan is undefined, default ranking behavior is preserved', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'elem-search-input',
+        role: 'textbox',
+        accessibleName: 'Search products',
+        confidence: 1.0,
+        interactive: true
+      };
+      const button: ModelCandidateTarget = {
+        elementId: 'elem-submit-btn',
+        role: 'button',
+        accessibleName: 'Search',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      // Undefined activePhase -> uses legacy SEARCH_ROLE_PRIORITY
+      const scoreSearch = scoreCandidate(searchBox, 'Search for products', undefined);
+      const scoreBtn = scoreCandidate(button, 'Search for products', undefined);
+
+      expect(getPhaseRolePriority(undefined, 'searchbox')).toBe(10);
+      expect(getPhaseRolePriority(undefined, 'textbox')).toBe(9);
+      expect(getPhaseRolePriority(undefined, 'button')).toBe(7);
+      expect(scoreSearch).toBeGreaterThan(0);
+      expect(scoreBtn).toBeGreaterThan(0);
+
+      const compacted = compactCandidatesForModel([button, searchBox], 'Search for products');
+      expect(compacted[0].elementId).toBe('elem-search-input');
+    });
+
+    // 11. YouTube regression: Search phase behaves as before; select-result phase prioritizes destination link
+    it('11. YouTube regression: Search phase prioritizes searchbox; select-result phase prioritizes destination video link', () => {
+      const searchInput: ModelCandidateTarget = {
+        elementId: 'search-input',
+        role: 'searchbox',
+        accessibleName: 'Search YouTube',
+        confidence: 1.0,
+        interactive: true
+      };
+      const videoResult: ModelCandidateTarget = {
+        elementId: 'video-result-1',
+        role: 'link',
+        accessibleName: 'MrBeast: I Built A City To Save Kids From Illegal Labor',
+        confidence: 1.0,
+        attributes: { href: '/watch?v=abc123xyz' },
+        interactive: true
+      };
+
+      const searchPhase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'search',
+        description: 'Search for MrBeast',
+        allowedActions: ['type']
+      };
+
+      const selectResultPhase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'select_result',
+        description: 'Play specific video',
+        targetHint: 'I Built A City',
+        allowedActions: ['click']
+      };
+
+      // In search phase: searchbox is preferred
+      const searchScoreP0 = scoreCandidate(searchInput, 'Search for MrBeast', searchPhase);
+      const videoScoreP0 = scoreCandidate(videoResult, 'Search for MrBeast', searchPhase);
+      expect(searchScoreP0).toBeGreaterThan(videoScoreP0);
+
+      // In select_result phase: destination video link is preferred over searchbox
+      const searchScoreP1 = scoreCandidate(searchInput, 'Play specific video', selectResultPhase);
+      const videoScoreP1 = scoreCandidate(videoResult, 'Play specific video', selectResultPhase);
+      expect(videoScoreP1).toBeGreaterThan(searchScoreP1);
+    });
+
+    // 11b. Search phase suppresses autocomplete suggestions even when matching exact query
+    it('11b. Autocomplete suggestion is heavily suppressed in search phase and does not outrank searchbox', () => {
+      const searchInput: ModelCandidateTarget = {
+        elementId: 'search-input',
+        role: 'searchbox',
+        accessibleName: 'Search',
+        confidence: 1.0,
+        interactive: true
+      };
+      const autocompleteSuggestion: ModelCandidateTarget = {
+        elementId: 'sugg-mrbeast',
+        role: 'option',
+        accessibleName: 'MrBeast',
+        visibleText: 'MrBeast',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const searchPhase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'search',
+        description: 'Search for MrBeast',
+        allowedActions: ['type']
+      };
+
+      const searchScore = scoreCandidate(searchInput, 'Search for MrBeast and play the first video', searchPhase);
+      const suggScore = scoreCandidate(autocompleteSuggestion, 'Search for MrBeast and play the first video', searchPhase);
+
+      // Search input is strongly boosted, while autocomplete suggestion is heavily penalized and denied keyword bonus
+      expect(searchScore).toBeGreaterThan(25);
+      expect(suggScore).toBeLessThan(0);
+      expect(searchScore).toBeGreaterThan(suggScore);
+
+      // Compacting preserves search input at index 0 ahead of suggestion
+      const compacted = compactCandidatesForModel(
+        [autocompleteSuggestion, searchInput],
+        'Search for MrBeast and play the first video',
+        5,
+        { activePhase: searchPhase }
+      );
+      expect(compacted[0].elementId).toBe('search-input');
+    });
+
+    // 12. Task creation regression: Open-surface phase does not select global searchbox when creation control exists
+    it('12. Task creation regression: Open-surface phase selects creation control over global searchbox', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'global-search-bar',
+        role: 'textbox',
+        accessibleName: 'Search tasks...',
+        confidence: 1.0,
+        interactive: true
+      };
+      const addTaskBtn: ModelCandidateTarget = {
+        elementId: 'btn-add-task',
+        role: 'button',
+        accessibleName: 'Add Task',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const openPhase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'open_surface',
+        description: 'Open task creation modal',
+        targetHint: 'add task',
+        allowedActions: ['click']
+      };
+
+      const candidates = [searchBox, addTaskBtn];
+      const compacted = compactCandidatesForModel(candidates, 'Create and add a task with name college', 10, { activePhase: openPhase });
+
+      expect(compacted[0].elementId).toBe('btn-add-task');
+      expect(compacted[0].role).toBe('button');
+    });
+
+    // 13. NAVIGATE: Navigation link with destination outranks searchbox and generic text inputs
+    it('13. NAVIGATE: Navigation link with destination outranks searchbox and generic text inputs', () => {
+      const searchBox: ModelCandidateTarget = {
+        elementId: 'search-input',
+        role: 'textbox',
+        accessibleName: 'Search',
+        confidence: 1.0,
+        interactive: true
+      };
+      const settingsLink: ModelCandidateTarget = {
+        elementId: 'nav-settings-link',
+        role: 'link',
+        accessibleName: 'Account Settings',
+        confidence: 1.0,
+        attributes: { href: '/settings/account' },
+        interactive: true
+      };
+
+      const navPhase: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'navigate',
+        description: 'Navigate to account settings',
+        targetHint: 'account settings',
+        allowedActions: ['click']
+      };
+
+      const searchScore = scoreCandidate(searchBox, 'Navigate to account settings', navPhase);
+      const linkScore = scoreCandidate(settingsLink, 'Navigate to account settings', navPhase);
+
+      expect(linkScore).toBeGreaterThan(searchScore);
+
+      const compacted = compactCandidatesForModel([searchBox, settingsLink], 'Navigate to account settings', 10, { activePhase: navPhase });
+      expect(compacted[0].elementId).toBe('nav-settings-link');
+    });
+
+    // 14. VERIFY_OUTCOME: Model proposal of COMPLETED is accepted when active phase is verify_outcome
+    it('14. VERIFY_OUTCOME: Model proposal of COMPLETED is accepted when active phase is verify_outcome', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'COMPLETED',
+            summary: 'Verified that task college is listed in table'
+          })
+        })
+      };
+
+      const driver = new LocalAgentDriver(mockChatClient);
+
+      const verifyPhase: TaskPhase = {
+        phaseId: 'p4',
+        phaseIndex: 4,
+        intent: 'verify_outcome',
+        description: 'Verify task creation was successful',
+        allowedActions: ['click']
+      };
+
+      const baseInput = createMockPlannerInput();
+      const input: PlannerInput = {
+        ...baseInput,
+        context: {
+          ...baseInput.context,
+          phaseState: {
+            activePhase: verifyPhase,
+            completedPhaseIds: ['p0', 'p1', 'p2', 'p3'],
+            remainingPhaseIds: [],
+            totalPhases: 5,
+            retryCountInCurrentPhase: 0
+          }
+        }
+      };
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('COMPLETED');
+      if (result.status === 'COMPLETED') {
+        expect(result.summary).toBe('Verified that task college is listed in table');
+      }
+    });
+
+    // 15. buildAgentUserPrompt serialization: Structured phase context with overallGoal, currentPhase, completedPhases, remainingPhases
+    it('15. buildAgentUserPrompt serialization: produces structured phase context and avoids raw TaskPlan bloat', () => {
+      const phase0: TaskPhase = {
+        phaseId: 'p0',
+        phaseIndex: 0,
+        intent: 'open_surface',
+        description: 'Open task creation drawer',
+        targetHint: 'add task',
+        allowedActions: ['click']
+      };
+      const phase1: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'fill_field',
+        description: 'Enter task name',
+        targetHint: 'task name',
+        fieldParameter: { fieldName: 'name', targetValue: 'college' },
+        allowedActions: ['type']
+      };
+
+      const baseInput = createMockPlannerInput();
+      const input: PlannerInput = {
+        ...baseInput,
+        goal: {
+          ...baseInput.goal,
+          description: 'Create and add task college',
+          taskPlan: {
+            planId: 'plan-xyz',
+            archetype: 'form_submission',
+            summary: 'Task creation plan',
+            phases: [phase0, phase1],
+            currentPhaseIndex: 1
+          }
+        },
+        context: {
+          ...baseInput.context,
+          phaseState: {
+            activePhase: phase1,
+            completedPhaseIds: ['p0'],
+            remainingPhaseIds: [],
+            totalPhases: 2,
+            retryCountInCurrentPhase: 0
+          }
+        }
+      };
+
+      const promptStr = buildAgentUserPrompt(input);
+      const parsed = JSON.parse(promptStr);
+
+      expect(parsed.overallGoal).toBe('Create and add task college');
+      expect(parsed.currentPhase).toBeDefined();
+      expect(parsed.currentPhase.index).toBe(1);
+      expect(parsed.currentPhase.intent).toBe('fill_field');
+      expect(parsed.currentPhase.objective).toBe('Enter task name');
+      expect(parsed.currentPhase.field).toEqual({ fieldName: 'name', targetValue: 'college' });
+      expect(parsed.completedPhases).toEqual([
+        { index: 0, intent: 'open_surface', description: 'Open task creation drawer' }
+      ]);
+      expect(parsed.remainingPhases).toEqual([]);
+
+      // Verify raw taskPlan blob is omitted from goal to prevent prompt token bloat
+      expect(parsed.goal.taskPlan).toBeUndefined();
+    });
+
+    // 16. FILL_FIELD with placeholder: Input with placeholder matching fieldName outranks generic inputs
+    it('16. FILL_FIELD with placeholder: input with placeholder matching fieldName outranks generic inputs', () => {
+      const genericInput: ModelCandidateTarget = {
+        elementId: 'input-generic',
+        role: 'textbox',
+        accessibleName: 'Filter items',
+        confidence: 1.0,
+        interactive: true
+      };
+      const inputWithPlaceholder: ModelCandidateTarget = {
+        elementId: 'input-name',
+        role: 'textbox',
+        accessibleName: '',
+        placeholder: 'Enter task name here',
+        confidence: 1.0,
+        interactive: true
+      };
+
+      const phase: TaskPhase = {
+        phaseId: 'p1',
+        phaseIndex: 1,
+        intent: 'fill_field',
+        description: 'Enter task name',
+        fieldParameter: { fieldName: 'name', targetValue: 'college' },
+        allowedActions: ['type']
+      };
+
+      const scoreGeneric = scoreCandidate(genericInput, 'Enter task name', phase);
+      const scoreWithPlaceholder = scoreCandidate(inputWithPlaceholder, 'Enter task name', phase);
+
+      expect(scoreWithPlaceholder).toBeGreaterThan(scoreGeneric);
+
+      const compacted = compactCandidatesForModel([genericInput, inputWithPlaceholder], 'Enter task name', 10, { activePhase: phase });
+      expect(compacted[0].elementId).toBe('input-name');
+    });
+  });
+
+  describe('Deterministic Temporal Grounding in TaskPlan Normalization', () => {
+    const FIXED_REF = '2026-09-29';
+
+    it('resolves relative date "today\'s date" into canonical YYYY-MM-DD and preserves rawTargetValue', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-date-1',
+        archetype: 'form_submission',
+        summary: 'Create task with today date',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'fill_field',
+            description: 'Enter due date with today\'s date',
+            fieldParameter: {
+              fieldName: 'dueDate',
+              targetValue: "today's date"
+            },
+            allowedActions: ['type'],
+            expectedOutcome: 'Due date is filled'
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      expect(normalized.phases[0].fieldParameter?.targetValue).toBe('2026-09-29');
+      expect(normalized.phases[0].fieldParameter?.rawTargetValue).toBe("today's date");
+    });
+
+    it('resolves "tomorrow" and "yesterday" with correct date offsets', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-offsets',
+        archetype: 'form_submission',
+        summary: 'Test date offsets',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'fill_field',
+            description: 'Enter start date',
+            fieldParameter: {
+              fieldName: 'startDate',
+              targetValue: 'yesterday'
+            },
+            allowedActions: ['type']
+          },
+          {
+            phaseIndex: 1,
+            phaseId: 'phase-1',
+            intent: 'fill_field',
+            description: 'Enter due date',
+            fieldParameter: {
+              fieldName: 'dueDate',
+              targetValue: 'tomorrow'
+            },
+            allowedActions: ['type']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      expect(normalized.phases[0].fieldParameter?.targetValue).toBe('2026-09-28');
+      expect(normalized.phases[0].fieldParameter?.rawTargetValue).toBe('yesterday');
+      expect(normalized.phases[1].fieldParameter?.targetValue).toBe('2026-09-30');
+      expect(normalized.phases[1].fieldParameter?.rawTargetValue).toBe('tomorrow');
+    });
+
+    it('preserves already-canonical YYYY-MM-DD dates without alteration', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-canon',
+        archetype: 'form_submission',
+        summary: 'Canonical date test',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'fill_field',
+            description: 'Enter due date',
+            fieldParameter: {
+              fieldName: 'dueDate',
+              targetValue: '2026-09-29'
+            },
+            allowedActions: ['type']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      expect(normalized.phases[0].fieldParameter?.targetValue).toBe('2026-09-29');
+      // No rawTargetValue needed when targetValue was already canonical
+      expect(normalized.phases[0].fieldParameter?.rawTargetValue).toBeUndefined();
+    });
+
+    it('leaves non-date fields and unsupported relative expressions untouched', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-mixed',
+        archetype: 'form_submission',
+        summary: 'Mixed fields',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'fill_field',
+            description: 'Enter name',
+            fieldParameter: {
+              fieldName: 'title',
+              targetValue: 'college'
+            },
+            allowedActions: ['type']
+          },
+          {
+            phaseIndex: 1,
+            phaseId: 'phase-1',
+            intent: 'select_option',
+            description: 'Select status',
+            fieldParameter: {
+              fieldName: 'status',
+              targetValue: 'pending'
+            },
+            allowedActions: ['select', 'click', 'type']
+          },
+          {
+            phaseIndex: 2,
+            phaseId: 'phase-2',
+            intent: 'fill_field',
+            description: 'Enter schedule',
+            fieldParameter: {
+              fieldName: 'schedule',
+              targetValue: 'next week'
+            },
+            allowedActions: ['type']
+          }
+        ],
+        extractedParameters: {
+          title: 'college',
+          status: 'pending',
+          dueDate: "today's date",
+          schedule: 'next week'
+        }
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      expect(normalized.phases[0].fieldParameter?.targetValue).toBe('college');
+      expect(normalized.phases[1].fieldParameter?.targetValue).toBe('pending');
+      expect(normalized.phases[2].fieldParameter?.targetValue).toBe('next week');
+
+      const extracted = normalized.extractedParameters as Record<string, string>;
+      expect(extracted['title']).toBe('college');
+      expect(extracted['status']).toBe('pending');
+      expect(extracted['dueDate']).toBe('2026-09-29');
+      expect(extracted['schedule']).toBe('next week');
+    });
+
+    it('end-to-end decomposeTaskGoal applies temporal grounding when client produces relative date', async () => {
+      const mockClient: LocalLlamaChatClient = {
+        chat: async () => ({
+          success: true,
+          content: JSON.stringify({
+            archetype: 'form_submission',
+            summary: 'Create task college',
+            phases: [
+              {
+                phaseIndex: 0,
+                id: 'phase-0',
+                intent: 'fill_field',
+                description: 'Enter task title',
+                fieldParameter: { fieldName: 'title', targetValue: 'college' },
+                allowedActions: ['type'],
+                expectedOutcome: 'Title entered'
+              },
+              {
+                phaseIndex: 1,
+                id: 'phase-1',
+                intent: 'fill_field',
+                description: 'Enter due date with today\'s date',
+                fieldParameter: { fieldName: 'dueDate', targetValue: "today's date" },
+                allowedActions: ['type'],
+                expectedOutcome: 'Due date entered'
+              }
+            ]
+          })
+        })
+      };
+
+      const result = await decomposeTaskGoal(
+        'Create and add a task with name college, due date with todays date',
+        { client: mockClient, referenceDate: FIXED_REF }
+      );
+
+      expect(result).toBeDefined();
+      expect(result?.phases[0].fieldParameter?.targetValue).toBe('college');
+      expect(result?.phases[1].fieldParameter?.targetValue).toBe('2026-09-29');
+      expect(result?.phases[1].fieldParameter?.rawTargetValue).toBe("today's date");
+    });
+  });
+
+  describe('Select-Option AllowedActions Normalization', () => {
+    const FIXED_REF = '2026-09-29';
+
+    it('normalizes select_option phase with allowedActions=["click"] to include both click and type', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-select-1',
+        archetype: 'form_submission',
+        summary: 'Select priority',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'select_option',
+            description: 'Select priority as high',
+            fieldParameter: { fieldName: 'priority', targetValue: 'high' },
+            allowedActions: ['click']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      const phase = normalized.phases[0];
+      expect(phase.allowedActions).toBeDefined();
+      expect(phase.allowedActions).toContain('click');
+      expect(phase.allowedActions).toContain('type');
+    });
+
+    it('normalizes select_option phase with no allowedActions to include both click and type', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-select-2',
+        archetype: 'form_submission',
+        summary: 'Select status',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'select_option',
+            description: 'Select status as pending',
+            fieldParameter: { fieldName: 'status', targetValue: 'pending' }
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      const phase = normalized.phases[0];
+      expect(phase.allowedActions).toBeDefined();
+      expect(phase.allowedActions).toContain('click');
+      expect(phase.allowedActions).toContain('type');
+    });
+
+    it('preserves existing ["click", "type"] on select_option without duplication', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-select-3',
+        archetype: 'form_submission',
+        summary: 'Select option',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'select_option',
+            description: 'Select category',
+            fieldParameter: { fieldName: 'category', targetValue: 'electronics' },
+            allowedActions: ['click', 'type']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      const phase = normalized.phases[0];
+      expect(phase.allowedActions).toContain('click');
+      expect(phase.allowedActions).toContain('type');
+      expect(phase.allowedActions!.length).toBe(2);
+    });
+
+    it('does NOT modify allowedActions on fill_field phases', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-fill-1',
+        archetype: 'form_submission',
+        summary: 'Fill title',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'fill_field',
+            description: 'Enter title',
+            fieldParameter: { fieldName: 'title', targetValue: 'college' },
+            allowedActions: ['type']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      const phase = normalized.phases[0];
+      expect(phase.allowedActions).toEqual(['type']);
+    });
+
+    it('does NOT modify allowedActions on submit phases', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-submit-1',
+        archetype: 'form_submission',
+        summary: 'Submit form',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'submit',
+            description: 'Submit the form',
+            allowedActions: ['click']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      const phase = normalized.phases[0];
+      expect(phase.allowedActions).toEqual(['click']);
+    });
+
+    it('normalizes select_option when allowedActions is a single string "click"', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-select-str',
+        archetype: 'form_submission',
+        summary: 'Select option',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'select_option',
+            description: 'Select priority',
+            fieldParameter: { fieldName: 'priority', targetValue: 'high' },
+            allowedActions: 'click'
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      const phase = normalized.phases[0];
+      expect(phase.allowedActions).toContain('click');
+      expect(phase.allowedActions).toContain('type');
+    });
+
+    it('normalizes multi-phase plan: only select_option phases get both actions', () => {
+      const rawObj: Record<string, unknown> = {
+        planId: 'plan-multi',
+        archetype: 'form_submission',
+        summary: 'Create task',
+        currentPhaseIndex: 0,
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'fill_field',
+            description: 'Enter title',
+            fieldParameter: { fieldName: 'title', targetValue: 'college' },
+            allowedActions: ['type']
+          },
+          {
+            phaseIndex: 1,
+            phaseId: 'phase-1',
+            intent: 'select_option',
+            description: 'Select status',
+            fieldParameter: { fieldName: 'status', targetValue: 'pending' },
+            allowedActions: ['click']
+          },
+          {
+            phaseIndex: 2,
+            phaseId: 'phase-2',
+            intent: 'select_option',
+            description: 'Select priority',
+            fieldParameter: { fieldName: 'priority', targetValue: 'high' },
+            allowedActions: ['click']
+          },
+          {
+            phaseIndex: 3,
+            phaseId: 'phase-3',
+            intent: 'submit',
+            description: 'Submit',
+            allowedActions: ['click']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'goal', FIXED_REF) as unknown as TaskPlan;
+      // fill_field: unchanged
+      expect(normalized.phases[0].allowedActions).toEqual(['type']);
+      // select_option: both click and type
+      expect(normalized.phases[1].allowedActions).toContain('click');
+      expect(normalized.phases[1].allowedActions).toContain('type');
+      // select_option: both click and type
+      expect(normalized.phases[2].allowedActions).toContain('click');
+      expect(normalized.phases[2].allowedActions).toContain('type');
+      // submit: unchanged
+      expect(normalized.phases[3].allowedActions).toEqual(['click']);
+    });
+
+    it('normalizes search phase allowedActions to ensure type is always available', () => {
+      const rawObj = {
+        planId: 'tp-search-norm',
+        archetype: 'search_and_act',
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'search',
+            description: 'Search query',
+            allowedActions: ['click']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawObj, 'Search for laptops') as unknown as TaskPlan;
+      expect(normalized.phases[0].allowedActions).toContain('type');
+      expect(normalized.phases[0].allowedActions).toContain('click');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Focused Regression Suite: Generic Item Retrieval & Contract Normalization (Tests A–J)
+  // -------------------------------------------------------------------------
+  describe('Focused Regression Suite: Generic Item Retrieval & Contract Normalization (A–J)', () => {
+    // A, B, C
+    it('Regression A/B/C: "Find my latest Amazon transaction." normalizes targetValue, targetHint, and description', () => {
+      const rawPlan = {
+        planId: 'tp-amazon-test',
+        archetype: 'item_retrieval',
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'search',
+            description: 'Search for the latest Amazon transaction.',
+            targetHint: 'Amazon transaction',
+            fieldParameter: { fieldName: 'search', targetValue: 'Amazon transaction' },
+            allowedActions: ['type']
+          },
+          {
+            phaseIndex: 1,
+            phaseId: 'phase-1',
+            intent: 'select_result',
+            description: 'Select the latest Amazon transaction.',
+            targetHint: 'Amazon transaction',
+            allowedActions: ['click']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawPlan, 'Find my latest Amazon transaction.') as unknown as TaskPlan;
+      const searchPhase = normalized.phases[0];
+      // A: search targetValue = "Amazon"
+      expect(searchPhase.fieldParameter?.targetValue).toBe('Amazon');
+      // B: search phase targetHint is normalized to "Amazon"
+      expect(searchPhase.targetHint).toBe('Amazon');
+      // C: search phase description is "Search for Amazon"
+      expect(searchPhase.description).toBe('Search for Amazon');
+      // Phase 1 preserves selection semantics
+      expect(normalized.phases[1].targetHint).toBe('Amazon');
+      expect(normalized.phases[1].intent).toBe('select_result');
+    });
+
+    // D
+    it('Regression D: LLM proposes type "Amazon transaction" while activePhase.targetValue = "Amazon" -> normalized action: type "Amazon"', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-search-input',
+            actionType: 'type',
+            payload: { text: 'Amazon transaction', pressEnter: true }
+          })
+        })
+      };
+
+      const driver = createLocalAgentDriver(mockChatClient);
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-amazon-d',
+          description: 'Find my latest Amazon transaction.',
+          taskPlan: {
+            planId: 'plan-1',
+            archetype: 'search_and_act',
+            summary: 'Find my latest Amazon transaction.',
+            currentPhaseIndex: 0,
+            phases: [
+              {
+                phaseId: 'phase-0',
+                phaseIndex: 0,
+                intent: 'search',
+                description: 'Search for Amazon',
+                targetHint: 'Amazon',
+                fieldParameter: { fieldName: 'search', targetValue: 'Amazon' },
+                allowedActions: ['type']
+              }
+            ]
+          }
+        },
+        context: {
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          availableTargets: [MOCK_TARGET_1],
+          page: {
+            ...MOCK_PAGE_REP,
+            elements: [
+              {
+                id: 'elem-search-input',
+                role: 'textbox',
+                tagName: 'input',
+                placeholder: 'Search transactions…'
+              }
+            ]
+          },
+          stepIndex: 0
+        }
+      });
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status !== 'ACTION') throw new Error('Expected ACTION');
+      expect(result.proposal.payload?.text).toBe('Amazon');
+      expect(result.proposal.payload?.clearFirst).toBe(true);
+      expect(result.proposal.payload?.pressEnter).toBe(true);
+    });
+
+    // E
+    it('Regression E: LLM proposes type "latest Amazon transaction" while activePhase.targetValue = "Amazon" -> normalized action: type "Amazon"', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-search-input',
+            actionType: 'type',
+            payload: { text: 'latest Amazon transaction', clearFirst: true, pressEnter: true }
+          })
+        })
+      };
+
+      const driver = createLocalAgentDriver(mockChatClient);
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-amazon-e',
+          description: 'Find my latest Amazon transaction.',
+          taskPlan: {
+            planId: 'plan-1',
+            archetype: 'search_and_act',
+            summary: 'Find my latest Amazon transaction.',
+            currentPhaseIndex: 0,
+            phases: [
+              {
+                phaseId: 'phase-0',
+                phaseIndex: 0,
+                intent: 'search',
+                description: 'Search for Amazon',
+                targetHint: 'Amazon',
+                fieldParameter: { fieldName: 'search', targetValue: 'Amazon' },
+                allowedActions: ['type']
+              }
+            ]
+          }
+        },
+        context: {
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          availableTargets: [MOCK_TARGET_1],
+          page: {
+            ...MOCK_PAGE_REP,
+            elements: [
+              {
+                id: 'elem-search-input',
+                role: 'textbox',
+                tagName: 'input',
+                placeholder: 'Search transactions…'
+              }
+            ]
+          },
+          stepIndex: 0
+        }
+      });
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status !== 'ACTION') throw new Error('Expected ACTION');
+      expect(result.proposal.payload?.text).toBe('Amazon');
+    });
+
+    // F
+    it('Regression F: Generic Swiggy case: "Find my latest Swiggy transaction." -> "Swiggy"', () => {
+      const rawPlan = {
+        planId: 'tp-swiggy-test',
+        archetype: 'item_retrieval',
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'search',
+            description: 'Search for the latest Swiggy transaction.',
+            targetHint: 'Swiggy transaction',
+            allowedActions: ['type']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawPlan, 'Find my latest Swiggy transaction.') as unknown as TaskPlan;
+      expect(normalized.phases[0].fieldParameter?.targetValue).toBe('Swiggy');
+      expect(normalized.phases[0].targetHint).toBe('Swiggy');
+      expect(normalized.phases[0].description).toBe('Search for Swiggy');
+    });
+
+    // G
+    it('Regression G: Generic Netflix case: "Find the latest Netflix payment." -> "Netflix"', () => {
+      const rawPlan = {
+        planId: 'tp-netflix-test',
+        archetype: 'item_retrieval',
+        phases: [
+          {
+            phaseIndex: 0,
+            phaseId: 'phase-0',
+            intent: 'search',
+            description: 'Search for the latest Netflix payment.',
+            targetHint: 'Netflix payment',
+            allowedActions: ['type']
+          }
+        ]
+      };
+
+      const normalized = normalizeDecomposedTaskPlan(rawPlan, 'Find the latest Netflix payment.') as unknown as TaskPlan;
+      expect(normalized.phases[0].fieldParameter?.targetValue).toBe('Netflix');
+      expect(normalized.phases[0].targetHint).toBe('Netflix');
+      expect(normalized.phases[0].description).toBe('Search for Netflix');
+    });
+
+    // H
+    it('Regression H: A normal free-form type action without structured targetValue remains unchanged', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'ACTION',
+            targetElementId: 'elem-search-input',
+            actionType: 'type',
+            payload: { text: 'custom arbitrary user query', clearFirst: true }
+          })
+        })
+      };
+
+      const driver = createLocalAgentDriver(mockChatClient);
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-freeform',
+          description: 'Type custom query',
+          taskPlan: {
+            planId: 'plan-freeform',
+            archetype: 'search_and_act',
+            summary: 'Type custom query',
+            currentPhaseIndex: 0,
+            phases: [
+              {
+                phaseId: 'phase-0',
+                phaseIndex: 0,
+                intent: 'search',
+                description: 'Search query',
+                // No fieldParameter.targetValue defined
+                allowedActions: ['type']
+              }
+            ]
+          }
+        },
+        context: {
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          availableTargets: [MOCK_TARGET_1],
+          page: {
+            ...MOCK_PAGE_REP,
+            elements: [
+              {
+                id: 'elem-search-input',
+                role: 'textbox',
+                tagName: 'input'
+              }
+            ]
+          },
+          stepIndex: 0
+        }
+      });
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+      if (result.status !== 'ACTION') throw new Error('Expected ACTION');
+      expect(result.proposal.payload?.text).toBe('custom arbitrary user query');
+    });
+
+    // I & J
+    it('Regression I/J: select_result with zero matching results cannot declare goal completion, returns NO_MATCHING_RESULTS instead of UNSUPPORTED_GOAL', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            type: 'COMPLETED',
+            rationale: 'No transactions found, marking completed'
+          })
+        })
+      };
+
+      const driver = createLocalAgentDriver(mockChatClient);
+      const input = createMockPlannerInput({
+        goal: {
+          id: 'goal-select-empty',
+          description: 'Find my latest Amazon transaction.',
+          taskPlan: {
+            planId: 'plan-select',
+            archetype: 'search_and_act',
+            summary: 'Find my latest Amazon transaction.',
+            currentPhaseIndex: 1,
+            phases: [
+              {
+                phaseId: 'phase-0',
+                phaseIndex: 0,
+                intent: 'search',
+                description: 'Search for Amazon',
+                allowedActions: ['type']
+              },
+              {
+                phaseId: 'phase-1',
+                phaseIndex: 1,
+                intent: 'select_result',
+                description: 'Select the latest transaction',
+                targetHint: 'Amazon',
+                allowedActions: ['click']
+              }
+            ]
+          }
+        },
+        context: {
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          availableTargets: [],
+          page: {
+            ...MOCK_PAGE_REP,
+            elements: []
+          },
+          stepIndex: 1,
+          completion: { satisfied: false }
+        },
+        history: [
+          {
+            stepIndex: 0,
+            phaseIndex: 0,
+            action: {
+              id: 'a0',
+              type: 'type',
+              target: MOCK_TARGET_1,
+              payload: { text: 'Amazon', pressEnter: true },
+              timestamp: Date.now()
+            },
+            perceivedOutcome: 'success'
+          }
+        ]
+      });
+
+      // LocalAgentDriver returns NO_MATCHING_RESULTS
+      const driverResult = await driver.proposeStep(input);
+      expect(driverResult.status).toBe('FAILED');
+      if (driverResult.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(driverResult.reason).toBe('NO_MATCHING_RESULTS');
+      expect(driverResult.reason).not.toBe('UNSUPPORTED_GOAL');
+
+      // Phase 3A planNextStep maps to descriptive message
+      const plannerResult = await planNextStep(input, driver);
+      expect(plannerResult.status).toBe('FAILED');
+      if (plannerResult.status !== 'FAILED') throw new Error('Expected FAILED');
+      expect(plannerResult.reason).toBe('NO_MATCHING_RESULTS');
+      expect(plannerResult.message).toContain('No matching transaction results are available for the current selection phase');
+    });
+  });
+
+  describe('Stage 3 — Safe Diagnostic Logging (No Raw Model Completion Logging)', () => {
+    it('never logs raw model completions containing synthetic PII to the console', async () => {
+      const sensitiveEmail = 'secret.victim@example.com';
+      const sensitivePhone = '+91 99887 76655';
+      const rawModelCompletion = JSON.stringify({
+        type: 'ACTION',
+        targetElementId: 'elem-submit-btn',
+        actionType: 'click',
+        rationale: `Contacting user at ${sensitiveEmail} and mobile ${sensitivePhone} to approve transaction`
+      });
+
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: rawModelCompletion
+        })
+      };
+
+      const consoleLogSpy = vi.spyOn(console, 'log');
+      const consoleWarnSpy = vi.spyOn(console, 'warn');
+      const consoleErrorSpy = vi.spyOn(console, 'error');
+
+      try {
+        const driver = createLocalAgentDriver(mockChatClient);
+        const input = createMockPlannerInput();
+        const result = await driver.proposeStep(input);
+
+        expect(result.status).toBe('ACTION');
+
+        // Collect all logged console messages
+        const allLoggedMessages: string[] = [
+          ...consoleLogSpy.mock.calls.map((call) => call.map(String).join(' ')),
+          ...consoleWarnSpy.mock.calls.map((call) => call.map(String).join(' ')),
+          ...consoleErrorSpy.mock.calls.map((call) => call.map(String).join(' '))
+        ];
+
+        // 1. Verify raw completion is NEVER logged
+        for (const msg of allLoggedMessages) {
+          expect(msg).not.toContain(rawModelCompletion);
+          expect(msg).not.toContain(sensitiveEmail);
+          expect(msg).not.toContain(sensitivePhone);
+          expect(msg).not.toContain('raw model response =');
+        }
+
+        // 2. Verify safe diagnostic metadata IS logged
+        const diagnosticLog = allLoggedMessages.find((msg) =>
+          msg.includes('[NexVision LocalAgent]') && msg.includes('inference response received')
+        );
+        expect(diagnosticLog).toBeDefined();
+        expect(diagnosticLog).toContain(`length=${rawModelCompletion.length}`);
+        expect(diagnosticLog).toContain('parseStatus=ACTION');
+        expect(diagnosticLog).toContain('action=click');
+        expect(diagnosticLog).toContain('targetId=elem-submit-btn');
+      } finally {
+        consoleLogSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+        consoleErrorSpy.mockRestore();
+      }
+    });
+
+    it('safely logs inference failure without leaking prompts or sensitive parameters', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: false,
+          error: {
+            code: 'SERVER_ERROR',
+            message: 'Inference timeout after 30s'
+          }
+        })
+      };
+
+      const consoleLogSpy = vi.spyOn(console, 'log');
+      try {
+        const driver = createLocalAgentDriver(mockChatClient);
+        const input = createMockPlannerInput();
+        const result = await driver.proposeStep(input);
+
+        expect(result.status).toBe('FAILED');
+
+        const allLogs = consoleLogSpy.mock.calls.map((call) => call.map(String).join(' '));
+        const failLog = allLogs.find((msg) => msg.includes('inference failed'));
+        expect(failLog).toBeDefined();
+        expect(failLog).toContain('Inference timeout after 30s');
+        expect(failLog).not.toContain('raw model response');
+      } finally {
+        consoleLogSpy.mockRestore();
+      }
+    });
+
+    it('24. strictly excludes customer names and masked cards from the final serialized model request', async () => {
+      let capturedUserPrompt = '';
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockImplementation(async (request) => {
+          capturedUserPrompt = request.userPrompt;
+          return {
+            success: true,
+            content: JSON.stringify({
+              type: 'ACTION',
+              targetElementId: 'elem-card-4821',
+              actionType: 'click',
+              rationale: 'Select payment card'
+            })
+          };
+        })
+      };
+
+      const rawCardTarget: ActionTarget = {
+        elementId: 'elem-card-4821',
+        point: { x: 200, y: 100 },
+        viewportBounds: { x: 100, y: 80, width: 200, height: 40 },
+        confidence: 0.95,
+        observationId: 'obs-card',
+        role: 'button'
+      };
+
+      const rawPage: PageRepresentation = {
+        schemaVersion: '1.0',
+        metadata: {
+          title: 'NexBank - Welcome, Arjun Reddy',
+          url: 'https://nexbank.internal/dashboard?account=XXXX%20XXXX%204821'
+        },
+        viewport: { width: 1280, height: 800 },
+        elements: [
+          {
+            id: 'elem-welcome-btn',
+            role: 'button',
+            accessibleName: 'Welcome, Arjun Reddy',
+            visibleText: 'Welcome, Arjun Reddy',
+            interactive: true,
+            bounds: { x: 50, y: 10, width: 200, height: 40 }
+          },
+          {
+            id: 'elem-card-4821',
+            role: 'button',
+            accessibleName: 'Debit Card XXXX XXXX 4821',
+            visibleText: 'Pay with card •••• 4821',
+            interactive: true,
+            bounds: { x: 100, y: 80, width: 200, height: 40 }
+          }
+        ]
+      };
+
+      const driver = createLocalAgentDriver(mockChatClient);
+      const input = createMockPlannerInput({
+        context: {
+          page: rawPage,
+          availableTargets: [rawCardTarget],
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          stepIndex: 1,
+          completion: { satisfied: false }
+        }
+      });
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+
+      // Inspect full serialized model request string sent to llama-server
+      const fullSerializedRequest = capturedUserPrompt;
+
+      // Verify ZERO residual PII reaches the model request
+      expect(fullSerializedRequest).not.toContain('Arjun Reddy');
+      expect(fullSerializedRequest).not.toContain('XXXX XXXX 4821');
+      expect(fullSerializedRequest).not.toContain('•••• 4821');
+
+      // Verify proper sanitized tokens are present in candidate targets and prompt text
+      expect(fullSerializedRequest).toContain('[REDACTED_NAME]');
+      expect(fullSerializedRequest).toContain('[CARD_ENDING_4821]');
+
+      // Verify action was grounded on the sanitized element
+      if (result.status === 'ACTION') {
+        expect(result.proposal.targetElementId).toBe('elem-card-4821');
+        expect(result.proposal.actionType).toBe('click');
+      }
+    });
+  });
+
+  describe('Phase 2.8 — Standalone Customer-Name & Financial Identifier Remediation', () => {
+    it('redacts standalone person names in candidate targets, button text, and accessible names', async () => {
+      let capturedUserPrompt = '';
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: async (req) => {
+          capturedUserPrompt = req.userPrompt;
+          return {
+            success: true,
+            content: JSON.stringify({
+              type: 'ACTION',
+              targetElementId: 'elem-switcher',
+              actionType: 'click',
+              rationale: 'Switch account profile'
+            })
+          };
+        }
+      };
+
+      const rawPage: PageRepresentation = {
+        schemaVersion: '1.0',
+        metadata: {
+          title: 'Account Management',
+          url: 'https://example.com/switch-profile'
+        },
+        viewport: { width: 1280, height: 800 },
+        elements: [
+          {
+            id: 'elem-switcher',
+            role: 'button',
+            accessibleName: 'Arjun Reddy',
+            visibleText: 'Arjun Reddy',
+            interactive: true,
+            bounds: { x: 50, y: 10, width: 120, height: 40 }
+          },
+          {
+            id: 'elem-aria-name',
+            role: 'button',
+            accessibleName: 'Priya Sharma',
+            visibleText: 'Switch User',
+            attributes: { 'aria-label': 'Priya Sharma' },
+            interactive: true,
+            bounds: { x: 50, y: 60, width: 120, height: 40 }
+          },
+          {
+            id: 'elem-submit',
+            role: 'button',
+            accessibleName: 'Submit Order',
+            visibleText: 'Submit Order',
+            interactive: true,
+            bounds: { x: 50, y: 110, width: 120, height: 40 }
+          },
+          {
+            id: 'elem-amazon',
+            role: 'button',
+            accessibleName: 'Amazon Pay',
+            visibleText: 'Amazon Pay',
+            interactive: true,
+            bounds: { x: 50, y: 160, width: 120, height: 40 }
+          },
+          {
+            id: 'elem-swiggy',
+            role: 'button',
+            accessibleName: 'Swiggy Delivery',
+            visibleText: 'Swiggy Delivery',
+            interactive: true,
+            bounds: { x: 50, y: 210, width: 120, height: 40 }
+          },
+          {
+            id: 'elem-netflix',
+            role: 'button',
+            accessibleName: 'Netflix Subscription',
+            visibleText: 'Netflix Subscription',
+            interactive: true,
+            bounds: { x: 50, y: 260, width: 120, height: 40 }
+          },
+          {
+            id: 'elem-continue',
+            role: 'button',
+            accessibleName: 'Continue',
+            visibleText: 'Continue',
+            interactive: true,
+            bounds: { x: 50, y: 310, width: 120, height: 40 }
+          }
+        ]
+      };
+
+      const driver = createLocalAgentDriver(mockChatClient);
+      const input = createMockPlannerInput({
+        context: {
+          page: rawPage,
+          availableTargets: [
+            { elementId: 'elem-switcher', point: { x: 110, y: 30 }, viewportBounds: { x: 50, y: 10, width: 120, height: 40 }, confidence: 1, observationId: 'obs-1', role: 'button' },
+            { elementId: 'elem-aria-name', point: { x: 110, y: 80 }, viewportBounds: { x: 50, y: 60, width: 120, height: 40 }, confidence: 1, observationId: 'obs-2', role: 'button' },
+            { elementId: 'elem-submit', point: { x: 110, y: 130 }, viewportBounds: { x: 50, y: 110, width: 120, height: 40 }, confidence: 1, observationId: 'obs-3', role: 'button' },
+            { elementId: 'elem-amazon', point: { x: 110, y: 180 }, viewportBounds: { x: 50, y: 160, width: 120, height: 40 }, confidence: 1, observationId: 'obs-4', role: 'button' },
+            { elementId: 'elem-swiggy', point: { x: 110, y: 230 }, viewportBounds: { x: 50, y: 210, width: 120, height: 40 }, confidence: 1, observationId: 'obs-5', role: 'button' },
+            { elementId: 'elem-netflix', point: { x: 110, y: 280 }, viewportBounds: { x: 50, y: 260, width: 120, height: 40 }, confidence: 1, observationId: 'obs-6', role: 'button' },
+            { elementId: 'elem-continue', point: { x: 110, y: 330 }, viewportBounds: { x: 50, y: 310, width: 120, height: 40 }, confidence: 1, observationId: 'obs-7', role: 'button' }
+          ],
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          stepIndex: 1,
+          completion: { satisfied: false }
+        }
+      });
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+
+      // Assert serialized model prompt:
+      expect(capturedUserPrompt).not.toContain('Arjun Reddy');
+      expect(capturedUserPrompt).not.toContain('Priya Sharma');
+
+      // Assert non-sensitive buttons & merchants are strictly preserved:
+      expect(capturedUserPrompt).toContain('Submit Order');
+      expect(capturedUserPrompt).toContain('Amazon Pay');
+      expect(capturedUserPrompt).toContain('Swiggy Delivery');
+      expect(capturedUserPrompt).toContain('Netflix Subscription');
+      expect(capturedUserPrompt).toContain('Continue');
+
+      // Assert candidate target serialization contains [REDACTED_NAME]
+      const payload = JSON.parse(capturedUserPrompt);
+      const switcherTarget = payload.availableTargets.find((t: any) => t.elementId === 'elem-switcher');
+      expect(switcherTarget).toBeDefined();
+      expect(switcherTarget.accessibleName).toBe('[REDACTED_NAME]');
+      expect(switcherTarget.visibleText).toBe('[REDACTED_NAME]');
+
+      const ariaTarget = payload.availableTargets.find((t: any) => t.elementId === 'elem-aria-name');
+      expect(ariaTarget).toBeDefined();
+      expect(ariaTarget.attributes?.['aria-label']).toBe('[REDACTED_NAME]');
+    });
+
+    it('enforces financial identifier disclosure policy across masked and fully masked formats', async () => {
+      let capturedUserPrompt = '';
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: async (req) => {
+          capturedUserPrompt = req.userPrompt;
+          return {
+            success: true,
+            content: JSON.stringify({
+              type: 'ACTION',
+              targetElementId: 'card-partial-1',
+              actionType: 'click',
+              rationale: 'Select card ending in 4821'
+            })
+          };
+        }
+      };
+
+      const rawPage: PageRepresentation = {
+        schemaVersion: '1.0',
+        metadata: { title: 'Cards', url: 'https://example.com/cards' },
+        viewport: { width: 1280, height: 800 },
+        elements: [
+          {
+            id: 'card-partial-1',
+            role: 'button',
+            accessibleName: 'Card XXXX XXXX 4821',
+            visibleText: 'Card XXXX XXXX 4821',
+            interactive: true,
+            bounds: { x: 10, y: 10, width: 200, height: 40 }
+          },
+          {
+            id: 'card-partial-2',
+            role: 'button',
+            accessibleName: 'Card **** 1092',
+            visibleText: 'Card **** 1092',
+            interactive: true,
+            bounds: { x: 10, y: 60, width: 200, height: 40 }
+          },
+          {
+            id: 'card-partial-3',
+            role: 'button',
+            accessibleName: 'Card •••• 9934',
+            visibleText: 'Card •••• 9934',
+            interactive: true,
+            bounds: { x: 10, y: 110, width: 200, height: 40 }
+          },
+          {
+            id: 'card-fully-masked-1',
+            role: 'button',
+            accessibleName: 'Card XXXX XXXX XXXX XXXX',
+            visibleText: 'Card XXXX XXXX XXXX XXXX',
+            interactive: true,
+            bounds: { x: 10, y: 160, width: 200, height: 40 }
+          },
+          {
+            id: 'card-fully-masked-2',
+            role: 'button',
+            accessibleName: 'Card ••••••••••••••••',
+            visibleText: 'Card ••••••••••••••••',
+            interactive: true,
+            bounds: { x: 10, y: 210, width: 200, height: 40 }
+          }
+        ]
+      };
+
+      const driver = createLocalAgentDriver(mockChatClient);
+      const input = createMockPlannerInput({
+        context: {
+          page: rawPage,
+          availableTargets: rawPage.elements.map(e => ({
+            elementId: e.id,
+            point: { x: e.bounds!.x + e.bounds!.width / 2, y: e.bounds!.y + e.bounds!.height / 2 },
+            viewportBounds: e.bounds!,
+            confidence: 1,
+            observationId: `obs-${e.id}`,
+            role: 'button'
+          })),
+          capturedAt: FIXED_TIME - 500,
+          currentTime: FIXED_TIME,
+          stepIndex: 1,
+          completion: { satisfied: false }
+        }
+      });
+
+      const result = await driver.proposeStep(input);
+      expect(result.status).toBe('ACTION');
+
+      // Verify original masked sequences NEVER reach model-facing fields
+      expect(capturedUserPrompt).not.toContain('XXXX XXXX 4821');
+      expect(capturedUserPrompt).not.toContain('**** 1092');
+      expect(capturedUserPrompt).not.toContain('•••• 9934');
+      expect(capturedUserPrompt).not.toContain('XXXX XXXX XXXX XXXX');
+      expect(capturedUserPrompt).not.toContain('••••••••••••••••');
+
+      // Verify documented suffix exception for grounding disambiguation
+      expect(capturedUserPrompt).toContain('[CARD_ENDING_4821]');
+      expect(capturedUserPrompt).toContain('[CARD_ENDING_1092]');
+      expect(capturedUserPrompt).toContain('[CARD_ENDING_9934]');
+
+      // Verify fully masked cards are redacted to [REDACTED_CARD] with zero digits disclosed
+      expect(capturedUserPrompt).toContain('[REDACTED_CARD]');
+
+      // Verify grounding succeeds on the target opaque ID
+      if (result.status === 'ACTION') {
+        expect(result.proposal.targetElementId).toBe('card-partial-1');
+      }
+    });
+  });
+
+  describe('Task Decomposition and Robust JSON Parsing', () => {
+    it('successfully parses valid JSON candidates', () => {
+      const valid = '{"planVersion": "1.0", "phases": []}';
+      expect(tryParseJsonCandidate(valid)).toEqual({ planVersion: '1.0', phases: [] });
+    });
+
+    it('repairs pipe-separated array syntax produced by local models', () => {
+      const malformedPipe = '{\n  "name": "search",\n  "allowedActions": ["click"|"type"|"focus"],\n  "successCriteria": "done"\n}';
+      const parsed = tryParseJsonCandidate(malformedPipe) as { allowedActions: string[] } | null;
+      expect(parsed).not.toBeNull();
+      expect(parsed?.allowedActions).toEqual(['click', 'type', 'focus']);
+    });
+
+    it('repairs trailing commas and smart quotes in JSON candidates', () => {
+      const malformed = '{\n  “targetField”: “search_input”,\n  “allowedActions”: [“click”, “type”,],\n}';
+      const parsed = tryParseJsonCandidate(malformed) as { targetField: string; allowedActions: string[] } | null;
+      expect(parsed).not.toBeNull();
+      expect(parsed?.targetField).toBe('search_input');
+      expect(parsed?.allowedActions).toEqual(['click', 'type']);
+    });
+
+    it('returns null on unrecoverable malformed JSON', () => {
+      expect(tryParseJsonCandidate('{ not valid json at all :::')).toBeNull();
+    });
+
+    it('decomposeTaskGoal parses pipe-syntax model responses successfully', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: JSON.stringify({
+            planId: 'plan-test-pipe',
+            archetype: 'search_and_act',
+            userGoal: 'Find my Amazon transaction for ₹4,299.',
+            summary: 'Search for Amazon and view transaction',
+            phases: [
+              {
+                phaseId: 'phase-0',
+                phaseIndex: 0,
+                intent: 'search',
+                description: 'Search for Amazon',
+                targetHint: 'Amazon',
+                fieldParameter: {
+                  fieldName: 'search',
+                  targetValue: 'Amazon'
+                },
+                allowedActions: ['type'],
+                expectedOutcome: 'Search results displayed'
+              }
+            ]
+          }).replace('"allowedActions": ["type"]', '"allowedActions": ["click"|"type"]')
+        })
+      };
+
+      const plan = await decomposeTaskGoal('Find my Amazon transaction for ₹4,299.', { client: mockChatClient });
+      expect(plan).toBeDefined();
+      expect(plan?.phases.length).toBeGreaterThan(0);
+      expect(plan?.phases[0].intent).toBe('search');
+    });
+
+    it('decomposeTaskGoal falls back to deterministic item retrieval plan when model generates invalid output', async () => {
+      const mockChatClient: LocalLlamaChatClient = {
+        chat: vi.fn().mockResolvedValue({
+          success: true,
+          content: 'I cannot provide a plan. Here is non-json text: <xml>invalid</xml>'
+        })
+      };
+
+      const plan = await decomposeTaskGoal('Find my Amazon transaction for ₹4,299.', { client: mockChatClient });
+      expect(plan).toBeDefined();
+      expect(plan?.archetype).toBe('search_and_act');
+      expect(plan?.phases.length).toBe(2);
+      expect(plan?.phases[0].intent).toBe('search');
+      expect(plan?.phases[1].intent).toBe('select_result');
+    });
   });
 });
 

@@ -15,7 +15,11 @@ import {
   detectPrivacyFindings,
   GLOBAL_CARD_CANDIDATE_PATTERN,
   GLOBAL_EMAIL_PATTERN,
-  getValidPhoneMatches
+  getValidPhoneMatches,
+  MASKED_FINANCIAL_PATTERN,
+  FULLY_MASKED_FINANCIAL_PATTERN,
+  NAME_CONTEXT_PATTERN,
+  isLikelyPersonName
 } from './detector.js';
 import { isValidLuhn } from './luhn.js';
 import {
@@ -70,13 +74,69 @@ export function redactText(text: string | undefined): string | undefined {
     }
   }
 
-  // 3. Redact phone numbers (validated complete candidates)
+  // 3. Redact masked payment cards / financial identifiers (e.g. XXXX XXXX 4821, •••• 4821, **** 4821)
+  result = result.replace(MASKED_FINANCIAL_PATTERN, (_match, suffix) => {
+    return `[CARD_ENDING_${suffix}]`;
+  });
+  result = result.replace(FULLY_MASKED_FINANCIAL_PATTERN, REDACTION_TOKENS.CARD);
+
+  // 4. Redact phone numbers (validated complete candidates)
   const phoneMatches = getValidPhoneMatches(result);
   for (const candidate of phoneMatches) {
     result = result.split(candidate).join(REDACTION_TOKENS.PHONE);
   }
 
+  // 5. Redact person names preceded by explicit contextual prefixes
+  result = result.replace(NAME_CONTEXT_PATTERN, (_match, prefix) => {
+    return `${prefix}${REDACTION_TOKENS.NAME}`;
+  });
+
+  // 6. Redact standalone person names (e.g. "Arjun Reddy", "Priya Sharma", "Rohan Verma")
+  result = redactStandalonePersonNames(result) ?? result;
+
   return result;
+}
+
+/**
+ * Redacts standalone customer/person names within text strings while preserving
+ * common interface labels, action verbs, and brand names.
+ */
+export function redactStandalonePersonNames(text: string | undefined): string | undefined {
+  if (text === undefined || text === null || text === '') {
+    return text;
+  }
+
+  // Exact standalone name match
+  if (isLikelyPersonName(text)) {
+    return REDACTION_TOKENS.NAME;
+  }
+
+  // Scan capitalized word clusters (e.g. "Sanitized AI Input Arjun Reddy")
+  return text.replace(/\b([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})+)\b/g, (cluster) => {
+    if (isLikelyPersonName(cluster)) {
+      return REDACTION_TOKENS.NAME;
+    }
+    const words = cluster.split(/\s+/);
+    let modified = cluster;
+
+    // Check 3-word windows
+    for (let i = 0; i <= words.length - 3; i++) {
+      const window3 = words.slice(i, i + 3).join(' ');
+      if (isLikelyPersonName(window3)) {
+        modified = modified.replace(window3, REDACTION_TOKENS.NAME);
+      }
+    }
+
+    // Check 2-word windows
+    for (let i = 0; i <= words.length - 2; i++) {
+      const window2 = words.slice(i, i + 2).join(' ');
+      if (isLikelyPersonName(window2)) {
+        modified = modified.replace(window2, REDACTION_TOKENS.NAME);
+      }
+    }
+
+    return modified;
+  });
 }
 
 
@@ -123,17 +183,55 @@ function sanitizeMetadata(metadata: PageMetadata | undefined): PageMetadata {
   };
 }
 
+function isCustomerNameAttribute(attr?: string): boolean {
+  if (!attr) return false;
+  const lower = attr.toLowerCase();
+  return (
+    lower === 'name' ||
+    lower.includes('fullname') ||
+    lower.includes('full_name') ||
+    lower.includes('customername') ||
+    lower.includes('customer_name') ||
+    lower.includes('cardholder')
+  );
+}
+
 /**
  * Sanitizes a single PageElement while preserving 100% of structural layout,
  * IDs, roles, bounding box, state, and relationship hierarchy.
  */
 function sanitizeElement(element: PageElement): PageElement {
-  // Deep copy attributes
+  // Password element determination
+  const isPassword =
+    element.inputType === 'password'
+    || element.attributes?.autocomplete?.toLowerCase().includes('password');
+
+  const isSemanticNameField = Boolean(
+    element.attributes?.autocomplete?.toLowerCase().split(/\s+/).some(t => t === 'name' || t === 'given-name' || t === 'family-name') ||
+    isCustomerNameAttribute(element.attributes?.name) ||
+    isCustomerNameAttribute(element.id)
+  );
+
+  const SENSITIVE_TEXT_ATTRIBUTES = new Set([
+    'aria-label',
+    'title',
+    'placeholder',
+    'alt',
+    'aria-description'
+  ]);
+
+  // Deep copy and sanitize attributes
   const attributes: Record<string, string> = {};
   if (element.attributes) {
     for (const [key, value] of Object.entries(element.attributes)) {
       const lowerKey = key.toLowerCase();
-      if (lowerKey === 'aria-label' || lowerKey === 'title') {
+      if (lowerKey === 'placeholder' && isPassword) {
+        attributes[key] = REDACTION_TOKENS.PASSWORD;
+      } else if (lowerKey === 'placeholder' && isSemanticNameField) {
+        attributes[key] = REDACTION_TOKENS.NAME;
+      } else if (lowerKey === 'value' && isSemanticNameField) {
+        attributes[key] = REDACTION_TOKENS.NAME;
+      } else if (SENSITIVE_TEXT_ATTRIBUTES.has(lowerKey)) {
         attributes[key] = redactText(value) || '';
       } else {
         attributes[key] = value;
@@ -141,14 +239,11 @@ function sanitizeElement(element: PageElement): PageElement {
     }
   }
 
-  // Password element placeholder handling
-  const isPassword =
-    element.inputType === 'password'
-    || element.attributes?.autocomplete?.toLowerCase().includes('password');
-
   let placeholder = element.placeholder;
   if (isPassword && placeholder) {
     placeholder = REDACTION_TOKENS.PASSWORD;
+  } else if (isSemanticNameField && placeholder) {
+    placeholder = REDACTION_TOKENS.NAME;
   } else {
     placeholder = redactText(placeholder);
   }
@@ -163,12 +258,20 @@ function sanitizeElement(element: PageElement): PageElement {
   const childIds = element.childIds ? [...element.childIds] : undefined;
   const labelIds = element.labelIds ? [...element.labelIds] : undefined;
 
+  const visibleText = isSemanticNameField && element.visibleText
+    ? (redactText(element.visibleText) === element.visibleText ? REDACTION_TOKENS.NAME : redactText(element.visibleText))
+    : redactText(element.visibleText);
+
+  const accessibleName = isSemanticNameField && element.accessibleName
+    ? (redactText(element.accessibleName) === element.accessibleName ? REDACTION_TOKENS.NAME : redactText(element.accessibleName))
+    : redactText(element.accessibleName);
+
   return {
     id: element.id,
     tagName: element.tagName,
     role: element.role,
-    visibleText: redactText(element.visibleText),
-    accessibleName: redactText(element.accessibleName),
+    visibleText,
+    accessibleName,
     placeholder,
     inputType: element.inputType,
     bounds,
@@ -238,7 +341,7 @@ export function sanitizePageRepresentation(
 
   // 3. Sanitize elements and metadata into a deep-cloned representation
   const sanitizedElements = Array.isArray(pageRepresentation.elements)
-    ? pageRepresentation.elements.map(sanitizeElement)
+    ? pageRepresentation.elements.map(el => sanitizeElement(el))
     : [];
 
   const sanitizedMetadata = sanitizeMetadata(pageRepresentation.metadata);

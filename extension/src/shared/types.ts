@@ -198,10 +198,39 @@ export const MessageType = {
   AGENT_COMPLETED_EVENT: 'agent-completed-event',
   AGENT_FAILED_EVENT: 'agent-failed-event',
   GET_AGENT_STATUS_REQUEST: 'get-agent-status-request',
-  GET_AGENT_STATUS_RESPONSE: 'get-agent-status-response'
+  GET_AGENT_STATUS_RESPONSE: 'get-agent-status-response',
+  CHAT_REQUEST: 'chat-request',
+  CHAT_RESPONSE: 'chat-response',
+  CHECK_HEALTH_REQUEST: 'check-health-request',
+  CHECK_HEALTH_RESPONSE: 'check-health-response'
 } as const;
 
 export type MessageType = typeof MessageType[keyof typeof MessageType];
+
+/** Request payload for general AI chat with local LLM. */
+export interface ChatRequest {
+  readonly message: string;
+  readonly history?: readonly { readonly role: 'user' | 'assistant'; readonly content: string }[];
+  readonly tabId?: number;
+  readonly windowId?: number;
+}
+
+/** Response payload for AI chat. */
+export interface ChatResponseData {
+  readonly reply: string;
+  readonly model?: string;
+  readonly pageTitle?: string;
+  readonly pageUrl?: string;
+}
+
+/** Response payload for health check of local inference server. */
+export interface CheckHealthResponseData {
+  readonly online: boolean;
+  readonly model?: string;
+  readonly status?: string;
+  readonly host?: string;
+  readonly port?: number;
+}
 
 /**
  * Payload for UNIFIED_PERCEPTION_REQUEST.
@@ -225,6 +254,8 @@ export interface StartAgentRequest {
   readonly tabId?: number;
   /** Optional target window ID for screenshot capture. */
   readonly windowId?: number;
+  /** Optional caller-assigned run ID to ensure immediate client-server event synchronization. */
+  readonly runId?: string;
 }
 
 /** Acknowledgment payload returned immediately when starting an agent run. */
@@ -391,6 +422,8 @@ export interface ExecutionSuccessResult {
   readonly elementId: string;
   readonly actionId: string;
   readonly timestamp: number;
+  /** Optional privacy-safe indicator that live DOM accepted the intended action value */
+  readonly valueMatch?: boolean;
 }
 
 /**

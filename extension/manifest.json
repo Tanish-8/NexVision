@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "SIH26171 On-device Perception",
+  "name": "NexVision AI",
   "version": "0.1.0",
-  "description": "Privacy-first browser agent — M0 foundation.",
+  "description": "Privacy-first on-device AI browser assistant.",
   "permissions": ["activeTab", "scripting"],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -18,10 +18,17 @@
   ],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "SIH26171 Perception Agent"
+    "default_title": "NexVision AI",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "icons": {
     "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   }

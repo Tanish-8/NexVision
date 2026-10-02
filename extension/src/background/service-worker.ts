@@ -20,7 +20,10 @@ import type {
   AgentProgressEvent,
   AgentCompletedEvent,
   AgentFailedEvent,
-  GetAgentStatusResponseData
+  GetAgentStatusResponseData,
+  ChatRequest,
+  ChatResponseData,
+  CheckHealthResponseData
 } from '../shared/types.js';
 import { captureVisibleTab } from './screenshot.js';
 import { perceivePage } from './orchestrator.js';
@@ -35,6 +38,16 @@ import { createLlamaVisionAdapter } from './llamaVisionAdapter.js';
 import { runDemoAgentWithProvider } from './demoRunner.js';
 import type { DemoRunResult, DemoStep } from './demoRunner.js';
 import { executeAction } from './executor.js';
+import { DefaultLocalLlamaChatClient } from './localAgent.js';
+import { sanitizePageRepresentation } from '../privacy/sanitizer.js';
+import {
+  isRestrictedUrl,
+  buildRestrictedPageContext,
+  buildUnavailablePageContext,
+  buildPageChatContext,
+  buildChatUserPrompt,
+  CHAT_SYSTEM_PROMPT
+} from './chatContext.js';
 
 
 export const router = new MessageRouter();
@@ -426,7 +439,9 @@ router.register<StartAgentRequest>(MessageType.START_AGENT_REQUEST, async (
       return { success: false, error: 'No active tab found for demo agent' };
     }
 
-    const runId = `agent-run-${Date.now()}`;
+    const runId = (payload?.runId && typeof payload.runId === 'string' && payload.runId.trim())
+      ? payload.runId.trim()
+      : `agent-run-${Date.now()}`;
     const startedAt = Date.now();
     const goalDescription = (payload?.goalDescription ?? '').trim() ||
       'Search for laptops under ₹50,000';
@@ -570,6 +585,168 @@ router.register<RunAgentStepRequest>(MessageType.RUN_AGENT_STEP_REQUEST, async (
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Demo agent failed'
+    };
+  }
+});
+
+/**
+ * Handle health check requests for the local llama-server.
+ */
+router.register(MessageType.CHECK_HEALTH_REQUEST, async (): Promise<ExtensionResponse<CheckHealthResponseData>> => {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    const res = await fetch('http://127.0.0.1:8080/health', { signal: controller.signal });
+    clearTimeout(timeout);
+    if (res.ok) {
+      const data = await res.json().catch(() => ({ status: 'ok' }));
+      return {
+        success: true,
+        data: {
+          online: true,
+          status: data.status || 'ok',
+          model: 'qwen2.5-vl-3b',
+          host: '127.0.0.1',
+          port: 8080
+        }
+      };
+    }
+    return {
+      success: true,
+      data: {
+        online: false,
+        status: `HTTP ${res.status}`
+      }
+    };
+  } catch (err) {
+    return {
+      success: true,
+      data: {
+        online: false,
+        status: err instanceof Error ? err.message : 'Offline'
+      }
+    };
+  }
+});
+
+/**
+ * Handle direct AI chat requests with the local LLM.
+ */
+router.register<ChatRequest>(MessageType.CHAT_REQUEST, async (
+  payload: ChatRequest,
+  _sender: chrome.runtime.MessageSender
+): Promise<ExtensionResponse<ChatResponseData>> => {
+  try {
+    const userMessage = (payload?.message ?? '').trim();
+    if (!userMessage) {
+      return {
+        success: false,
+        error: 'Message cannot be empty'
+      };
+    }
+
+    // 1. Resolve target tab and metadata
+    let tabId = payload?.tabId;
+    let windowId = payload?.windowId;
+    let tabUrl: string | undefined;
+    let tabTitle: string | undefined;
+
+    if (tabId === undefined) {
+      const activeTab = await getActiveTab();
+      tabId = activeTab?.id;
+      windowId = activeTab?.windowId;
+      tabUrl = activeTab?.url;
+      tabTitle = activeTab?.title;
+    } else {
+      try {
+        if (typeof chrome !== 'undefined' && chrome?.tabs?.get) {
+          const tab = await chrome.tabs.get(tabId);
+          tabUrl = tab?.url;
+          tabTitle = tab?.title;
+        }
+      } catch {
+        // Tab query fallback
+      }
+    }
+
+    // 2. Extract and sanitize webpage context
+    let pageContextText: string | undefined;
+
+    if (tabUrl && isRestrictedUrl(tabUrl)) {
+      pageContextText = buildRestrictedPageContext(tabUrl, tabTitle);
+    } else if (typeof tabId === 'number' && !isNaN(tabId)) {
+      try {
+        const domProvider = createDomProvider(tabId);
+        let rawPage: import('../shared/types.js').PageRepresentation;
+        try {
+          rawPage = await domProvider();
+        } catch (firstErr) {
+          // If content script was not ready or attached, attempt programmatic injection
+          if (typeof chrome !== 'undefined' && (chrome as any)?.scripting?.executeScript) {
+            try {
+              await (chrome as any).scripting.executeScript({
+                target: { tabId },
+                files: ['content/content-script.js']
+              });
+              await new Promise(r => setTimeout(r, 100));
+              rawPage = await domProvider();
+            } catch {
+              throw firstErr;
+            }
+          } else {
+            throw firstErr;
+          }
+        }
+
+        if (rawPage) {
+          // Privacy boundary: sanitize all textual content before LLM exposure
+          const sanitized = sanitizePageRepresentation(rawPage);
+          pageContextText = buildPageChatContext(sanitized.pageRepresentation);
+          if (!tabTitle && sanitized.pageRepresentation.metadata?.title) {
+            tabTitle = sanitized.pageRepresentation.metadata.title;
+          }
+          if (!tabUrl && sanitized.pageRepresentation.metadata?.url) {
+            tabUrl = sanitized.pageRepresentation.metadata.url;
+          }
+        }
+      } catch (domErr) {
+        const errMsg = domErr instanceof Error ? domErr.message : String(domErr);
+        pageContextText = buildUnavailablePageContext(tabUrl, tabTitle, errMsg);
+      }
+    }
+
+    // 3. Build grounded prompt
+    const userPrompt = buildChatUserPrompt(userMessage, payload?.history, pageContextText);
+
+    // 4. Query local model
+    const client = new DefaultLocalLlamaChatClient();
+    const response = await client.chat({
+      systemPrompt: CHAT_SYSTEM_PROMPT,
+      userPrompt,
+      maxTokens: 512,
+      temperature: 0.3
+    });
+
+    if (response.success) {
+      return {
+        success: true,
+        data: {
+          reply: response.content.trim(),
+          model: 'qwen2.5-vl-3b',
+          pageTitle: tabTitle,
+          pageUrl: tabUrl
+        }
+      };
+    } else {
+      return {
+        success: false,
+        error: response.error.message || 'Local AI inference failed'
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to communicate with local AI server'
     };
   }
 });
