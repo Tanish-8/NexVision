@@ -38,12 +38,71 @@ export const PAGE_REPRESENTATION_SCHEMA_VERSION = '1.0' as const;
 export type PageRepresentationSchemaVersion =
   typeof PAGE_REPRESENTATION_SCHEMA_VERSION;
 
+import type { PageType } from './urlIntelligence.js';
+
+export type { PageType };
+
+/** Search control affordance detected on the page */
+export interface PageSearchControl {
+  readonly elementId?: string;
+  readonly role?: string;
+  readonly name?: string;
+  readonly placeholder?: string;
+  readonly actionUrl?: string;
+  readonly method?: 'GET' | 'POST';
+}
+
+/** Semantic link representation extracted from the page */
+export interface PageRelevantLink {
+  readonly text: string;
+  readonly href: string;
+  readonly elementId?: string;
+  readonly category?: 'product' | 'search' | 'pagination' | 'navigation' | 'generic';
+}
+
+/** Structured product data extracted from JSON-LD / Microdata */
+export interface PageProductData {
+  readonly name?: string;
+  readonly description?: string;
+  readonly brand?: string;
+  readonly price?: string | number;
+  readonly priceCurrency?: string;
+  readonly availability?: string;
+  readonly ratingValue?: string | number;
+  readonly reviewCount?: number;
+  readonly sku?: string;
+}
+
 /** Page-level metadata that may be available to a perception source. */
 export interface PageMetadata {
   /** The document title, when available. */
   title?: string;
   /** The document URL, when available. */
   url?: string;
+  /** Canonical URL declared in <link rel="canonical"> */
+  canonicalUrl?: string;
+  /** Hostname of the page (e.g. 'www.amazon.in') */
+  hostname?: string;
+  /** Registered domain / eTLD+1 (e.g. 'amazon.in') */
+  domain?: string;
+  /** Meta description from <meta name="description"> or og:description */
+  description?: string;
+  /** Semantic classification of page archetype */
+  pageType?: PageType;
+  /** Detected search controls on the page */
+  searchControls?: readonly PageSearchControl[];
+  /** Relevant semantic navigation/product links on the page */
+  relevantLinks?: readonly PageRelevantLink[];
+  /** Structured product data if available on product pages */
+  productData?: PageProductData;
+  /** OpenGraph metadata attributes */
+  openGraph?: Readonly<Record<string, string>>;
+  /** Structured data extracted from JSON-LD or microdata (sanitized) */
+  structuredData?: readonly Record<string, any>[];
+  /** Timestamp when snapshot was captured */
+  extractionTimestamp?: number;
+  /** Completeness status of page extraction */
+  completeness?: 'complete' | 'partial' | 'restricted' | 'unavailable';
 }
 
 /** Viewport dimensions in CSS pixels. */
@@ -215,12 +274,54 @@ export interface ChatRequest {
   readonly windowId?: number;
 }
 
+/** Evidence type classification for extracted facts */
+export type EvidenceType =
+  | 'dom_text'
+  | 'heading'
+  | 'structured_metadata'
+  | 'product_attribute'
+  | 'table_cell'
+  | 'search_result';
+
+/** Structured atomic fact extracted during page perception or research */
+export interface ExtractedFact {
+  readonly id: string;
+  readonly entityName?: string;
+  readonly field: string;
+  readonly value: string;
+  readonly sourceUrl: string;
+  readonly sourceTitle?: string;
+  readonly evidenceType: EvidenceType;
+  readonly verified: boolean;
+  readonly timestamp?: number;
+}
+
+/** Structured research plan formulated by information sufficiency evaluator */
+export interface ResearchPlan {
+  readonly userGoal: string;
+  readonly intent: string;
+  readonly isSufficient: boolean;
+  readonly missingEvidence?: readonly string[];
+  readonly plannedQueries?: readonly string[];
+  readonly targetUrls?: readonly string[];
+}
+
+/** Research and evidence metadata backing the answer */
+export interface ChatResearchContext {
+  readonly intent: string;
+  readonly searchedQuery?: string;
+  readonly sourcesVisited?: readonly { readonly title: string; readonly url: string }[];
+  readonly evidenceCount?: number;
+  readonly verifiedFacts?: readonly ExtractedFact[];
+}
+
 /** Response payload for AI chat. */
 export interface ChatResponseData {
   readonly reply: string;
   readonly model?: string;
   readonly pageTitle?: string;
   readonly pageUrl?: string;
+  readonly researchContext?: ChatResearchContext;
 }
 
 /** Response payload for health check of local inference server. */

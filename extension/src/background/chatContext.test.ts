@@ -285,6 +285,56 @@ describe('chatContext Module', () => {
       expect(result).not.toContain('\n·\n');
       expect(result).not.toContain('\n|\n');
     });
+
+    it('formats URL intelligence, product details, search controls, and relevant links', () => {
+      const page: PageRepresentation = {
+        schemaVersion: '1.0',
+        metadata: {
+          title: 'Acer Nitro 5 Gaming Laptop',
+          url: 'https://www.amazon.in/Acer-Nitro-Gaming-Laptop/dp/B001TEST',
+          canonicalUrl: 'https://www.amazon.in/dp/B001TEST',
+          domain: 'amazon.in',
+          pageType: 'product',
+          description: 'High performance gaming laptop under 50000 with RTX graphics.',
+          productData: {
+            name: 'Acer Nitro 5',
+            brand: 'Acer',
+            price: '49,990',
+            priceCurrency: 'INR',
+            availability: 'InStock',
+            ratingValue: '4.4',
+            reviewCount: 350
+          },
+          searchControls: [
+            { placeholder: 'Search Amazon.in', name: 'k', actionUrl: '/s' }
+          ],
+          relevantLinks: [
+            { text: 'Browse more Gaming Laptops', href: 'https://www.amazon.in/s?k=gaming+laptops', category: 'search' },
+            { text: 'Asus TUF Alternative', href: 'https://www.amazon.in/dp/B002ASUS', category: 'product' }
+          ]
+        },
+        viewport: { width: 1280, height: 720 },
+        elements: [
+          { id: 'elem-1', tagName: 'h1', role: 'heading', visibleText: 'Acer Nitro 5 Gaming Laptop', state: { visible: true } }
+        ]
+      };
+
+      const result = buildPageChatContext(page);
+
+      expect(result).toContain('URL: https://www.amazon.in/Acer-Nitro-Gaming-Laptop/dp/B001TEST');
+      expect(result).toContain('Domain: amazon.in');
+      expect(result).toContain('Page Type: product');
+      expect(result).toContain('Canonical URL: https://www.amazon.in/dp/B001TEST');
+      expect(result).toContain('Description: High performance gaming laptop');
+      expect(result).toContain('Structured Product Details:');
+      expect(result).toContain('- Product Name: Acer Nitro 5');
+      expect(result).toContain('- Price: INR 49,990');
+      expect(result).toContain('Site Search Capabilities:');
+      expect(result).toContain('Available search input: "Search Amazon.in"');
+      expect(result).toContain('Key Navigation & Relevant Links:');
+      expect(result).toContain('[SEARCH] Browse more Gaming Laptops');
+      expect(result).toContain('[PRODUCT] Asus TUF Alternative');
+    });
   });
 
   describe('buildChatUserPrompt', () => {

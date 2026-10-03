@@ -177,9 +177,57 @@ function sanitizeMetadata(metadata: PageMetadata | undefined): PageMetadata {
     return {};
   }
 
+  const searchControls = metadata.searchControls?.map(c => ({
+    ...c,
+    placeholder: redactText(c.placeholder),
+    actionUrl: sanitizeUrl(c.actionUrl)
+  }));
+
+  const relevantLinks = metadata.relevantLinks?.map(l => ({
+    ...l,
+    text: redactText(l.text) || '',
+    href: sanitizeUrl(l.href) || ''
+  }));
+
+  const productData = metadata.productData ? {
+    ...metadata.productData,
+    name: redactText(metadata.productData.name),
+    description: redactText(metadata.productData.description),
+    brand: redactText(metadata.productData.brand)
+  } : undefined;
+
+  const openGraph: Record<string, string> = {};
+  if (metadata.openGraph) {
+    for (const [k, v] of Object.entries(metadata.openGraph)) {
+      openGraph[k] = redactText(v) || '';
+    }
+  }
+
+  const structuredData = metadata.structuredData?.map(item => {
+    try {
+      const serialized = JSON.stringify(item);
+      const redacted = redactText(serialized);
+      return redacted ? JSON.parse(redacted) : item;
+    } catch {
+      return item;
+    }
+  });
+
   return {
     title: redactText(metadata.title),
-    url: sanitizeUrl(metadata.url)
+    url: sanitizeUrl(metadata.url),
+    canonicalUrl: sanitizeUrl(metadata.canonicalUrl),
+    hostname: metadata.hostname,
+    domain: metadata.domain,
+    description: redactText(metadata.description),
+    pageType: metadata.pageType,
+    searchControls,
+    relevantLinks,
+    productData,
+    openGraph: Object.keys(openGraph).length > 0 ? openGraph : undefined,
+    structuredData,
+    extractionTimestamp: metadata.extractionTimestamp,
+    completeness: metadata.completeness
   };
 }
 
@@ -231,6 +279,8 @@ function sanitizeElement(element: PageElement): PageElement {
         attributes[key] = REDACTION_TOKENS.NAME;
       } else if (lowerKey === 'value' && isSemanticNameField) {
         attributes[key] = REDACTION_TOKENS.NAME;
+      } else if (lowerKey === 'href') {
+        attributes[key] = sanitizeUrl(value) || '';
       } else if (SENSITIVE_TEXT_ATTRIBUTES.has(lowerKey)) {
         attributes[key] = redactText(value) || '';
       } else {

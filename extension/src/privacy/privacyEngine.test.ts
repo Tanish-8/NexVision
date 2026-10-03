@@ -1078,5 +1078,69 @@ describe('Local Privacy Engine (Phase 4)', () => {
         expect(sanitized.pageRepresentation.elements[8].visibleText).toBe('Transaction: TXN-8849201');
       });
     });
+
+    describe('Phase 2 — Extended URL & Metadata Sanitization', () => {
+      it('sanitizes sensitive tokens and auth parameters in anchor attributes.href', () => {
+        const page = createBaseRepresentation([
+          {
+            id: 'link-oauth',
+            tagName: 'a',
+            visibleText: 'Sign in to account',
+            attributes: {
+              href: 'https://example.com/oauth/callback?token=secret_xyz123&session_id=sess_999&redirect=/dashboard'
+            }
+          }
+        ]);
+
+        const sanitized = sanitizePageRepresentation(page);
+        const href = sanitized.pageRepresentation.elements[0].attributes?.['href'];
+        expect(href).toBeDefined();
+        expect(href).not.toContain('secret_xyz123');
+        expect(href).not.toContain('sess_999');
+        expect(href).toContain('token=[REDACTED_PARAM]');
+        expect(href).toContain('session_id=[REDACTED_PARAM]');
+        expect(href).toContain('redirect=%2Fdashboard');
+      });
+
+      it('sanitizes metadata canonicalUrl, description, relevantLinks, and productData', () => {
+        const page: PageRepresentation = {
+          schemaVersion: '1.0',
+          metadata: {
+            title: 'Welcome John Doe',
+            url: 'https://example.com/shop?user_email=john@example.com',
+            canonicalUrl: 'https://example.com/shop?token=jwt12345',
+            description: 'Contact John Doe at john@example.com for assistance',
+            productData: {
+              name: 'Laptop for Priya Sharma',
+              description: 'Shipped to Priya Sharma with order details',
+              price: '45000',
+              priceCurrency: 'INR'
+            },
+            relevantLinks: [
+              {
+                text: 'Order for Arjun Reddy',
+                href: 'https://example.com/orders?token=tok999',
+                category: 'navigation'
+              }
+            ]
+          },
+          viewport: { width: 1280, height: 720 },
+          elements: []
+        };
+
+        const sanitized = sanitizePageRepresentation(page);
+        const meta = sanitized.pageRepresentation.metadata;
+
+        expect(meta.title).toContain('[REDACTED_NAME]');
+        expect(meta.canonicalUrl).not.toContain('jwt12345');
+        expect(meta.description).toContain('[REDACTED_EMAIL]');
+        expect(meta.description).toContain('[REDACTED_NAME]');
+        expect(meta.productData?.name).toContain('[REDACTED_NAME]');
+        expect(meta.productData?.description).toContain('[REDACTED_NAME]');
+        expect(meta.productData?.price).toBe('45000');
+        expect(meta.relevantLinks?.[0].text).toContain('[REDACTED_NAME]');
+        expect(meta.relevantLinks?.[0].href).not.toContain('tok999');
+      });
+    });
   });
 });

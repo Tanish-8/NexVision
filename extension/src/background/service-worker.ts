@@ -23,6 +23,7 @@ import type {
   GetAgentStatusResponseData,
   ChatRequest,
   ChatResponseData,
+  ChatResearchContext,
   CheckHealthResponseData
 } from '../shared/types.js';
 import { captureVisibleTab } from './screenshot.js';
@@ -48,6 +49,7 @@ import {
   buildChatUserPrompt,
   CHAT_SYSTEM_PROMPT
 } from './chatContext.js';
+import { executeChatResearch } from './chatResearcher.js';
 
 
 export const router = new MessageRouter();
@@ -776,6 +778,7 @@ router.register<ChatRequest>(MessageType.CHAT_REQUEST, async (
 
     // 2. Extract and sanitize webpage context
     let pageContextText: string | undefined;
+    let researchContext: ChatResearchContext | undefined;
 
     if (tabUrl && isRestrictedUrl(tabUrl)) {
       pageContextText = buildRestrictedPageContext(tabUrl, tabTitle);
@@ -813,6 +816,40 @@ router.register<ChatRequest>(MessageType.CHAT_REQUEST, async (
           if (!tabUrl && sanitized.pageRepresentation.metadata?.url) {
             tabUrl = sanitized.pageRepresentation.metadata.url;
           }
+
+          // Phase 4/5: URL-Aware Contextual Intelligence & Bounded Site Research
+          if (tabId && !isRestrictedUrl(tabUrl || '')) {
+            try {
+              const researchResult = await executeChatResearch({
+                userMessage,
+                tabId,
+                initialPage: sanitized.pageRepresentation,
+                domProvider,
+                actionExecutor: (req) => executeAction(req, { timeoutMs: 5000 }),
+                maxHops: 1
+              });
+
+              if (researchResult.isResearched) {
+                pageContextText = researchResult.synthesizedContext;
+                if (researchResult.newPage?.metadata?.title) {
+                  tabTitle = researchResult.newPage.metadata.title;
+                }
+                if (researchResult.newPage?.metadata?.url) {
+                  tabUrl = researchResult.newPage.metadata.url;
+                }
+              }
+
+              researchContext = {
+                intent: researchResult.intent,
+                searchedQuery: researchResult.searchQuery,
+                sourcesVisited: researchResult.sourcesVisited,
+                evidenceCount: researchResult.facts.length,
+                verifiedFacts: researchResult.facts
+              };
+            } catch {
+              // Graceful fallback to initial page context
+            }
+          }
         }
       } catch (domErr) {
         const errMsg = domErr instanceof Error ? domErr.message : String(domErr);
@@ -839,7 +876,8 @@ router.register<ChatRequest>(MessageType.CHAT_REQUEST, async (
           reply: response.content.trim(),
           model: 'qwen2.5-vl-3b',
           pageTitle: tabTitle,
-          pageUrl: tabUrl
+          pageUrl: tabUrl,
+          researchContext
         }
       };
     } else {

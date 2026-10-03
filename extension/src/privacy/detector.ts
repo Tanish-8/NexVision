@@ -116,7 +116,9 @@ export const COMMON_UI_AND_BRAND_WORDS: ReadonlySet<string> = new Set([
   'flipkart', 'uber', 'zomato', 'visa', 'mastercard', 'rupay', 'amex',
   'paypal', 'paytm', 'phonepe', 'gpay', 'youtube', 'facebook', 'instagram',
   'twitter', 'github', 'linkedin', 'spotify', 'walmart', 'ebay', 'target',
-  'bestbuy', 'costco', 'samsung', 'sony', 'lg',
+  'bestbuy', 'costco', 'samsung', 'sony', 'lg', 'acer', 'asus', 'hp',
+  'lenovo', 'dell', 'intel', 'amd', 'nvidia', 'ryzen', 'laptop', 'aspire',
+  'ideapad', 'thinkpad', 'pavilion', 'victus', 'predator', 'legion',
 
   // Common qualifiers / adjectives
   'all', 'any', 'new', 'old', 'current', 'recent', 'latest', 'popular', 'top',

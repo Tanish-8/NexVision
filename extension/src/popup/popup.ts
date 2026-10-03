@@ -34,6 +34,7 @@ export interface ChatMessage {
   text: string;
   timestamp: number;
   isError?: boolean;
+  researchContext?: import('../shared/types.js').ChatResearchContext;
   taskData?: {
     runId: string;
     goal: string;
@@ -227,9 +228,12 @@ function renderMessage(msg: ChatMessage): void {
       wrapper.innerHTML = renderTaskCardHtml(msg.taskData, timeStr);
     } else {
       const errorClass = msg.isError ? ' error' : '';
+      const researchMeta = msg.researchContext?.searchedQuery
+        ? ` · Researched "${escapeHtml(msg.researchContext.searchedQuery)}"`
+        : '';
       wrapper.innerHTML = `
         <div class="bubble${errorClass}">${formatAssistantText(msg.text)}</div>
-        <div class="message-meta">NexVision AI · ${timeStr}</div>
+        <div class="message-meta">NexVision AI · ${timeStr}${researchMeta}</div>
       `;
     }
   }
@@ -390,7 +394,37 @@ export async function submitChatMessage(text: string): Promise<void> {
   renderMessage(userMsg);
 
   if (els.chatInput) els.chatInput.value = '';
-  setThinking(true);
+
+  let tabId: number | undefined;
+  let windowId: number | undefined;
+  let initialThinking = 'Thinking';
+
+  if (typeof chrome !== 'undefined' && chrome.tabs?.query) {
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab) {
+        tabId = activeTab.id;
+        windowId = activeTab.windowId;
+        if (activeTab.url) {
+          try {
+            const host = new URL(activeTab.url).hostname.replace(/^www\./, '');
+            const isDiscovery = /\b(?:best|laptop|phone|buy|search|price|under|cheap|cost|item|product)\b/i.test(userText);
+            if (host && isDiscovery) {
+              initialThinking = `Searching ${host}...`;
+            } else if (host) {
+              initialThinking = `Analyzing ${host}...`;
+            }
+          } catch {
+            // URL parse fallback
+          }
+        }
+      }
+    } catch {
+      // Fallback tab query will be executed in service-worker
+    }
+  }
+
+  setThinking(true, initialThinking);
 
   const history = sessionMessages
     .filter(m => m.mode === 'chat' && !m.isError)
@@ -401,20 +435,6 @@ export async function submitChatMessage(text: string): Promise<void> {
     }));
 
   try {
-    let tabId: number | undefined;
-    let windowId: number | undefined;
-    if (typeof chrome !== 'undefined' && chrome.tabs?.query) {
-      try {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (activeTab) {
-          tabId = activeTab.id;
-          windowId = activeTab.windowId;
-        }
-      } catch {
-        // Fallback tab query will be executed in service-worker
-      }
-    }
-
     const res: ExtensionResponse<ChatResponseData> =
       await sendToBackground<ChatResponseData>(MessageType.CHAT_REQUEST, {
         message: userText,
@@ -431,7 +451,8 @@ export async function submitChatMessage(text: string): Promise<void> {
         sender: 'assistant',
         mode: 'chat',
         text: res.data.reply,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        researchContext: res.data.researchContext
       };
       sessionMessages.push(assistantMsg);
       renderMessage(assistantMsg);
@@ -462,10 +483,14 @@ export async function submitChatMessage(text: string): Promise<void> {
   }
 }
 
-function setThinking(active: boolean): void {
+function setThinking(active: boolean, statusText?: string): void {
   const els = getDomElements();
   if (els.thinkingIndicator) {
     els.thinkingIndicator.style.display = active ? 'flex' : 'none';
+    const textSpan = els.thinkingIndicator.querySelector('span');
+    if (textSpan) {
+      textSpan.textContent = active ? (statusText || 'Thinking') : 'Thinking';
+    }
   }
   if (els.sendBtn) els.sendBtn.disabled = active;
   if (els.chatInput) els.chatInput.disabled = active;

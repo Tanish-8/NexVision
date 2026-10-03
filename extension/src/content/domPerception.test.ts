@@ -1050,5 +1050,99 @@ describe('DOM Perception', () => {
         expect(el.attributes).not.toHaveProperty('value');
       });
     });
+
+    it('should extract canonical URL, description, and OpenGraph metadata', () => {
+      const canonicalLink = document.createElement('link');
+      canonicalLink.rel = 'canonical';
+      canonicalLink.href = 'https://example.com/canonical-page';
+      document.head.appendChild(canonicalLink);
+
+      const metaDesc = document.createElement('meta');
+      metaDesc.name = 'description';
+      metaDesc.content = 'Official store for laptops and computers.';
+      document.head.appendChild(metaDesc);
+
+      const ogTitle = document.createElement('meta');
+      ogTitle.setAttribute('property', 'og:title');
+      ogTitle.content = 'Laptops Store';
+      document.head.appendChild(ogTitle);
+
+      const rep = extractPageRepresentationFromDom();
+
+      expect(rep.metadata.canonicalUrl).toBe('https://example.com/canonical-page');
+      expect(rep.metadata.description).toBe('Official store for laptops and computers.');
+      expect(rep.metadata.openGraph?.['og:title']).toBe('Laptops Store');
+
+      canonicalLink.remove();
+      metaDesc.remove();
+      ogTitle.remove();
+    });
+
+    it('should extract structured schema.org JSON-LD product details', () => {
+      const script = document.createElement('script');
+      script.type = 'application/ld+json';
+      script.textContent = JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'Product',
+        name: 'Pro Gaming Laptop',
+        brand: { '@type': 'Brand', name: 'Acer' },
+        offers: {
+          '@type': 'Offer',
+          price: '48999',
+          priceCurrency: 'INR',
+          availability: 'https://schema.org/InStock'
+        },
+        aggregateRating: {
+          '@type': 'AggregateRating',
+          ratingValue: '4.5',
+          reviewCount: 120
+        }
+      });
+      document.head.appendChild(script);
+
+      const rep = extractPageRepresentationFromDom();
+
+      expect(rep.metadata.productData).toBeDefined();
+      expect(rep.metadata.productData?.name).toBe('Pro Gaming Laptop');
+      expect(rep.metadata.productData?.brand).toBe('Acer');
+      expect(rep.metadata.productData?.price).toBe('48999');
+      expect(rep.metadata.productData?.priceCurrency).toBe('INR');
+      expect(rep.metadata.productData?.ratingValue).toBe('4.5');
+      expect(rep.metadata.productData?.reviewCount).toBe(120);
+      expect(rep.metadata.pageType).toBe('product');
+
+      script.remove();
+    });
+
+    it('should detect search controls and relevant links', () => {
+      setUpHtml(`
+        <header>
+          <form action="/search" method="get">
+            <input type="search" name="k" placeholder="Search products...">
+            <button type="submit">Search</button>
+          </form>
+          <nav>
+            <a href="/dp/B001PROD">Acer Laptop Deal</a>
+            <a href="/s?k=mouse">Mouse Category</a>
+            <a href="/help">Help</a>
+          </nav>
+        </header>
+      `);
+      document.querySelectorAll('header, form, input, button, nav, a').forEach((el) => {
+        mockBoundingClientRect(el, { width: 100, height: 25 });
+      });
+
+      const rep = extractPageRepresentationFromDom();
+
+      expect(rep.metadata.searchControls).toBeDefined();
+      expect(rep.metadata.searchControls?.[0].placeholder).toBe('Search products...');
+      expect(rep.metadata.searchControls?.[0].name).toBe('k');
+      expect(rep.metadata.searchControls?.[0].actionUrl).toBe('/search');
+
+      expect(rep.metadata.relevantLinks).toBeDefined();
+      const productLink = rep.metadata.relevantLinks?.find(l => l.category === 'product');
+      expect(productLink).toBeDefined();
+      expect(productLink?.text).toBe('Acer Laptop Deal');
+    });
   });
 });

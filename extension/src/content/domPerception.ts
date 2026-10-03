@@ -12,8 +12,19 @@ import {
   type PageElement,
   type PageMetadata,
   type PageRepresentation,
-  type Viewport
+  type Viewport,
+  type PageType,
+  type PageProductData,
+  type PageRelevantLink,
+  type PageSearchControl
 } from '../shared/types.js';
+import {
+  parseUrlDetails,
+  normalizeCanonicalUrl,
+  inferPageTypeFromUrlAndDom,
+  isRestrictedUrlScheme,
+  type DomTypeHints
+} from '../shared/urlIntelligence.js';
 
 /** Roles that can be represented without copying an arbitrary role value. */
 const SUPPORTED_ARIA_ROLES = new Set<ElementRole>([
@@ -778,6 +789,174 @@ export function getPerceptionElementRegistry(): ReadonlyMap<string, Element> {
 }
 
 /**
+ * Safely extracts schema.org structured JSON-LD and product data from document.
+ */
+function extractStructuredData(doc: Document = document): {
+  structuredData?: Record<string, any>[];
+  productData?: PageProductData;
+  schemaType?: string;
+} {
+  const scripts = doc.querySelectorAll('script[type="application/ld+json"]');
+  if (!scripts || scripts.length === 0) return {};
+
+  const structuredData: Record<string, any>[] = [];
+  let productData: PageProductData | undefined;
+  let schemaType: string | undefined;
+
+  for (const script of Array.from(scripts)) {
+    const raw = script.textContent?.trim();
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      const items = Array.isArray(parsed)
+        ? parsed
+        : (parsed?.['@graph'] && Array.isArray(parsed['@graph']))
+        ? parsed['@graph']
+        : [parsed];
+
+      for (const item of items) {
+        if (!item || typeof item !== 'object') continue;
+        const type = String(item['@type'] || '');
+        if (type && !schemaType) {
+          schemaType = type;
+        }
+
+        // Bounded capture of structured items (max 5 items)
+        if (structuredData.length < 5) {
+          structuredData.push(item);
+        }
+
+        if (type.toLowerCase() === 'product' && !productData) {
+          const offers = item.offers;
+          const offerObj = Array.isArray(offers) ? offers[0] : (typeof offers === 'object' ? offers : undefined);
+          const brandObj = item.brand;
+          const brandName = typeof brandObj === 'string'
+            ? brandObj
+            : (typeof brandObj?.name === 'string' ? brandObj.name : undefined);
+          const ratingObj = item.aggregateRating;
+
+          productData = {
+            name: typeof item.name === 'string' ? normalizeText(item.name) : undefined,
+            description: typeof item.description === 'string' ? normalizeText(item.description).slice(0, 300) : undefined,
+            brand: brandName ? normalizeText(brandName) : undefined,
+            price: offerObj?.price !== undefined ? String(offerObj.price) : undefined,
+            priceCurrency: typeof offerObj?.priceCurrency === 'string' ? offerObj.priceCurrency : undefined,
+            availability: typeof offerObj?.availability === 'string' ? offerObj.availability : undefined,
+            ratingValue: ratingObj?.ratingValue !== undefined ? String(ratingObj.ratingValue) : undefined,
+            reviewCount: typeof ratingObj?.reviewCount === 'number' ? ratingObj.reviewCount : undefined,
+            sku: typeof item.sku === 'string' ? item.sku : undefined
+          };
+        }
+      }
+    } catch {
+      // Ignore malformed JSON-LD gracefully
+    }
+  }
+
+  return {
+    structuredData: structuredData.length > 0 ? structuredData : undefined,
+    productData,
+    schemaType
+  };
+}
+
+/**
+ * Detects search input controls and associated form actions.
+ */
+function extractSearchControls(elementsArray: Element[], elementIdMap: Map<Element, string>): PageSearchControl[] {
+  const controls: PageSearchControl[] = [];
+  const seenIds = new Set<string>();
+
+  for (const el of elementsArray) {
+    const tagName = el.tagName.toLowerCase();
+    const role = getElementRole(el);
+    const isSearchInput =
+      role === 'searchbox' ||
+      (tagName === 'input' && (el as HTMLInputElement).type?.toLowerCase() === 'search') ||
+      (tagName === 'input' && (
+        el.getAttribute('placeholder')?.toLowerCase().includes('search') ||
+        el.getAttribute('name')?.toLowerCase().includes('search') ||
+        el.getAttribute('name')?.toLowerCase() === 'k' ||
+        el.getAttribute('name')?.toLowerCase() === 'q'
+      ));
+
+    if (isSearchInput) {
+      const elementId = elementIdMap.get(el);
+      if (elementId && !seenIds.has(elementId)) {
+        seenIds.add(elementId);
+        const form = el.closest('form');
+        const actionUrl = form?.getAttribute('action') || undefined;
+        const method = form?.getAttribute('method')?.toUpperCase() === 'POST' ? 'POST' : 'GET';
+        const name = el.getAttribute('name') || undefined;
+        const placeholder = el.getAttribute('placeholder') || undefined;
+
+        controls.push({
+          elementId,
+          role,
+          name,
+          placeholder: placeholder ? normalizeText(placeholder) : undefined,
+          actionUrl,
+          method
+        });
+        if (controls.length >= 3) break;
+      }
+    }
+  }
+  return controls;
+}
+
+/**
+ * Extracts top relevant semantic links (product, search, navigation) from perceived elements.
+ */
+function extractRelevantLinks(elementsArray: Element[], elementIdMap: Map<Element, string>): PageRelevantLink[] {
+  const links: PageRelevantLink[] = [];
+  const seenHrefs = new Set<string>();
+
+  for (const el of elementsArray) {
+    if (el.tagName.toLowerCase() === 'a' && el.hasAttribute('href')) {
+      const href = el.getAttribute('href')?.trim();
+      if (!href || href === '#' || isRestrictedUrlScheme(href)) continue;
+
+      let fullHref = href;
+      try {
+        const base = typeof window !== 'undefined' ? window.location.href : 'http://localhost';
+        fullHref = new URL(href, base).href;
+      } catch {
+        continue;
+      }
+
+      if (seenHrefs.has(fullHref)) continue;
+      seenHrefs.add(fullHref);
+
+      const text = (getVisibleText(el) || getAccessibleName(el) || '').trim();
+      if (!text || text.length < 2) continue;
+
+      let category: PageRelevantLink['category'] = 'generic';
+      const lowerHref = fullHref.toLowerCase();
+      if (lowerHref.includes('/dp/') || lowerHref.includes('/p/') || lowerHref.includes('/product/') || lowerHref.includes('/item/')) {
+        category = 'product';
+      } else if (lowerHref.includes('/s?') || lowerHref.includes('/search')) {
+        category = 'search';
+      } else if (/^(?:next|prev|previous|\d+)$/i.test(text) || el.getAttribute('rel') === 'next') {
+        category = 'pagination';
+      } else {
+        category = 'navigation';
+      }
+
+      links.push({
+        text: normalizeText(text),
+        href: fullHref,
+        elementId: elementIdMap.get(el),
+        category
+      });
+
+      if (links.length >= 20) break;
+    }
+  }
+  return links;
+}
+
+/**
  * Extracts a PageRepresentation from the current DOM.
  */
 export function extractPageRepresentationFromDom(): PageRepresentation {
@@ -857,9 +1036,63 @@ export function extractPageRepresentationFromDom(): PageRepresentation {
     };
   });
 
+  // Extract URL and document metadata
+  const docUrl = typeof window !== 'undefined' ? window.location.href : '';
+  const urlDetails = parseUrlDetails(docUrl);
+
+  const canonicalEl = document.querySelector('link[rel="canonical"]');
+  const rawCanonical = canonicalEl?.getAttribute('href') || undefined;
+  const canonicalUrl = normalizeCanonicalUrl(rawCanonical, docUrl);
+
+  const metaDescEl = document.querySelector('meta[name="description"]') || document.querySelector('meta[property="og:description"]');
+  const description = metaDescEl ? normalizeText(metaDescEl.getAttribute('content') || '') : undefined;
+
+  // OpenGraph metadata
+  const openGraph: Record<string, string> = {};
+  const ogTags = document.querySelectorAll('meta[property^="og:"]');
+  for (const og of Array.from(ogTags)) {
+    const prop = og.getAttribute('property');
+    const content = og.getAttribute('content');
+    if (prop && content) {
+      openGraph[prop] = normalizeText(content);
+    }
+  }
+
+  // Schema.org structured data
+  const { structuredData, productData, schemaType } = extractStructuredData(document);
+
+  // Search controls and relevant links
+  const searchControls = extractSearchControls(elementsArray, elementIdMap);
+  const relevantLinks = extractRelevantLinks(elementsArray, elementIdMap);
+
+  // DOM type hints for classification
+  const domHints: DomTypeHints = {
+    hasSearchBox: searchControls.length > 0,
+    hasSearchResultsGrid: Boolean(document.querySelector('[data-component-type="s-search-result"], .search-results, [role="feed"]')),
+    hasProductPrice: Boolean(productData?.price || document.querySelector('.price, [data-price], [itemprop="price"]')),
+    hasAddToCart: Boolean(document.querySelector('button[name*="submit.add-to-cart"], button[id*="add-to-cart"], [aria-label*="Add to cart" i]')),
+    hasArticleBody: Boolean(document.querySelector('article, [itemprop="articleBody"]')),
+    hasCodeBlocks: Boolean(document.querySelector('pre code, .highlight, .docs-content')),
+    hasPrimaryForm: Boolean(document.querySelector('form:not([role="search"])')),
+    schemaType
+  };
+
+  const pageType = inferPageTypeFromUrlAndDom(urlDetails, domHints);
+
   const metadata: PageMetadata = {
     title: normalizeText(document.title) || undefined,
-    url: window.location.href || undefined
+    url: docUrl || undefined,
+    canonicalUrl,
+    hostname: urlDetails?.hostname,
+    domain: urlDetails?.domain,
+    description: description || undefined,
+    pageType,
+    searchControls: searchControls.length > 0 ? searchControls : undefined,
+    relevantLinks: relevantLinks.length > 0 ? relevantLinks : undefined,
+    productData,
+    openGraph: Object.keys(openGraph).length > 0 ? openGraph : undefined,
+    structuredData,
+    completeness: 'complete'
   };
 
   const viewport: Viewport = {
