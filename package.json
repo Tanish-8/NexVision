@@ -8,7 +8,7 @@
     "vision"
   ],
   "scripts": {
-    "typecheck": "tsc --build extension/tsconfig.json && cd vision && npm run typecheck",
+    "typecheck": "tsc --noEmit -p extension/tsconfig.json && cd vision && npm run typecheck",
     "test": "cd extension && npm test && cd ../vision && npm test",
     "build": "cd extension && npm run build",
     "lint": "cd extension && npm run lint"

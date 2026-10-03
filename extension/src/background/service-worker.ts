@@ -133,6 +133,26 @@ export async function getActiveTab(): Promise<chrome.tabs.Tab | undefined> {
 export const DOM_IPC_TIMEOUT_MS = 5000;
 
 /**
+ * Determines whether an IPC error indicates that the content script is missing
+ * or the communication channel could not be established (recoverable transport failure).
+ *
+ * Does NOT match application-level extraction errors returned by the content script.
+ */
+export function isMissingReceiverError(errorMsg?: string): boolean {
+  if (!errorMsg || typeof errorMsg !== 'string') return false;
+  const lower = errorMsg.toLowerCase();
+  return (
+    lower.includes('could not establish connection') ||
+    lower.includes('receiving end does not exist') ||
+    lower.includes('message port closed') ||
+    lower.includes('connection reset') ||
+    lower.includes('frame with id') ||
+    lower.includes('recipient does not exist') ||
+    lower.includes('no tab with id')
+  );
+}
+
+/**
  * Create an async DOM perception provider that retrieves PageRepresentation
  * from the content script running in the given tab via IPC.
  *
@@ -147,34 +167,119 @@ export const DOM_IPC_TIMEOUT_MS = 5000;
  * The caller (perceivePage) catches these throws and maps them to origin 'dom'.
  */
 export function createDomProvider(tabId: number): DomPerceptionProvider {
-  return async (): Promise<PageRepresentation> => {
-    const ipcPromise = sendToTab<PageRepresentation>(
-      tabId,
-      MessageType.INSPECT_PAGE_REQUEST
-    );
-
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`DOM perception timed out after ${DOM_IPC_TIMEOUT_MS}ms`)),
-        DOM_IPC_TIMEOUT_MS
-      )
-    );
-
+  async function getPageRepresentation(): Promise<PageRepresentation> {
     let response: ExtensionResponse<PageRepresentation>;
     try {
-      response = await Promise.race([ipcPromise, timeoutPromise]);
-    } catch (error) {
-      // Covers timeout and any sendToTab transport errors
-      throw error instanceof Error
-        ? error
-        : new Error('DOM perception IPC failed');
+      response = await sendToTab<PageRepresentation>(
+        tabId,
+        MessageType.INSPECT_PAGE_REQUEST
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      response = { success: false, error: msg };
     }
 
-    if (!response.success || response.data == null) {
-      throw new Error(response.error ?? 'Content script returned failure for DOM perception');
+    if (response.success && response.data != null) {
+      return response.data;
     }
 
-    return response.data;
+    const initialError = response.error ?? 'Content script returned failure for DOM perception';
+
+    // If it's NOT a missing receiver transport failure, it's an application-level error
+    // (e.g. DOM extraction failure): preserve and throw the original error without reinjection.
+    if (!isMissingReceiverError(initialError)) {
+      throw new Error(initialError);
+    }
+
+    // Recoverable transport failure (receiver missing): attempt injection if scripting API is available
+    if (typeof chrome === 'undefined' || !(chrome as any)?.scripting?.executeScript) {
+      throw new Error(initialError);
+    }
+
+    // Restrict injection on unscriptable browser schemes
+    if (typeof chrome !== 'undefined' && chrome?.tabs?.get) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab?.url && (
+          tab.url.startsWith('chrome://') ||
+          tab.url.startsWith('chrome-extension://') ||
+          tab.url.startsWith('edge://') ||
+          tab.url.startsWith('devtools://') ||
+          tab.url.startsWith('view-source:') ||
+          tab.url.startsWith('about:')
+        )) {
+          throw new Error(`Cannot inject content script into restricted URL: ${tab.url}`);
+        }
+      } catch (tabErr: unknown) {
+        if (tabErr instanceof Error && tabErr.message.includes('Cannot inject')) {
+          throw tabErr;
+        }
+        // If tabs.get is unavailable or tab doesn't have URL, proceed with executeScript
+      }
+    }
+
+    // Programmatically inject content script
+    try {
+      await (chrome as any).scripting.executeScript({
+        target: { tabId },
+        files: ['content/content-script.js']
+      });
+    } catch (injectErr: unknown) {
+      const msg = injectErr instanceof Error ? injectErr.message : String(injectErr);
+      throw new Error(`Failed to inject content script: ${msg}`);
+    }
+
+    // Bounded readiness verification retry (up to 3 attempts with exponential backoff)
+    const READINESS_DELAYS_MS = [25, 50, 100];
+    let retryResponse: ExtensionResponse<PageRepresentation> | undefined;
+
+    for (const delay of READINESS_DELAYS_MS) {
+      await new Promise(r => setTimeout(r, delay));
+
+      try {
+        retryResponse = await sendToTab<PageRepresentation>(
+          tabId,
+          MessageType.INSPECT_PAGE_REQUEST
+        );
+      } catch (retryErr: unknown) {
+        const msg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        retryResponse = { success: false, error: msg };
+      }
+
+      if (retryResponse.success && retryResponse.data != null) {
+        return retryResponse.data;
+      }
+
+      // If it returned an explicit application error, stop retrying immediately
+      if (!isMissingReceiverError(retryResponse.error)) {
+        throw new Error(retryResponse.error ?? 'Content script returned failure for DOM perception after injection');
+      }
+    }
+
+    throw new Error(retryResponse?.error ?? 'Content script failed to respond after injection');
+  }
+
+  return async (): Promise<PageRepresentation> => {
+    let timerId: ReturnType<typeof setTimeout> | undefined;
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timerId = setTimeout(
+        () => reject(new Error(`DOM perception timed out after ${DOM_IPC_TIMEOUT_MS}ms`)),
+        DOM_IPC_TIMEOUT_MS
+      );
+    });
+
+    const ipcPromise = getPageRepresentation();
+
+    try {
+      return await Promise.race([ipcPromise, timeoutPromise]);
+    } finally {
+      if (timerId !== undefined) {
+        clearTimeout(timerId);
+      }
+      // Attach no-op error handler to suppress unhandled rejections if ipcPromise settles after timeout
+      ipcPromise.catch(() => {});
+    }
   };
 }
 

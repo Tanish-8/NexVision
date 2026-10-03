@@ -12,7 +12,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createDomProvider, DOM_IPC_TIMEOUT_MS } from './service-worker.js';
+import { createDomProvider, DOM_IPC_TIMEOUT_MS, isMissingReceiverError } from './service-worker.js';
+import { initializeContentScript } from '../content/content-script.js';
 import { perceivePage } from './orchestrator.js';
 import { captureVisibleTab } from './screenshot.js';
 import { MessageRouter } from '../shared/messaging.js';
@@ -181,6 +182,197 @@ describe('Phase 2D — createDomProvider', () => {
     expect(result.error.message).toContain('timed out');
 
     vi.useRealTimers();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reinjection & Transport Error Resilience Tests
+// ---------------------------------------------------------------------------
+
+describe('Reinjection & Transport Error Resilience in createDomProvider', () => {
+  const originalChrome = globalThis.chrome;
+
+  afterEach(() => {
+    globalThis.chrome = originalChrome;
+    vi.restoreAllMocks();
+  });
+
+  it('2 & 5. genuine missing-receiver error triggers reinjection and succeeds on retry', async () => {
+    const executeScriptMock = vi.fn().mockResolvedValue([]);
+    const sendMessageMock = vi.fn()
+      .mockResolvedValueOnce({
+        success: false,
+        error: 'Could not establish connection. Receiving end does not exist.'
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        data: MOCK_DOM,
+        id: 'msg-retry'
+      });
+
+    globalThis.chrome = {
+      tabs: {
+        sendMessage: sendMessageMock
+      },
+      scripting: {
+        executeScript: executeScriptMock
+      }
+    } as any;
+
+    const provider = createDomProvider(101);
+    const dom = await provider();
+
+    expect(executeScriptMock).toHaveBeenCalledOnce();
+    expect(executeScriptMock).toHaveBeenCalledWith({
+      target: { tabId: 101 },
+      files: ['content/content-script.js']
+    });
+    expect(sendMessageMock).toHaveBeenCalledTimes(2);
+    expect(dom.metadata.url).toBe('https://example.com');
+  });
+
+  it('3. explicit content-script extraction failure does not trigger reinjection', async () => {
+    const executeScriptMock = vi.fn().mockResolvedValue([]);
+    const sendMessageMock = vi.fn().mockResolvedValue({
+      success: false,
+      error: 'DOM node disconnected during extraction'
+    });
+
+    globalThis.chrome = {
+      tabs: {
+        sendMessage: sendMessageMock
+      },
+      scripting: {
+        executeScript: executeScriptMock
+      }
+    } as any;
+
+    const provider = createDomProvider(102);
+    await expect(provider()).rejects.toThrow('DOM node disconnected during extraction');
+    expect(executeScriptMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).toHaveBeenCalledOnce();
+  });
+
+  it('4. content script initialization is idempotent and does not register duplicate listeners', () => {
+    const addListenerMock = vi.fn();
+    (globalThis as any).chrome = {
+      runtime: {
+        onMessage: {
+          addListener: addListenerMock
+        }
+      }
+    };
+
+    const mockWindow: any = {};
+    const firstInit = initializeContentScript(mockWindow);
+    const secondInit = initializeContentScript(mockWindow);
+
+    expect(firstInit).toBe(true);
+    expect(secondInit).toBe(false);
+    expect(addListenerMock).toHaveBeenCalledOnce();
+  });
+
+  it('6. injection failure returns a useful diagnostic error', async () => {
+    const executeScriptMock = vi.fn().mockRejectedValue(new Error('Cannot access a chrome:// URL'));
+    const sendMessageMock = vi.fn().mockResolvedValue({
+      success: false,
+      error: 'Could not establish connection. Receiving end does not exist.'
+    });
+
+    globalThis.chrome = {
+      tabs: {
+        sendMessage: sendMessageMock
+      },
+      scripting: {
+        executeScript: executeScriptMock
+      }
+    } as any;
+
+    const provider = createDomProvider(103);
+    await expect(provider()).rejects.toThrow('Failed to inject content script: Cannot access a chrome:// URL');
+  });
+
+  it('7. timeout is cleaned up on successful IPC', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    const sendMessageMock = vi.fn().mockResolvedValue({
+      success: true,
+      data: MOCK_DOM
+    });
+
+    globalThis.chrome = {
+      tabs: {
+        sendMessage: sendMessageMock
+      }
+    } as any;
+
+    const provider = createDomProvider(104);
+    await provider();
+
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+  });
+
+  it('8. timeout is cleaned up on failed IPC', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    const sendMessageMock = vi.fn().mockResolvedValue({
+      success: false,
+      error: 'Content script extraction failed'
+    });
+
+    globalThis.chrome = {
+      tabs: {
+        sendMessage: sendMessageMock
+      }
+    } as any;
+
+    const provider = createDomProvider(105);
+    await expect(provider()).rejects.toThrow('Content script extraction failed');
+
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+  });
+
+  it('9. navigation followed by perception recovers via reinjection', async () => {
+    const executeScriptMock = vi.fn().mockResolvedValue([]);
+    const navigatedDom: PageRepresentation = {
+      schemaVersion: '1.0',
+      metadata: { title: 'Search Results', url: 'https://www.amazon.in/s?k=laptops' },
+      viewport: { width: 1280, height: 720 },
+      elements: [{ ...MOCK_DOM.elements[0]!, visibleText: 'Laptop Result' }]
+    };
+
+    const sendMessageMock = vi.fn()
+      .mockResolvedValueOnce({
+        success: false,
+        error: 'The message port closed before a response was received.'
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        data: navigatedDom
+      });
+
+    globalThis.chrome = {
+      tabs: {
+        sendMessage: sendMessageMock
+      },
+      scripting: {
+        executeScript: executeScriptMock
+      }
+    } as any;
+
+    const provider = createDomProvider(106);
+    const dom = await provider();
+
+    expect(executeScriptMock).toHaveBeenCalledOnce();
+    expect(dom.metadata.url).toBe('https://www.amazon.in/s?k=laptops');
+    expect(dom.elements[0]!.visibleText).toBe('Laptop Result');
+  });
+
+  it('isMissingReceiverError correctly identifies transport failures vs application failures', () => {
+    expect(isMissingReceiverError('Could not establish connection. Receiving end does not exist.')).toBe(true);
+    expect(isMissingReceiverError('The message port closed before a response was received.')).toBe(true);
+    expect(isMissingReceiverError('No tab with id: 42')).toBe(true);
+    expect(isMissingReceiverError('Content script extraction failed')).toBe(false);
+    expect(isMissingReceiverError('Element not found')).toBe(false);
+    expect(isMissingReceiverError(undefined)).toBe(false);
   });
 });
 

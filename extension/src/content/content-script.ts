@@ -51,18 +51,38 @@ router.register<ExecuteActionRequest>(MessageType.EXECUTE_ACTION_REQUEST, async 
 });
 
 /**
- * Listen for messages from the background script / popup
+ * Global initialization sentinel to ensure idempotent initialization
+ * and prevent duplicate listener registration upon script reinjection.
  */
-if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
-  chrome.runtime.onMessage.addListener(
-    <T = any>(message: ExtensionMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: ExtensionResponse) => void) => {
-      if (!message || typeof message !== 'object' || !router.hasHandler(message.type)) {
-        return false;
+const GLOBAL_INIT_KEY = '__NEXVISION_CONTENT_SCRIPT_INITIALIZED__';
+
+export function initializeContentScript(targetGlobal: any = typeof window !== 'undefined' ? window : globalThis): boolean {
+  if (targetGlobal && targetGlobal[GLOBAL_INIT_KEY]) {
+    // Already initialized in this execution context
+    return false;
+  }
+  if (targetGlobal) {
+    targetGlobal[GLOBAL_INIT_KEY] = true;
+  }
+
+  /**
+   * Listen for messages from the background script / popup
+   */
+  if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
+    chrome.runtime.onMessage.addListener(
+      <T = any>(message: ExtensionMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: ExtensionResponse) => void) => {
+        if (!message || typeof message !== 'object' || !router.hasHandler(message.type)) {
+          return false;
+        }
+        return dispatchMessageToRouter(router, message, sender, sendResponse);
       }
-      return dispatchMessageToRouter(router, message, sender, sendResponse);
-    }
-  );
+    );
+  }
+  return true;
 }
+
+// Auto-run on script execution
+initializeContentScript();
 
 export { extractPageRepresentationFromDom, executeDomAction, router };
 export type { PageSnapshot, PageRepresentation, ExecutionResult };

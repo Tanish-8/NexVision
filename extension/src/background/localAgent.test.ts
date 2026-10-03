@@ -29,6 +29,7 @@ import {
   type LocalLlamaChatClient,
   DefaultLocalLlamaChatClient,
   compactCandidatesForModel,
+  compactCandidateAttributes,
   MAX_MODEL_CANDIDATES,
   getPhaseRolePriority,
   scoreCandidateRelevance,
@@ -813,7 +814,8 @@ describe('Phase 5A — Local AI Agent / PlannerDriver Integration', () => {
       const mockFetch = vi.fn().mockResolvedValue({
         ok: false,
         status: 500,
-        statusText: 'Internal Server Error'
+        statusText: 'Internal Server Error',
+        json: async () => ({})
       });
 
       const agent = createLocalAgent({
@@ -825,6 +827,64 @@ describe('Phase 5A — Local AI Agent / PlannerDriver Integration', () => {
       if (result.status !== 'FAILED') throw new Error('Expected FAILED');
       expect(result.reason).toBe('MODEL_ERROR');
       expect(result.message).toContain('HTTP 500 Internal Server Error');
+    });
+
+    it('DefaultLocalLlamaChatClient parses exceed_context_size_error and marks code CONTEXT_LENGTH_EXCEEDED', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        statusText: 'Bad Request',
+        json: async () => ({
+          error: {
+            code: 400,
+            message: 'request (4869 tokens) exceeds the available context size (4096 tokens), try increasing it',
+            type: 'exceed_context_size_error',
+            n_prompt_tokens: 4869,
+            n_ctx: 4096
+          }
+        })
+      });
+
+      const client = new DefaultLocalLlamaChatClient({
+        fetchFn: mockFetch as any
+      });
+
+      const chatResult = await client.chat({
+        systemPrompt: 'sys',
+        userPrompt: 'user'
+      });
+
+      expect(chatResult.success).toBe(false);
+      if (chatResult.success) throw new Error('Expected failure');
+      expect(chatResult.error.code).toBe('CONTEXT_LENGTH_EXCEEDED');
+      expect(chatResult.error.message).toContain('request (4869 tokens) exceeds the available context size (4096 tokens)');
+    });
+
+    it('DefaultLocalLlamaChatClient extracts server error detail on 4xx/5xx responses safely', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 422,
+        statusText: 'Unprocessable Entity',
+        json: async () => ({
+          error: {
+            message: 'Invalid schema parameters'
+          }
+        })
+      });
+
+      const client = new DefaultLocalLlamaChatClient({
+        fetchFn: mockFetch as any
+      });
+
+      const chatResult = await client.chat({
+        systemPrompt: 'sys',
+        userPrompt: 'user'
+      });
+
+      expect(chatResult.success).toBe(false);
+      if (chatResult.success) throw new Error('Expected failure');
+      expect(chatResult.error.code).toBe('HTTP_ERROR');
+      expect(chatResult.error.message).toContain('HTTP 422 Unprocessable Entity: Invalid schema parameters');
     });
 
     it('DefaultLocalLlamaChatClient handles network connection failure cleanly', async () => {
@@ -1741,6 +1801,94 @@ describe('compactCandidatesForModel — prompt payload compaction', () => {
     expect(out.accessibleName).toBe('Submit order');
     expect(out.visibleText).toBe('Submit');
     expect(out.confidence).toBe(0.92);
+  });
+
+  // -------------------------------------------------------------------------
+  // Attribute compaction — eliminating transport/styling bloat
+  // -------------------------------------------------------------------------
+
+  describe('compactCandidateAttributes', () => {
+    it('strips class, href, aria-describedby, aria-controls, aria-labelledby', () => {
+      const raw = {
+        class: 'a-button a-button-primary a-button-span12 _single-creative-card_style_... 195 chars',
+        href: 'https://www.amazon.in/s?k=laptops&_encoding=UTF8&pd_rd_w=12345&content-id=67890 540 chars',
+        'aria-describedby': 'desc-123',
+        'aria-controls': 'panel-456',
+        'aria-labelledby': 'label-789',
+        'data-txn': 'tx-1001',
+        'type': 'submit',
+        'name': 'twotabsearchtextbox'
+      };
+
+      const compacted = compactCandidateAttributes(raw);
+      expect(compacted).toBeDefined();
+      expect(compacted?.['class']).toBeUndefined();
+      expect(compacted?.['href']).toBeUndefined();
+      expect(compacted?.['aria-describedby']).toBeUndefined();
+      expect(compacted?.['aria-controls']).toBeUndefined();
+      expect(compacted?.['aria-labelledby']).toBeUndefined();
+      expect(compacted?.['data-txn']).toBe('tx-1001');
+      expect(compacted?.['type']).toBe('submit');
+      expect(compacted?.['name']).toBe('twotabsearchtextbox');
+    });
+
+    it('preserves semantic data-* attributes for financial/NexBank grounding', () => {
+      const raw = {
+        'data-txn': 'TXN-9842',
+        'data-merchant': 'Acme Superstore',
+        'data-amount': '$142.50',
+        'data-date': '2026-09-30',
+        'data-detail': 'Groceries',
+        'aria-label': 'View details for TXN-9842'
+      };
+
+      const compacted = compactCandidateAttributes(raw);
+      expect(compacted).toEqual(raw);
+    });
+
+    it('caps attribute values longer than 100 characters to 100 characters', () => {
+      const raw = {
+        'data-custom': 'x'.repeat(250)
+      };
+
+      const compacted = compactCandidateAttributes(raw);
+      expect(compacted?.['data-custom']).toHaveLength(100);
+      expect(compacted?.['data-custom']).toBe('x'.repeat(100));
+    });
+
+    it('returns undefined when all attributes are excluded or empty', () => {
+      expect(compactCandidateAttributes(undefined)).toBeUndefined();
+      expect(compactCandidateAttributes({})).toBeUndefined();
+      expect(compactCandidateAttributes({
+        class: 'btn-primary',
+        href: 'https://example.com/test'
+      })).toBeUndefined();
+      expect(compactCandidateAttributes({
+        'data-empty': '   '
+      })).toBeUndefined();
+    });
+  });
+
+  it('compactCandidatesForModel strips verbose href and class attributes while preserving hasHref and semantic attributes', () => {
+    const candidateWithBloat = {
+      elementId: 'elem-amazon-link',
+      role: 'link',
+      accessibleName: 'Electronics & Accessories',
+      visibleText: 'Electronics',
+      hasHref: true,
+      confidence: 0.85,
+      attributes: {
+        href: 'https://www.amazon.in/electronics-store/b?ie=UTF8&node=976419031&ref_=nav_cs_electronics' + 'x'.repeat(400),
+        class: 'nav-a nav-a-2 nav-progressive-attribute ' + 'y'.repeat(150),
+        'data-category': 'electronics'
+      }
+    };
+
+    const [out] = compactCandidatesForModel([candidateWithBloat], 'browse electronics');
+    expect(out.hasHref).toBe(true);
+    expect(out.attributes?.['href']).toBeUndefined();
+    expect(out.attributes?.['class']).toBeUndefined();
+    expect(out.attributes?.['data-category']).toBe('electronics');
   });
 
   // -------------------------------------------------------------------------

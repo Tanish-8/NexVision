@@ -575,6 +575,56 @@ export function scoreCandidateRelevance(
 }
 
 /**
+ * Strips high-entropy transport and layout attributes (such as tracking href URLs and CSS classes)
+ * from candidate targets before serializing them for the model prompt.
+ *
+ * Preserves semantic attributes needed for task grounding (e.g. data-txn, data-merchant, data-amount,
+ * data-date, data-detail, data-timestamp, type, name, role, title, alt, aria-label, aria-expanded,
+ * aria-checked, aria-selected, aria-modal, aria-autocomplete).
+ *
+ * Caps individual attribute values to prevent prompt token exhaustion.
+ */
+export function compactCandidateAttributes(
+  rawAttributes?: Record<string, string>
+): Record<string, string> | undefined {
+  if (!rawAttributes || typeof rawAttributes !== 'object') {
+    return undefined;
+  }
+
+  // Explicitly excluded transport/presentation attributes that bloat prompt tokens
+  const EXCLUDED_ATTRIBUTES = new Set([
+    'class',
+    'href',
+    'aria-describedby',
+    'aria-controls',
+    'aria-labelledby'
+  ]);
+
+  const MAX_ATTR_VALUE_LENGTH = 100;
+  const compacted: Record<string, string> = {};
+
+  for (const [key, rawValue] of Object.entries(rawAttributes)) {
+    const lowerKey = key.toLowerCase();
+    if (EXCLUDED_ATTRIBUTES.has(lowerKey)) {
+      continue;
+    }
+    if (typeof rawValue !== 'string') {
+      continue;
+    }
+    const trimmed = rawValue.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    // Cap attribute length to prevent high-entropy bloat while preserving semantic value
+    compacted[key] = trimmed.length > MAX_ATTR_VALUE_LENGTH
+      ? trimmed.slice(0, MAX_ATTR_VALUE_LENGTH)
+      : trimmed;
+  }
+
+  return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+/**
  * Compacts and ranks candidate targets before model serialization.
  *
  * 1. Ranks by `scoreCandidateRelevance` with phase-conditioned priority and keyword hits.
@@ -635,19 +685,22 @@ export function compactCandidatesForModel(
   scored.sort((a, b) => b.score - a.score);
 
   // Cap and strip bounds from model-facing DTO; preserve focused, hasHref, and placeholder flags.
-  return scored.slice(0, limit).map(({ candidate: c }) => ({
-    elementId: c.elementId,
-    ...(c.role !== undefined ? { role: c.role } : {}),
-    ...(c.accessibleName !== undefined ? { accessibleName: c.accessibleName } : {}),
-    ...(c.visibleText !== undefined ? { visibleText: c.visibleText } : {}),
-    ...(c.placeholder !== undefined ? { placeholder: c.placeholder } : {}),
-    ...(c.attributes !== undefined ? { attributes: c.attributes } : {}),
-    ...(c.focused === true ? { focused: true } : {}),
-    ...(c.hasHref === true ? { hasHref: true } : {}),
-    confidence: c.confidence
-    // bounds intentionally omitted — the executor resolves the element by id,
-    // not by pixel coordinates. Omitting bounds saves ~40 chars/candidate.
-  }));
+  return scored.slice(0, limit).map(({ candidate: c }) => {
+    const compactedAttrs = compactCandidateAttributes(c.attributes);
+    return {
+      elementId: c.elementId,
+      ...(c.role !== undefined ? { role: c.role } : {}),
+      ...(c.accessibleName !== undefined ? { accessibleName: c.accessibleName } : {}),
+      ...(c.visibleText !== undefined ? { visibleText: c.visibleText } : {}),
+      ...(c.placeholder !== undefined ? { placeholder: c.placeholder } : {}),
+      ...(compactedAttrs !== undefined ? { attributes: compactedAttrs } : {}),
+      ...(c.focused === true ? { focused: true } : {}),
+      ...(c.hasHref === true ? { hasHref: true } : {}),
+      confidence: c.confidence
+      // bounds intentionally omitted — the executor resolves the element by id,
+      // not by pixel coordinates. Omitting bounds saves ~40 chars/candidate.
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1903,11 +1956,39 @@ export class DefaultLocalLlamaChatClient implements LocalLlamaChatClient {
       });
 
       if (!response.ok) {
+        let serverErrorDetail = '';
+        if (typeof response.json === 'function') {
+          try {
+            const errorJson = await response.json();
+            if (errorJson?.error && typeof errorJson.error === 'object') {
+              const err = errorJson.error;
+              if (typeof err.message === 'string' && err.message.trim().length > 0) {
+                serverErrorDetail = err.message.trim();
+              } else if (typeof err.type === 'string' && err.type.trim().length > 0) {
+                serverErrorDetail = err.type.trim();
+              }
+            } else if (typeof errorJson?.message === 'string' && errorJson.message.trim().length > 0) {
+              serverErrorDetail = errorJson.message.trim();
+            }
+          } catch {
+            // Non-JSON response body or stream error; ignore safely
+          }
+        }
+
+        const isContextOverflow =
+          response.status === 400 &&
+          (serverErrorDetail.includes('exceed_context_size_error') ||
+           serverErrorDetail.toLowerCase().includes('context size') ||
+           serverErrorDetail.toLowerCase().includes('exceeds the available context size'));
+
+        const statusDesc = response.statusText ? ` ${response.statusText}` : '';
+        const detailSuffix = serverErrorDetail ? `: ${serverErrorDetail}` : '';
+
         return {
           success: false,
           error: {
-            code: 'HTTP_ERROR',
-            message: `Local inference server returned HTTP ${response.status} ${response.statusText}`
+            code: isContextOverflow ? 'CONTEXT_LENGTH_EXCEEDED' : 'HTTP_ERROR',
+            message: `Local inference server returned HTTP ${response.status}${statusDesc}${detailSuffix}`
           }
         };
       }
